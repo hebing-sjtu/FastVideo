@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass, field, fields
+from typing import Any, TYPE_CHECKING
+
+from fastvideo.logger import init_logger
+
+if TYPE_CHECKING:
+    from fastvideo.platforms import AttentionBackendEnum
+
+logger = init_logger(__name__)
+
+
+# 1. ArchConfig contains all fields from diffuser's/transformer's config.json (i.e. all fields related to the architecture of the model)
+# 2. ArchConfig should be inherited & overridden by each model arch_config
+# 3. Any field in ArchConfig is fixed upon initialization, and should be hidden away from users
+@dataclass
+class ArchConfig:
+    stacked_params_mapping: list[tuple[str, str, str]] = field(
+        default_factory=list)  # mapping from huggingface weight names to custom names
+
+
+@dataclass
+class ModelConfig:
+    # Every model config parameter can be categorized into either ArchConfig or everything else
+    # Diffuser/Transformer parameters
+    arch_config: ArchConfig = field(default_factory=ArchConfig)
+
+    # FastVideo-specific parameters here
+
+    # The attention backend requested for this component, resolved once at load
+    # time by the loader (explicit request, else the environment variable) and
+    # written here so the decision travels *on the component* rather than being
+    # looked up again while its layers are built. ``None`` means no request, so
+    # each layer falls through to its declared default and platform selection.
+    #
+    # This is the component-level decision, not a promise about the kernel any
+    # single layer ends up running: a layer that does not declare support for
+    # this backend still falls back (see ``fastvideo/attention/selector.py``).
+    # Keyword-only: the loader writes this by attribute assignment, so it must not
+    # take a slot in the positional signature that subclasses' fields inherit.
+    _resolved_attention_backend: "AttentionBackendEnum | None" = field(default=None, kw_only=True)
+
+    def __getattr__(self, name):
+        # Only called if 'name' is not found in ModelConfig directly
+        if hasattr(self.arch_config, name):
+            return getattr(self.arch_config, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def __getstate__(self):
+        # Return a dictionary of attributes to pickle
+        # Convert to dict and exclude any problematic attributes
+        state = self.__dict__.copy()
+        return state
+
+    def __setstate__(self, state):
+        # Restore instance attributes from the unpickled state
+        self.__dict__.update(state)
+
+    # This should be used only when loading from transformers/diffusers
+    def update_model_arch(self, source_model_dict: dict[str, Any]) -> None:
+        arch_config = self.arch_config
+        valid_fields = {f.name for f in fields(arch_config)}
+
+        for key, value in source_model_dict.items():
+            if key in valid_fields:
+                setattr(arch_config, key, value)
+
+        if hasattr(arch_config, "__post_init__"):
+            arch_config.__post_init__()
+
+    def update_model_config(self, source_model_dict: dict[str, Any]) -> None:
+        assert "arch_config" not in source_model_dict, "Source model config shouldn't contain arch_config."
+
+        valid_fields = {f.name for f in fields(self)}
+
+        for key, value in source_model_dict.items():
+            if key in valid_fields:
+                setattr(self, key, value)
+            else:
+                logger.warning("%s does not contain field '%s'!", type(self).__name__, key)
+                raise AttributeError(f"Invalid field: {key}")
+
+        if hasattr(self, "__post_init__"):
+            self.__post_init__()

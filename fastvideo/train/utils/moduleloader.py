@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import os
+from contextlib import nullcontext
+from typing import Any, TYPE_CHECKING
+
+import torch
+
+from fastvideo.attention.selector import (
+    _component_attention_backend_scope,
+    coerce_attn_backend,
+)
+from fastvideo.configs.pipelines.base import PipelineConfig
+from fastvideo.fastvideo_args import ExecutionMode, TrainingArgs
+from fastvideo.models.loader.component_loader import (
+    PipelineComponentLoader, )
+from fastvideo.utils import (
+    maybe_download_model,
+    verify_model_config_and_directory,
+)
+from fastvideo.platforms import AttentionBackendEnum
+
+if TYPE_CHECKING:
+    from fastvideo.train.utils.training_config import (
+        TrainingConfig, )
+
+# ------------------------------------------------------------------
+# TrainingArgs builders (only place that creates FastVideoArgs)
+# ------------------------------------------------------------------
+
+
+def _make_training_args(
+    tc: TrainingConfig,
+    *,
+    model_path: str,
+) -> TrainingArgs:
+    """Build a TrainingArgs for PipelineComponentLoader."""
+    pipeline_config = tc.pipeline_config or PipelineConfig()
+    # Propagate dit_precision from TrainingConfig to PipelineConfig
+    # so that TransformerLoader.load() picks up the correct
+    # default_dtype (e.g. fp32 master weights for training).
+    if tc.dit_precision and tc.dit_precision != pipeline_config.dit_precision:
+        pipeline_config.dit_precision = tc.dit_precision
+    return TrainingArgs(
+        model_path=model_path,
+        mode=ExecutionMode.DISTILLATION,
+        inference_mode=False,
+        pipeline_config=pipeline_config,
+        num_gpus=tc.distributed.num_gpus,
+        tp_size=tc.distributed.tp_size,
+        sp_size=tc.distributed.sp_size,
+        hsdp_replicate_dim=tc.distributed.hsdp_replicate_dim,
+        hsdp_shard_dim=tc.distributed.hsdp_shard_dim,
+        pin_cpu_memory=tc.distributed.pin_cpu_memory,
+        dit_cpu_offload=False,
+        dit_layerwise_offload=False,
+        vae_cpu_offload=False,
+        text_encoder_cpu_offload=False,
+        image_encoder_cpu_offload=False,
+        use_fsdp_inference=False,
+        enable_torch_compile=False,
+    )
+
+
+def make_inference_args(
+    tc: TrainingConfig,
+    *,
+    model_path: str,
+) -> TrainingArgs:
+    """Build a TrainingArgs for inference (validation / pipelines)."""
+    args = _make_training_args(tc, model_path=model_path)
+    args.inference_mode = True
+    args.mode = ExecutionMode.INFERENCE
+    args.dit_cpu_offload = True
+    args.VSA_sparsity = tc.vsa_sparsity
+    return args
+
+
+# ------------------------------------------------------------------
+# Module loading
+# ------------------------------------------------------------------
+
+
+def load_module_from_path(
+    *,
+    model_path: str,
+    module_type: str,
+    training_config: TrainingConfig,
+    disable_custom_init_weights: bool = False,
+    override_transformer_cls_name: str | None = None,
+    transformer_override_safetensor: str | None = None,
+    attention_backend: AttentionBackendEnum | str | None = None,
+) -> torch.nn.Module:
+    """Load one pipeline component with its role-scoped attention policy.
+
+    Accepts a ``TrainingConfig`` and internally builds the
+    ``TrainingArgs`` needed by ``PipelineComponentLoader``.
+
+    Diffusers component entries retain provider and architecture as their
+    first two fields and can append modular loading metadata. Attention layers
+    bind their backend during construction, so the requested backend remains
+    scoped to this load call.
+    """
+    fastvideo_args: Any = _make_training_args(training_config, model_path=model_path)
+
+    local_model_path = maybe_download_model(model_path)
+    config = verify_model_config_and_directory(local_model_path)
+
+    if module_type not in config:
+        raise ValueError(f"Module {module_type!r} not found in "
+                         f"config at {local_model_path}")
+
+    module_info = config[module_type]
+    if module_info is None:
+        raise ValueError(f"Module {module_type!r} has null value in "
+                         f"config at {local_model_path}")
+
+    # Trailing modular-manifest metadata does not change component dispatch;
+    # the provider and architecture remain the first two fields.
+    transformers_or_diffusers, _architecture = module_info[:2]
+    component_path = os.path.join(local_model_path, module_type)
+
+    # fastvideo_args is freshly built above and never escapes this function,
+    # so overrides are plain assignments — nothing to save or restore.
+    if override_transformer_cls_name is not None:
+        fastvideo_args.override_transformer_cls_name = str(override_transformer_cls_name)
+
+    if transformer_override_safetensor:
+        fastvideo_args.init_weights_from_safetensors = str(transformer_override_safetensor)
+
+    if attention_backend is not None and module_type != "transformer":
+        raise ValueError("attention_backend can only be set when loading "
+                         f"a transformer, got module_type={module_type!r}")
+    resolved_attention_backend = coerce_attn_backend(attention_backend)
+    # Per-role request delivered as a construction scope: process-local,
+    # exception-safe, and part of the selector's cache key (no global
+    # mutation, no cache flushes between roles).
+    attention_context = (nullcontext() if resolved_attention_backend is None else _component_attention_backend_scope(
+        resolved_attention_backend, component=module_type))
+
+    if disable_custom_init_weights:
+        fastvideo_args._loading_teacher_critic_model = True
+    # Attention implementations are bound while transformer layers are
+    # constructed. Scope the override to this one role so student,
+    # teacher, and critic can use independent backends in one process.
+    with attention_context:
+        module = PipelineComponentLoader.load_module(
+            module_name=module_type,
+            component_model_path=component_path,
+            transformers_or_diffusers=(transformers_or_diffusers),
+            fastvideo_args=fastvideo_args,
+        )
+
+    if not isinstance(module, torch.nn.Module):
+        raise TypeError(f"Loaded {module_type!r} is not a "
+                        f"torch.nn.Module: {type(module)}")
+    return module
