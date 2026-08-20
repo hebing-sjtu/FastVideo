@@ -56,6 +56,12 @@ _IMAGE_TO_VIDEO_DIT_MODELS = {
     "DreamXWorldTransformer3DModel": ("dits", "dreamx_world", "DreamXWorldTransformer3DModel"),
     "DreamXWorldARTransformer3DModel": ("dits", "dreamx_world_ar", "DreamXWorldARTransformer3DModel"),
     "CausalWanTransformer3DModel": ("dits", "causal_wanvideo", "CausalWanTransformer3DModel"),
+    "WanV2VDepthTransformer3DModel": ("dits", "wan_v2v_depth_controlnet", "WanV2VDepthTransformer3DModel"),
+    "CausalWanV2VDepthTransformer3DModel": (
+        "dits",
+        "causal_wan_v2v_depth_controlnet",
+        "CausalWanV2VDepthTransformer3DModel",
+    ),
     "LingBotWorld2CausalFastTransformer3DModel": (
         "dits",
         "lingbotworld2",

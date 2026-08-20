@@ -124,6 +124,197 @@ def _resolve_resume_checkpoint(resume_from_checkpoint: str, *, output_dir: str) 
                      f"containing such checkpoints. Got: {path} (output_dir={out}).")
 
 
+def _resolve_model_weight_dcp_dir(checkpoint_path: str) -> Path:
+    """Resolve an explicit ``checkpoint-<step>`` or ``dcp/`` path."""
+    path = Path(os.path.expanduser(str(checkpoint_path))).resolve()
+    dcp_dir = path if path.name == "dcp" else path / "dcp"
+    if not dcp_dir.is_dir():
+        raise FileNotFoundError(f"Model-weight checkpoint has no dcp/ directory: {path}")
+    if not (dcp_dir / ".metadata").is_file():
+        raise FileNotFoundError(f"Model-weight checkpoint is incomplete (missing {dcp_dir / '.metadata'}).")
+    return dcp_dir
+
+
+class _PrefixedModelWeightLoader(Stateful):
+    """Map a prefixed DCP model state onto a direct target module.
+
+    The wrapper deliberately exposes only tensor keys found under one source
+    model prefix, so DCP never plans reads for optimizer, scheduler, dataloader,
+    callback, RNG, or any sibling model state.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        source_metadata: dict[str, Any],
+        source_prefix: str,
+        required_target_prefixes: tuple[str, ...] | None = None,
+        optional_target_substrings: tuple[str, ...] | None = None,
+    ) -> None:
+        self.model = model
+        self.source_prefix = source_prefix
+        self.loaded_tensor_count = 0
+        self.ignored_missing_target_count = 0
+        # `optional_target_substrings` mark model keys allowed to be absent from
+        # the checkpoint, e.g. a newly-added branch layered onto an older save.
+        # Substring rather than prefix matching so mid-key markers like `.wca.`
+        # are covered. Declaring any forces a non-strict `set_model_state_dict`
+        # and leaves those params at their constructed value for the caller.
+        self.optional_target_substrings = tuple(optional_target_substrings or ())
+        self._strict_load = (required_target_prefixes is None and not self.optional_target_substrings)
+
+        target_state = get_model_state_dict(model)
+        self.source_to_target: dict[str, str] = {}
+        unexpected_source_keys: list[str] = []
+        shape_mismatches: list[str] = []
+        for source_name, metadata in source_metadata.items():
+            if not source_name.startswith(source_prefix):
+                continue
+            target_name = source_name[len(source_prefix):]
+            target_tensor = target_state.get(target_name)
+            if target_tensor is None:
+                unexpected_source_keys.append(target_name)
+                continue
+            source_size = getattr(metadata, "size", None)
+            if source_size is None:
+                raise TypeError(f"DCP model entry {source_name!r} is not tensor metadata")
+            if tuple(source_size) != tuple(target_tensor.shape):
+                shape_mismatches.append(
+                    f"{target_name}: checkpoint={tuple(source_size)}, target={tuple(target_tensor.shape)}")
+                continue
+            self.source_to_target[source_name] = target_name
+
+        covered_targets = set(self.source_to_target.values())
+        all_missing_target_keys = sorted(set(target_state).difference(covered_targets))
+        missing_target_keys = all_missing_target_keys
+        if required_target_prefixes is not None:
+            # A partial overlay names the subtree it insists on, e.g.
+            # `depth_controlnet.` layered on a backbone loaded from `init_from`.
+            missing_target_keys = [key for key in missing_target_keys if key.startswith(required_target_prefixes)]
+        if self.optional_target_substrings:
+            missing_target_keys = [
+                key for key in missing_target_keys if not any(sub in key for sub in self.optional_target_substrings)
+            ]
+        self.ignored_missing_target_count = len(all_missing_target_keys) - len(missing_target_keys)
+        if unexpected_source_keys or shape_mismatches or missing_target_keys:
+            details = []
+            if unexpected_source_keys:
+                details.append("checkpoint keys absent from target: " + ", ".join(unexpected_source_keys[:8]))
+            if shape_mismatches:
+                details.append("shape mismatches: " + "; ".join(shape_mismatches[:8]))
+            if missing_target_keys:
+                details.append("checkpoint missing target keys: " + ", ".join(missing_target_keys[:8]))
+            raise ValueError("Checkpoint does not match this model; align the enabled control modalities and the "
+                             "ControlNet architecture before loading (" + " | ".join(details) + ")")
+        if not self.source_to_target:
+            raise ValueError(f"No model tensors matched DCP source prefix {source_prefix!r}")
+
+    def state_dict(self) -> dict[str, Any]:
+        target_state = get_model_state_dict(self.model)
+        return {source_name: target_state[target_name] for source_name, target_name in self.source_to_target.items()}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        missing = set(self.source_to_target).difference(state_dict)
+        if missing:
+            raise KeyError(f"DCP did not return requested model tensors: {sorted(missing)[:8]}")
+        target_state = {
+            self.source_to_target[source_name]: tensor
+            for source_name, tensor in state_dict.items() if source_name in self.source_to_target
+        }
+        set_model_state_dict(
+            self.model,
+            model_state_dict=target_state,
+            options=StateDictOptions(strict=self._strict_load),
+        )
+        self.loaded_tensor_count = len(target_state)
+
+
+def load_prefixed_model_weights_from_dcp(
+    model: torch.nn.Module,
+    checkpoint_path: str,
+    *,
+    state_key: str,
+    source_prefix: str,
+    required_target_prefixes: tuple[str, ...] | None = None,
+    optional_target_substrings: tuple[str, ...] | None = None,
+) -> int:
+    """Load only one prefixed model state from a DCP training checkpoint.
+
+    This never constructs or loads optimizer, scheduler, dataloader, callback, or
+    RNG state; extra DCP entries are ignored by omitting them from the requested
+    state dictionary. By default every target model key must be present under
+    ``source_prefix``; ``required_target_prefixes`` narrows that check for
+    partial overlays such as a ControlNet-only checkpoint layered on top of a
+    base backbone loaded from ``init_from``.
+    """
+    dcp_dir = _resolve_model_weight_dcp_dir(checkpoint_path)
+    normalized_prefix = source_prefix.rstrip(".")
+    if normalized_prefix:
+        normalized_prefix = f"{normalized_prefix}."
+    metadata_root = f"{state_key}."
+    reader = dcp.FileSystemReader(str(dcp_dir))
+    metadata = reader.read_metadata()
+    source_metadata = {
+        full_name[len(metadata_root):]: value
+        for full_name, value in metadata.state_dict_metadata.items()
+        if full_name.startswith(f"{metadata_root}{normalized_prefix}")
+    }
+    if not source_metadata:
+        raise KeyError(f"No model weights under {state_key}.{normalized_prefix} in {dcp_dir}")
+
+    loader = _PrefixedModelWeightLoader(
+        model,
+        source_metadata=source_metadata,
+        source_prefix=normalized_prefix,
+        required_target_prefixes=required_target_prefixes,
+        optional_target_substrings=optional_target_substrings,
+    )
+    if loader.ignored_missing_target_count:
+        logger.info(
+            "Ignoring %d target model key(s) absent from %s; required target prefixes=%s.",
+            loader.ignored_missing_target_count,
+            dcp_dir,
+            required_target_prefixes,
+        )
+    logger.info(
+        "Loading %d model tensors only from %s (state=%s, prefix=%s); "
+        "optimizer/scheduler/dataloader/callback/RNG states are not requested.",
+        len(loader.source_to_target),
+        dcp_dir,
+        state_key,
+        normalized_prefix,
+    )
+    dcp.load({state_key: loader}, storage_reader=reader)
+    _barrier()
+    if loader.loaded_tensor_count != len(loader.source_to_target):
+        raise RuntimeError(f"Expected {len(loader.source_to_target)} model tensors, "
+                           f"loaded {loader.loaded_tensor_count}")
+    return loader.loaded_tensor_count
+
+
+def dcp_model_has_key_substring(
+    checkpoint_path: str,
+    *,
+    state_key: str,
+    source_prefix: str,
+    substring: str,
+) -> bool:
+    """Return True if the DCP save has any model tensor key containing ``substring``.
+
+    Reads only DCP metadata (no tensor reads, no collectives), so a warm-start
+    seed can be applied only when the branch is genuinely absent.
+    """
+    dcp_dir = _resolve_model_weight_dcp_dir(checkpoint_path)
+    normalized_prefix = source_prefix.rstrip(".")
+    if normalized_prefix:
+        normalized_prefix = f"{normalized_prefix}."
+    full_prefix = f"{state_key}.{normalized_prefix}"
+    metadata = dcp.FileSystemReader(str(dcp_dir)).read_metadata()
+    return any(
+        full_name.startswith(full_prefix) and substring in full_name for full_name in metadata.state_dict_metadata)
+
+
 class _RoleModuleContainer(torch.nn.Module):
     """Ephemeral container to expose multiple role modules as a single
     ``nn.Module``.

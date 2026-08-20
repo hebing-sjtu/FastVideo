@@ -5,6 +5,8 @@
 # Copyright 2025 The FastVideo Authors.
 
 from __future__ import annotations
+import hashlib
+import math
 import os
 import contextlib
 from collections.abc import Callable, Generator
@@ -458,8 +460,71 @@ def load_model_from_full_model_state_dict(
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
     # List of allowed parameter name patterns
-    ALLOWED_NEW_PARAM_PATTERNS = ["gate_compress", "proj_l"]  # Can be extended as needed
-    for new_param_name in unused_keys:
+    ALLOWED_NEW_PARAM_PATTERNS = [
+        "gate_compress",
+        "proj_l",
+        # Train-time control branches own parameters the base checkpoint cannot
+        # carry, so they are built on meta and initialized here.
+        "depth_controlnet",
+    ]  # Can be extended as needed
+
+    def _generator_for_missing_param(name: str, target_device: torch.device | str) -> torch.Generator:
+        # New parameters are initialized independently on every rank, so seed
+        # from the stable parameter name to keep ranks agreeing without a
+        # broadcast.
+        digest = hashlib.sha256(name.encode("utf-8")).digest()
+        seed = int.from_bytes(digest[:8], "big") % (2**63 - 1)
+        return torch.Generator(device=target_device).manual_seed(seed)
+
+    def _kaiming_uniform_missing_param(name: str, shape: tuple[int, ...],
+                                       target_dtype: torch.dtype) -> torch.Tensor:
+        """``kaiming_uniform_(a=sqrt(5))`` over fan_in, i.e. torch's default Linear init."""
+        generator = _generator_for_missing_param(name, device)
+        tensor = torch.empty(shape, device=device, dtype=target_dtype)
+        if len(shape) >= 2:
+            fan = torch.nn.init._calculate_correct_fan(tensor, "fan_in")
+            gain = torch.nn.init.calculate_gain("leaky_relu", math.sqrt(5))
+            std = gain / math.sqrt(fan) if fan > 0 else 0.0
+            bound = math.sqrt(3.0) * std
+            tensor.uniform_(-bound, bound, generator=generator)
+        else:
+            tensor.normal_(mean=0.0, std=0.02, generator=generator)
+        return tensor
+
+    def _init_missing_full_param(name: str, meta_tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+        """Initialize a parameter that the checkpoint does not carry.
+
+        Zeros are correct only where a zeroed tensor is the intended no-op (a
+        ControlNet's output projection, every bias). Zeroing a whole trunk
+        instead pins it at a symmetric point that gradient descent cannot leave,
+        so the rest follows the module's own scheme.
+        """
+        shape = tuple(meta_tensor.shape)
+        if "depth_controlnet" not in name:
+            return torch.zeros(shape, device=device, dtype=target_dtype)
+        if name.endswith("bias"):
+            return torch.zeros(shape, device=device, dtype=target_dtype)
+        # Zero-init output projections keep the branch a no-op at step 0.
+        if "proj_out" in name:
+            return torch.zeros(shape, device=device, dtype=target_dtype)
+        if "norm_" in name and name.endswith("weight"):
+            return torch.ones(shape, device=device, dtype=target_dtype)
+        if name.endswith("scale_shift_table"):
+            dim = shape[-1] if shape else 1
+            return torch.randn(
+                shape,
+                device=device,
+                dtype=target_dtype,
+                generator=_generator_for_missing_param(name, device),
+            ) / math.sqrt(max(1, dim))
+        return _kaiming_uniform_missing_param(name, shape, target_dtype)
+
+    # Iterate in sorted order: `unused_keys` is a set whose iteration order
+    # differs across ranks (each torchrun process has its own PYTHONHASHSEED),
+    # and `distribute_tensor` below issues collectives. A per-rank ordering
+    # mismatch would desynchronize them and deadlock as soon as more than one
+    # new parameter needs distributing.
+    for new_param_name in sorted(unused_keys):
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
             logger.error("Unsupported new parameter: %s. Allowed patterns: %s", new_param_name,
                          ALLOWED_NEW_PARAM_PATTERNS)
@@ -471,15 +536,14 @@ def load_model_from_full_model_state_dict(
         if callable(dtype_selector):
             target_dtype = dtype_selector(new_param_name, param_dtype)
         if not hasattr(meta_sharded_param, "device_mesh"):
-            # Initialize with zeros
-            sharded_tensor = torch.zeros_like(meta_sharded_param, device=device, dtype=target_dtype)
+            sharded_tensor = _init_missing_full_param(new_param_name, meta_sharded_param, target_dtype)
         else:
-            # Initialize with zeros and distribute
-            full_tensor = torch.zeros_like(meta_sharded_param, device=device, dtype=target_dtype)
+            full_tensor = _init_missing_full_param(new_param_name, meta_sharded_param, target_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,
                 meta_sharded_param.placements,
+                src_data_rank=None,
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()

@@ -1,5 +1,8 @@
 # Sourced by bootstrap_node.sh and ~/.bashrc on training nodes.
 # Override any variable before sourcing, or export it in the shell.
+#
+# uv lives in ~/.local/bin on the official image and is NOT on PATH until
+# .bashrc is loaded. Web consoles often skip that, so we put it on PATH here.
 
 : "${FV_REPO_DIR:=/workspace/FastVideo}"
 : "${FV_DATA_ROOT:=/data}"
@@ -12,7 +15,18 @@ export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="${FV_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-if [[ -f "${FV_VENV}/bin/activate" ]]; then
+# Official image: uv installer → $HOME/.local/bin; venv → /opt/venv.
+export PATH="${HOME}/.local/bin:/root/.local/bin:${FV_VENV}/bin:${PATH}"
+
+if [ -f "${HOME}/.local/bin/env" ]; then
     # shellcheck source=/dev/null
-    source "${FV_VENV}/bin/activate"
+    . "${HOME}/.local/bin/env"
+elif [ -f /root/.local/bin/env ]; then
+    # shellcheck source=/dev/null
+    . /root/.local/bin/env
+fi
+
+if [ -f "${FV_VENV}/bin/activate" ]; then
+    # shellcheck source=/dev/null
+    . "${FV_VENV}/bin/activate"
 fi

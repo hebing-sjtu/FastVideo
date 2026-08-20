@@ -308,6 +308,13 @@ class TrainingBatch:
     infos: list[dict[str, Any]] | None = None
     mask_lat_size: torch.Tensor | None = None
 
+    # v2v + geometry control. `control_latent` is the pixel-aligned source video
+    # that occupies the Wan I2V conditioning slot; `depth_latent` drives the
+    # ControlNet branch and `depth_wide_latent` its wider-FOV peripheral view.
+    control_latent: torch.Tensor | None = None
+    depth_latent: torch.Tensor | None = None
+    depth_wide_latent: torch.Tensor | None = None
+
     # ODE trajectory supervision
     trajectory_latents: torch.Tensor | None = None
     trajectory_timesteps: torch.Tensor | None = None

@@ -1,0 +1,82 @@
+# Stage 1 (BD): bidirectional Wan 2.2 A14B video-to-video with a depth ControlNet.
+#
+# The backbone is frozen and only `depth_controlnet.*` trains, so this stage
+# teaches the branch to read depth while the base model's video prior is left
+# untouched. Set `freeze_backbone: false` for a later joint pass if the branch
+# alone saturates.
+
+models:
+  student:
+    _target_: fastvideo.train.models.wan.WanV2VDepthModel
+    init_from: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+    trainable: true
+    flow_shift: 5.0
+    # A14B is a two-expert MoE; train one expert per run. `high` covers the
+    # noisy end of the schedule where structure is decided, which is where a
+    # geometry control signal matters most.
+    expert: high
+    enable_controlnet: true
+    enable_depth: true
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    controlnet_num_heads: 16
+    controlnet_layer_stride: 2
+    freeze_backbone: true
+    enable_wide_fov: false
+    control_dropout: 0.1
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    num_gpus: 16
+    sp_size: 4
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 16
+
+  data:
+    data_path:
+      data/game_v2v_depth/train: 1
+    dataloader_num_workers: 4
+    train_batch_size: 1
+    training_cfg_rate: 0.1
+    seed: 42
+    num_latent_t: 21
+    num_height: 480
+    num_width: 832
+    num_frames: 81
+
+  optimizer:
+    learning_rate: 1.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.0
+    lr_scheduler: constant_with_warmup
+    lr_warmup_steps: 200
+
+  loop:
+    max_train_steps: 20000
+    gradient_accumulation_steps: 1
+
+  checkpoint:
+    output_dir: outputs/game_v2v_depth/stage1_bd
+    training_state_checkpointing_steps: 1000
+    checkpoints_total_limit: 3
+
+  tracker:
+    project_name: game_v2v_depth
+    run_name: stage1_bd_controlnet
+
+  model:
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: fp32
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+pipeline:
+  flow_shift: 5

@@ -5,3 +5,7 @@ from fastvideo.train.models.wan.wan import (
     WanModel as WanModel, )
 from fastvideo.train.models.wan.wan_causal import (
     WanCausalModel as WanCausalModel, )
+from fastvideo.train.models.wan.wan_v2v_depth import (
+    WanV2VDepthModel as WanV2VDepthModel, )
+from fastvideo.train.models.wan.wan_causal_v2v_depth import (
+    WanCausalV2VDepthModel as WanCausalV2VDepthModel, )

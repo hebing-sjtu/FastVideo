@@ -4,7 +4,8 @@
 # Mental model: the Docker image is the runtime; this repo is the code.
 # Maintain the repo on your laptop, push, then on each training node:
 #
-#   First time (deploy key or PAT must already work):
+#   First time (deploy key or PAT must already work). Use bash, not sh:
+#     exec bash
 #     git clone git@github.com:hebing-sjtu/FastVideo.git /workspace/FastVideo
 #     bash /workspace/FastVideo/scripts/bootstrap_node.sh
 #
@@ -26,6 +27,13 @@
 #   FV_GIT_BRANCH   default current branch (usually main)
 
 set -euo pipefail
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "ERROR: this script must run under bash, not sh." >&2
+    echo "  exec bash" >&2
+    echo "  bash $0 $*" >&2
+    exit 1
+fi
 
 DO_PULL=1
 DO_INSTALL=1
@@ -54,7 +62,7 @@ export FV_VENV="${FV_VENV:-/opt/venv}"
 export FV_GIT_REMOTE="${FV_GIT_REMOTE:-origin}"
 
 # shellcheck source=/dev/null
-source "${SCRIPT_DIR}/node_env.sh"
+. "${SCRIPT_DIR}/node_env.sh"
 
 echo "=== FastVideo node bootstrap ==="
 echo "Host:       $(hostname)"
@@ -103,7 +111,18 @@ echo "Remote:   $(git remote get-url "${FV_GIT_REMOTE}")"
 
 if [[ "${DO_INSTALL}" -eq 1 ]]; then
     echo "Editable install (no dependency resolve) ..."
-    uv pip install -e ".[dev]" --no-deps
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install -e ".[dev]" --no-deps
+    elif [[ -x "${FV_VENV}/bin/pip" ]]; then
+        echo "uv not on PATH; falling back to ${FV_VENV}/bin/pip"
+        "${FV_VENV}/bin/pip" install -e ".[dev]" --no-deps
+    else
+        echo "ERROR: uv not found. On the official image it is /root/.local/bin/uv" >&2
+        echo "  echo \$0          # should be bash, not sh" >&2
+        echo "  ls /root/.local/bin/uv /opt/venv/bin/python" >&2
+        echo "  export PATH=\"/root/.local/bin:/opt/venv/bin:\$PATH\"" >&2
+        exit 1
+    fi
 fi
 
 if [[ "${DO_BASHRC}" -eq 1 ]]; then
@@ -115,7 +134,7 @@ ${marker_begin}
 export FV_REPO_DIR="${FV_REPO_DIR}"
 export FV_DATA_ROOT="${FV_DATA_ROOT}"
 export FV_VENV="${FV_VENV}"
-source "${SCRIPT_DIR}/node_env.sh"
+. "${SCRIPT_DIR}/node_env.sh"
 ${marker_end}
 EOF
 )
@@ -136,7 +155,8 @@ fi
 
 echo
 echo "--- sanity ---"
-python - <<'PY'
+echo "uv: $({ command -v uv || echo missing; })"
+"${FV_VENV}/bin/python" - <<'PY'
 import sys
 print("python:", sys.executable)
 try:

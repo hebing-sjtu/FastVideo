@@ -1,0 +1,91 @@
+# Stage 2 (AR): convert the stage-1 model to block-causal attention.
+#
+# Teacher-forcing SFT is what makes the model tolerate its own clean context:
+# each chunk is denoised while attending to ground-truth history, which is the
+# layout streaming inference produces. The depth branch is inherited from stage 1
+# via `controlnet_checkpoint`, so it starts already able to read depth and only
+# has to relearn it under a causal mask.
+
+models:
+  student:
+    _target_: fastvideo.train.models.wan.WanCausalV2VDepthModel
+    init_from: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+    trainable: true
+    flow_shift: 5.0
+    expert: high
+    enable_controlnet: true
+    enable_depth: true
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    controlnet_num_heads: 16
+    controlnet_layer_stride: 2
+    # The backbone must adapt to causal attention, so it cannot stay frozen here.
+    freeze_backbone: false
+    enable_wide_fov: false
+    control_dropout: 0.1
+    num_frames_per_block: 3
+    controlnet_checkpoint: outputs/game_v2v_depth/stage1_bd/checkpoint-20000
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.tfsft.TeacherForcingSFTMethod
+  chunk_size: 3
+  min_timestep_ratio: 0.02
+  max_timestep_ratio: 0.98
+
+training:
+  distributed:
+    num_gpus: 16
+    sp_size: 4
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 16
+
+  data:
+    data_path:
+      data/game_v2v_depth/train: 1
+    dataloader_num_workers: 4
+    train_batch_size: 1
+    training_cfg_rate: 0.1
+    seed: 42
+    num_latent_t: 21
+    num_height: 480
+    num_width: 832
+    num_frames: 81
+
+  optimizer:
+    learning_rate: 2.0e-5
+    betas: [0.9, 0.95]
+    weight_decay: 0.0
+    lr_scheduler: constant
+    lr_warmup_steps: 0
+
+  loop:
+    max_train_steps: 10000
+    gradient_accumulation_steps: 1
+
+  checkpoint:
+    output_dir: outputs/game_v2v_depth/stage2_ar
+    training_state_checkpointing_steps: 1000
+    checkpoints_total_limit: 3
+
+  tracker:
+    project_name: game_v2v_depth
+    run_name: stage2_ar_tfsft
+
+  model:
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: fp32
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+pipeline:
+  flow_shift: 5
+  dit_config:
+    # 6 latent frames of attention window = 2 chunks of 3; the KV cache is sized
+    # from this, so it sets the streaming memory floor.
+    local_attn_size: 6
+    sink_size: 1

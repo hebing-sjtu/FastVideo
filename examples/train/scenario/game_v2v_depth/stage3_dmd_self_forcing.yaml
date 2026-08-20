@@ -1,0 +1,146 @@
+# Stage 3 (DMD): distill the causal model down to 4 denoising steps.
+#
+# The student rolls out chunk by chunk through its own KV cache, so it is trained
+# on the error distribution it will actually see when streaming. Teacher and
+# critic stay bidirectional (they only score full clips) and inherit stage 1's
+# branch, which is why they need the depth branch too.
+#
+# Note which handoff key each role uses. A checkpoint only stores parameters that
+# had `requires_grad`, so stage 1 (frozen backbone) saved the branch alone and
+# must be layered onto `init_from` with `controlnet_checkpoint`. Stage 2 trained
+# the whole transformer, so the student can take it wholesale with
+# `init_checkpoint`.
+#
+# This is also the stage that turns on the optional wide-FOV depth branch. It is
+# warm-started with a zeroed output gate, so enabling it here does not disturb the
+# stage-2 result; drop `enable_wide_fov` everywhere to skip it.
+
+models:
+  student:
+    _target_: fastvideo.train.models.wan.WanCausalV2VDepthModel
+    init_from: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+    trainable: true
+    flow_shift: 5.0
+    expert: high
+    enable_controlnet: true
+    enable_depth: true
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    controlnet_num_heads: 16
+    controlnet_layer_stride: 2
+    freeze_backbone: false
+    enable_wide_fov: true
+    wide_fov_scale: 0.5
+    num_frames_per_block: 3
+    init_checkpoint: outputs/game_v2v_depth/stage2_ar/checkpoint-10000
+  teacher:
+    _target_: fastvideo.train.models.wan.WanV2VDepthModel
+    init_from: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+    trainable: false
+    disable_custom_init_weights: true
+    expert: high
+    enable_controlnet: true
+    enable_depth: true
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    controlnet_num_heads: 16
+    controlnet_layer_stride: 2
+    freeze_backbone: false
+    enable_wide_fov: true
+    wide_fov_scale: 0.5
+    controlnet_checkpoint: outputs/game_v2v_depth/stage1_bd/checkpoint-20000
+  critic:
+    _target_: fastvideo.train.models.wan.WanV2VDepthModel
+    init_from: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+    trainable: true
+    disable_custom_init_weights: true
+    expert: high
+    enable_controlnet: true
+    enable_depth: true
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    controlnet_num_heads: 16
+    controlnet_layer_stride: 2
+    freeze_backbone: false
+    enable_wide_fov: true
+    wide_fov_scale: 0.5
+    controlnet_checkpoint: outputs/game_v2v_depth/stage1_bd/checkpoint-20000
+
+method:
+  _target_: fastvideo.train.methods.distribution_matching.self_forcing.SelfForcingMethod
+  rollout_mode: simulate
+  generator_update_interval: 5
+  dmd_denoising_steps: [1000, 750, 500, 250]
+  warp_denoising_step: true
+  min_timestep_ratio: 0.02
+  max_timestep_ratio: 0.98
+
+  chunk_size: 3
+  student_sample_type: sde
+  same_step_across_blocks: true
+  last_step_only: false
+  context_noise: 0.0
+  enable_gradient_in_rollout: true
+  start_gradient_frame: 0
+
+  fake_score_learning_rate: 3.0e-7
+  fake_score_betas: [0.9, 0.95]
+  fake_score_lr_scheduler: constant
+
+training:
+  distributed:
+    num_gpus: 16
+    sp_size: 4
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 16
+
+  data:
+    data_path: data/game_v2v_depth/train
+    dataloader_num_workers: 4
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 1001
+    num_latent_t: 21
+    num_height: 480
+    num_width: 832
+    num_frames: 81
+
+  optimizer:
+    learning_rate: 3.0e-6
+    betas: [0.9, 0.95]
+    weight_decay: 0.0
+    lr_scheduler: constant
+    lr_warmup_steps: 0
+
+  loop:
+    max_train_steps: 3000
+    gradient_accumulation_steps: 1
+
+  checkpoint:
+    output_dir: outputs/game_v2v_depth/stage3_dmd
+    training_state_checkpointing_steps: 500
+    checkpoints_total_limit: 2
+
+  tracker:
+    project_name: game_v2v_depth
+    run_name: stage3_dmd_self_forcing
+
+  model:
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: fp32
+
+callbacks:
+  ema:
+    decay: 0.99
+    start_iter: 200
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+pipeline:
+  flow_shift: 5
+  dit_config:
+    local_attn_size: 6
+    sink_size: 1
