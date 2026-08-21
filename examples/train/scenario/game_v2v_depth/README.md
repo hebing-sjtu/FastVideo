@@ -107,11 +107,15 @@ training transformer into `WanV2VDepthPipeline`, so the ControlNet weights being
 trained are the ones sampled — no checkpoint round-trip.
 
 The pipeline deliberately does **not** reuse `WanVideoToVideoPipeline`: that one
-builds the Wan-Fun-Control layout `[noise | source | zeros]`, whereas training
-builds `[noise | mask | source]`. `WanV2VDepthConditioningStage` reproduces the
-training layout, and both it and `encode_v2v_depth_samples.py` share
-`fastvideo/dataset/v2v_depth_preprocess.py`, so crop, resize and depth encoding
-cannot drift between the cache and validation.
+needs a pre-populated `batch.video_latent` no validation record can supply, and
+it builds the Wan-Fun-Control layout `[noise | source | zeros]` (48 channels)
+whereas training builds `[noise | mask | source]` (36 on Fun-InP).
+`WanV2VDepthConditioningStage` reproduces the training layout.
+
+That stage mirrors the crop, resize and depth encoding in
+`encode_v2v_depth_samples.py`. **Change one and change the other** — a mismatch
+shifts the control signal against the frame silently and only shows up as worse
+metrics.
 
 Build the validation set from the same pack the cache came from:
 

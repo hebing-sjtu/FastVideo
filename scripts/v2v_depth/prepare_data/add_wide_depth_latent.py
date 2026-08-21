@@ -25,9 +25,7 @@ from pathlib import Path
 
 import torch
 
-from encode_v2v_depth_samples import Encoders
-
-from fastvideo.dataset.v2v_depth_preprocess import load_depth_clip
+from encode_v2v_depth_samples import Encoders, load_depth_clip
 
 
 def parse_args() -> argparse.Namespace:
