@@ -67,6 +67,13 @@ def parse_args() -> argparse.Namespace:
                         help="Must satisfy (num_frames - 1) %% 4 == 0 for the Wan VAE.")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
+    # Outer-edge crop BEFORE resize. Fractions of the source H/W removed from
+    # each side. KOF / SF3-style HUD (measured on 1280x720 src): top≈0.175
+    # clears portraits+HP+timer; bottom≈0.105 clears super meters.
+    parser.add_argument("--crop-top", type=float, default=0.0)
+    parser.add_argument("--crop-bottom", type=float, default=0.0)
+    parser.add_argument("--crop-left", type=float, default=0.0)
+    parser.add_argument("--crop-right", type=float, default=0.0)
     parser.add_argument("--depth-near", type=float, default=0.1)
     parser.add_argument("--depth-far", type=float, default=500.0)
     parser.add_argument("--depth-encoding", choices=("disparity", "linear"), default="disparity")
@@ -85,12 +92,37 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--depth-near must be > 0 and --depth-far must exceed it")
     if not 0 <= args.shard_index < args.num_shards:
         raise SystemExit("--shard-index must be in [0, --num-shards)")
+    for name in ("crop_top", "crop_bottom", "crop_left", "crop_right"):
+        value = float(getattr(args, name))
+        if not 0.0 <= value < 0.5:
+            raise SystemExit(f"--{name.replace('_', '-')} must be in [0, 0.5), got {value}")
+    if args.crop_top + args.crop_bottom >= 1.0 or args.crop_left + args.crop_right >= 1.0:
+        raise SystemExit("crop fractions leave an empty frame")
     return args
 
 
 # ----------------------------------------------------------------------
 # Frame loading
 # ----------------------------------------------------------------------
+
+
+def _crop_box(
+    width: int,
+    height: int,
+    *,
+    crop_top: float,
+    crop_bottom: float,
+    crop_left: float,
+    crop_right: float,
+) -> tuple[int, int, int, int]:
+    """Return PIL-style ``(left, top, right, bottom)`` pixel box."""
+    left = int(round(crop_left * width))
+    top = int(round(crop_top * height))
+    right = width - int(round(crop_right * width))
+    bottom = height - int(round(crop_bottom * height))
+    if right - left < 2 or bottom - top < 2:
+        raise ValueError(f"crop emptied the frame: box=({left}, {top}, {right}, {bottom}) from {width}x{height}")
+    return left, top, right, bottom
 
 
 def _read_frames(path: Path, num_frames: int) -> list[Any]:
@@ -112,14 +144,39 @@ def _read_frames(path: Path, num_frames: int) -> list[Any]:
     return frames[:num_frames]
 
 
-def load_rgb_clip(path: Path, *, num_frames: int, height: int, width: int) -> torch.Tensor:
-    """Load an RGB clip as ``[1, 3, T, H, W]`` in [-1, 1]."""
+def load_rgb_clip(
+    path: Path,
+    *,
+    num_frames: int,
+    height: int,
+    width: int,
+    crop_top: float = 0.0,
+    crop_bottom: float = 0.0,
+    crop_left: float = 0.0,
+    crop_right: float = 0.0,
+) -> torch.Tensor:
+    """Load an RGB clip as ``[1, 3, T, H, W]`` in [-1, 1].
+
+    Outer-edge crop (fractions of the native resolution) runs before the resize
+    to ``(width, height)``, so HUD bands are removed at source aspect.
+    """
     from PIL import Image
 
     frames = _read_frames(path, num_frames)
     tensors = []
+    crop = None
     for frame in frames:
-        frame = frame.convert("RGB").resize((width, height), Image.BICUBIC)
+        frame = frame.convert("RGB")
+        if crop is None:
+            crop = _crop_box(
+                frame.size[0],
+                frame.size[1],
+                crop_top=crop_top,
+                crop_bottom=crop_bottom,
+                crop_left=crop_left,
+                crop_right=crop_right,
+            )
+        frame = frame.crop(crop).resize((width, height), Image.BICUBIC)
         array = np.asarray(frame, dtype=np.float32) / 255.0
         tensors.append(torch.from_numpy(array).permute(2, 0, 1))
     clip = torch.stack(tensors, dim=1).unsqueeze(0)
@@ -135,6 +192,10 @@ def load_depth_clip(
     near: float,
     far: float,
     encoding: str,
+    crop_top: float = 0.0,
+    crop_bottom: float = 0.0,
+    crop_left: float = 0.0,
+    crop_right: float = 0.0,
 ) -> torch.Tensor:
     """Load a depth clip as ``[1, 3, T, H, W]`` in [-1, 1].
 
@@ -148,11 +209,23 @@ def load_depth_clip(
 
     frames = _read_frames(path, num_frames)
     tensors = []
+    crop = None
     for frame in frames:
         array = np.asarray(frame)
         if array.ndim == 3:
             array = array[..., 0]
-        array = array.astype(np.float32)
+        if crop is None:
+            left, top, right, bottom = _crop_box(
+                array.shape[1],
+                array.shape[0],
+                crop_top=crop_top,
+                crop_bottom=crop_bottom,
+                crop_left=crop_left,
+                crop_right=crop_right,
+            )
+            crop = (top, bottom, left, right)
+        top, bottom, left, right = crop
+        array = array[top:bottom, left:right].astype(np.float32)
         if array.max() > 1.5:
             # Integer source: >255 means a 16-bit metric map, otherwise 8-bit
             # normalized. Both end up in [0, 1] with 1 == nearest.
@@ -255,8 +328,24 @@ def main() -> None:
 
         try:
             near, far = entry.get("depth_range", (args.depth_near, args.depth_far))
-            common = {"num_frames": args.num_frames, "height": args.height, "width": args.width}
-            depth_common = {**common, "near": float(near), "far": float(far), "encoding": args.depth_encoding}
+            crop = {
+                "crop_top": float(args.crop_top),
+                "crop_bottom": float(args.crop_bottom),
+                "crop_left": float(args.crop_left),
+                "crop_right": float(args.crop_right),
+            }
+            common = {
+                "num_frames": args.num_frames,
+                "height": args.height,
+                "width": args.width,
+                **crop,
+            }
+            depth_common = {
+                **common,
+                "near": float(near),
+                "far": float(far),
+                "encoding": args.depth_encoding,
+            }
 
             sample: dict[str, Any] = {
                 "vae_latent": encoders.encode_video(load_rgb_clip(root / entry["target"], **common)),
@@ -279,6 +368,7 @@ def main() -> None:
                 "depth_encoding": args.depth_encoding,
                 "num_frames": args.num_frames,
                 "resolution": [args.height, args.width],
+                "crop": crop,
             }
 
             shapes = {key: tuple(value.shape) for key, value in sample.items() if torch.is_tensor(value)}

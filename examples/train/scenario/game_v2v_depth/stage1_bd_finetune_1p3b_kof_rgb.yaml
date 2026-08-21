@@ -1,8 +1,12 @@
 # Stage 1 pipeline smoke on Fun-1.3B + kof_1k RGB (no depth yet).
 #
+# Encode with HUD crop before resize (SF3-style bars on this pack):
+#   --crop-top 0.175 --crop-bottom 0.105
+# Measured on 1280x720 video_src: top clears portraits+HP+timer,
+# bottom clears super meters. Same fractions apply to 1344x768 targets.
+#
 # This pack has video_src / video_target / prompt only. ControlNet is OFF so the
 # run validates: encode → dataloader → V2V channel concat → BD finetune.
-# Turn enable_controlnet/enable_depth back on after depth is available.
 
 models:
   student:
