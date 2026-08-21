@@ -224,6 +224,17 @@ class DenoisingStage(PipelineStage):
             },
         )
 
+        # Depth control rides as an explicit kwarg rather than an input channel,
+        # so it survives the ControlNet branch being absent: a transformer whose
+        # forward does not name these gets nothing.
+        control_kwargs = self.prepare_extra_func_kwargs(
+            self.transformer.forward,
+            {
+                "depth_latent": batch.extra.get("depth_latent"),
+                "depth_wide_latent": batch.extra.get("depth_wide_latent"),
+            },
+        )
+
         # Get latents and embeddings
         latents = batch.latents
         cast_embeds = getattr(fastvideo_args.pipeline_config.dit_config, "cast_prompt_embeds_to_dit_dtype", False)
@@ -522,6 +533,7 @@ class DenoisingStage(PipelineStage):
                             **dreamx_camera_kwargs,
                             **timesteps_r_kwarg,
                             **flux2_id_kwargs,
+                            **control_kwargs,
                         )
 
                     if batch.do_classifier_free_guidance:
@@ -565,6 +577,7 @@ class DenoisingStage(PipelineStage):
                                     **dreamx_camera_kwargs,
                                     **timesteps_r_kwarg,
                                     **flux2_id_kwargs,
+                                    **control_kwargs,
                                 )
                             _cfg_gate_fresh_uncond += 1
 

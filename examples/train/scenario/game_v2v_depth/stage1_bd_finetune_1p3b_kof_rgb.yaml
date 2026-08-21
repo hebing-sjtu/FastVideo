@@ -75,5 +75,33 @@ callbacks:
     _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
     max_grad_norm: 1.0
 
+  validation:
+    _target_: fastvideo.train.callbacks.validation.ValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.wan.wan_v2v_depth_pipeline.WanV2VDepthPipeline
+    # Build with scripts/v2v_depth/prepare_data/kof_jsonl_to_validation_json.py.
+    # crop_* live in that file and must match the encode run's crop.
+    dataset_file: /data/raw/kof_1k_pre_q_060_rgb/validation_val8.json
+    every_steps: 100
+    run_at_start: true
+    sampling_steps: [30]
+    num_frames: 81
+    guidance_scale: 5.0
+    # The source clip is the conditioning signal; the callback must not also
+    # treat its first frame as an image-to-video prompt.
+    use_validation_media_conditioning: false
+    # A 1.3B pipeline plus optimizer state does not fit twice on one card.
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+    metrics:
+      enabled: true
+      names:
+        - vbench.imaging_quality
+        - vbench.aesthetic_quality
+        - vbench.subject_consistency
+        - vbench.background_consistency
+      skip_missing_deps: true
+      strict: false
+      unload_after_validation: true
+
 pipeline:
   flow_shift: 5

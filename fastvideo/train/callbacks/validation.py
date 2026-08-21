@@ -103,6 +103,25 @@ DEFAULT_VALIDATION_VBENCH_METRICS = [
     "vbench.dynamic_degree",
 ]
 
+# Control-conditioning fields forwarded verbatim from a validation record into
+# ``ForwardBatch.extra``. ``ValidationDataset`` has already resolved the paths
+# and decoded whatever it recognises; a pipeline stage decides what to do with
+# them. The list is explicit so an unrelated dataset column can never end up
+# being interpreted as conditioning.
+CONTROL_CONDITION_PASSTHROUGH_KEYS = (
+    "control_video",
+    "control_video_path",
+    "depth_video_path",
+    "depth_wide_video_path",
+    "crop_top",
+    "crop_bottom",
+    "crop_left",
+    "crop_right",
+    "depth_near",
+    "depth_far",
+    "depth_encoding",
+)
+
 SYNTHETIC_OPTICAL_FLOW_METRIC = "optical_flow.synthetic_optical_flow"
 SYNTHETIC_OPTICAL_FLOW_LOG_KEYS = (
     "mf_epe_mean",
@@ -1382,6 +1401,11 @@ class ValidationCallback(Callback):
         # Conditionally set I2V fields.
         if ("image" in validation_batch and validation_batch["image"] is not None):
             batch.pil_image = validation_batch["image"]
+
+        for key in CONTROL_CONDITION_PASSTHROUGH_KEYS:
+            value = validation_batch.get(key)
+            if value is not None:
+                batch.extra[key] = value
 
         self._attach_action_conditions(
             batch,

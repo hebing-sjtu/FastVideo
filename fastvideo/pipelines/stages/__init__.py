@@ -46,6 +46,9 @@ from fastvideo.pipelines.stages.longcat_video_vae_encoding import LongCatVideoVA
 from fastvideo.pipelines.stages.longcat_kv_cache_init import LongCatKVCacheInitStage
 from fastvideo.pipelines.stages.longcat_vc_denoising import LongCatVCDenoisingStage
 
+# Video-to-video + depth ControlNet stages
+from fastvideo.pipelines.stages.v2v_depth_conditioning import WanV2VDepthConditioningStage
+
 __all__ = [
     "PipelineStage",
     "InputValidationStage",
@@ -101,4 +104,6 @@ __all__ = [
     "LongCatVideoVAEEncodingStage",
     "LongCatKVCacheInitStage",
     "LongCatVCDenoisingStage",
+    # Video-to-video + depth ControlNet stages
+    "WanV2VDepthConditioningStage",
 ]

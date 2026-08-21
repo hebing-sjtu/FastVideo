@@ -100,6 +100,63 @@ NNODES=2 NODE_RANK=1 MASTER_ADDR=<node0_ip> NUM_GPUS=8 \
 
 Then `stage2_ar_tfsft.yaml` → `stage3_dmd_self_forcing.yaml`.
 
+## Evaluation
+
+Validation runs inside the training loop. `ValidationCallback` injects the live
+training transformer into `WanV2VDepthPipeline`, so the ControlNet weights being
+trained are the ones sampled — no checkpoint round-trip.
+
+The pipeline deliberately does **not** reuse `WanVideoToVideoPipeline`: that one
+builds the Wan-Fun-Control layout `[noise | source | zeros]`, whereas training
+builds `[noise | mask | source]`. `WanV2VDepthConditioningStage` reproduces the
+training layout, and both it and `encode_v2v_depth_samples.py` share
+`fastvideo/dataset/v2v_depth_preprocess.py`, so crop, resize and depth encoding
+cannot drift between the cache and validation.
+
+Build the validation set from the same pack the cache came from:
+
+```bash
+python scripts/v2v_depth/prepare_data/kof_jsonl_to_validation_json.py \
+  --root /data/raw/kof_1k_pre_q_060_rgb \
+  --split val --limit 8 \
+  --num-frames 81 \
+  --crop-top 0.175 --crop-bottom 0.105 \
+  --out /data/raw/kof_1k_pre_q_060_rgb/validation_val8.json
+```
+
+Each record carries:
+
+| Field | Meaning |
+| --- | --- |
+| `caption` | prompt |
+| `control_video_path` | low-poly source clip — the V2V condition |
+| `ref_video` | teacher target, used as the metric reference |
+| `crop_*` | **must match the `--crop-*` used to encode the cache** |
+| `depth_video_path` | added by `--depth-subdir` once depth renders exist |
+
+`video_path` is intentionally absent: that key makes the callback treat the
+clip's first frame as an I2V prompt. Keep `use_validation_media_conditioning:
+false` in the YAML for the same reason.
+
+Wire it up per stage (see `stage1_bd_finetune_1p3b_kof_rgb.yaml`):
+
+```yaml
+callbacks:
+  validation:
+    _target_: fastvideo.train.callbacks.validation.ValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.wan.wan_v2v_depth_pipeline.WanV2VDepthPipeline
+    dataset_file: /data/raw/kof_1k_pre_q_060_rgb/validation_val8.json
+    every_steps: 100
+    num_frames: 81
+    use_validation_media_conditioning: false
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+```
+
+Keep `--limit` small: eight clips at 30 sampling steps already costs real time
+on every validation event, and the callback holds a full pipeline in memory
+alongside the training state.
+
 ## Checkpoint handoff
 
 | From → To | How |

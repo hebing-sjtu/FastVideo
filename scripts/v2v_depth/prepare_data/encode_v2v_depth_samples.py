@@ -47,8 +47,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
+
+from fastvideo.dataset.v2v_depth_preprocess import (load_depth_clip, load_rgb_clip)
 
 TEXT_MAX_LENGTH = 512
 
@@ -99,152 +100,6 @@ def parse_args() -> argparse.Namespace:
     if args.crop_top + args.crop_bottom >= 1.0 or args.crop_left + args.crop_right >= 1.0:
         raise SystemExit("crop fractions leave an empty frame")
     return args
-
-
-# ----------------------------------------------------------------------
-# Frame loading
-# ----------------------------------------------------------------------
-
-
-def _crop_box(
-    width: int,
-    height: int,
-    *,
-    crop_top: float,
-    crop_bottom: float,
-    crop_left: float,
-    crop_right: float,
-) -> tuple[int, int, int, int]:
-    """Return PIL-style ``(left, top, right, bottom)`` pixel box."""
-    left = int(round(crop_left * width))
-    top = int(round(crop_top * height))
-    right = width - int(round(crop_right * width))
-    bottom = height - int(round(crop_bottom * height))
-    if right - left < 2 or bottom - top < 2:
-        raise ValueError(f"crop emptied the frame: box=({left}, {top}, {right}, {bottom}) from {width}x{height}")
-    return left, top, right, bottom
-
-
-def _read_frames(path: Path, num_frames: int) -> list[Any]:
-    """Read a clip as a list of PIL images, from a video file or a frame directory."""
-    from PIL import Image
-
-    if path.is_dir():
-        frame_paths = sorted(p for p in path.iterdir()
-                             if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".exr", ".tiff"})
-        if not frame_paths:
-            raise FileNotFoundError(f"No frames found in {path}")
-        frames = [Image.open(p) for p in frame_paths]
-    else:
-        from fastvideo.models.vision_utils import load_video
-
-        frames = load_video(str(path))
-    if len(frames) < num_frames:
-        raise ValueError(f"{path} has {len(frames)} frames, need {num_frames}")
-    return frames[:num_frames]
-
-
-def load_rgb_clip(
-    path: Path,
-    *,
-    num_frames: int,
-    height: int,
-    width: int,
-    crop_top: float = 0.0,
-    crop_bottom: float = 0.0,
-    crop_left: float = 0.0,
-    crop_right: float = 0.0,
-) -> torch.Tensor:
-    """Load an RGB clip as ``[1, 3, T, H, W]`` in [-1, 1].
-
-    Outer-edge crop (fractions of the native resolution) runs before the resize
-    to ``(width, height)``, so HUD bands are removed at source aspect.
-    """
-    from PIL import Image
-
-    frames = _read_frames(path, num_frames)
-    tensors = []
-    crop = None
-    for frame in frames:
-        frame = frame.convert("RGB")
-        if crop is None:
-            crop = _crop_box(
-                frame.size[0],
-                frame.size[1],
-                crop_top=crop_top,
-                crop_bottom=crop_bottom,
-                crop_left=crop_left,
-                crop_right=crop_right,
-            )
-        frame = frame.crop(crop).resize((width, height), Image.BICUBIC)
-        array = np.asarray(frame, dtype=np.float32) / 255.0
-        tensors.append(torch.from_numpy(array).permute(2, 0, 1))
-    clip = torch.stack(tensors, dim=1).unsqueeze(0)
-    return clip * 2.0 - 1.0
-
-
-def load_depth_clip(
-    path: Path,
-    *,
-    num_frames: int,
-    height: int,
-    width: int,
-    near: float,
-    far: float,
-    encoding: str,
-    crop_top: float = 0.0,
-    crop_bottom: float = 0.0,
-    crop_left: float = 0.0,
-    crop_right: float = 0.0,
-) -> torch.Tensor:
-    """Load a depth clip as ``[1, 3, T, H, W]`` in [-1, 1].
-
-    Accepts 16-bit PNG/TIFF frame directories carrying metres directly, and
-    8-bit videos already carrying a normalized map. The distinction matters:
-    a 16-bit source is remapped through the fixed near/far pair, while an 8-bit
-    source is assumed to have been normalized by the renderer and is only
-    rescaled to [-1, 1].
-    """
-    from PIL import Image
-
-    frames = _read_frames(path, num_frames)
-    tensors = []
-    crop = None
-    for frame in frames:
-        array = np.asarray(frame)
-        if array.ndim == 3:
-            array = array[..., 0]
-        if crop is None:
-            left, top, right, bottom = _crop_box(
-                array.shape[1],
-                array.shape[0],
-                crop_top=crop_top,
-                crop_bottom=crop_bottom,
-                crop_left=crop_left,
-                crop_right=crop_right,
-            )
-            crop = (top, bottom, left, right)
-        top, bottom, left, right = crop
-        array = array[top:bottom, left:right].astype(np.float32)
-        if array.max() > 1.5:
-            # Integer source: >255 means a 16-bit metric map, otherwise 8-bit
-            # normalized. Both end up in [0, 1] with 1 == nearest.
-            if array.max() > 255.0:
-                metres = np.clip(array / 1000.0, near, far)
-                if encoding == "disparity":
-                    normalized = (1.0 / metres - 1.0 / far) / (1.0 / near - 1.0 / far)
-                else:
-                    normalized = 1.0 - (metres - near) / (far - near)
-            else:
-                normalized = array / 255.0
-        else:
-            normalized = array
-        normalized = np.clip(normalized, 0.0, 1.0)
-        image = Image.fromarray((normalized * 255.0).astype(np.uint8)).resize((width, height), Image.BILINEAR)
-        single = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0)
-        tensors.append(single.unsqueeze(0).repeat(3, 1, 1))
-    clip = torch.stack(tensors, dim=1).unsqueeze(0)
-    return clip * 2.0 - 1.0
 
 
 # ----------------------------------------------------------------------

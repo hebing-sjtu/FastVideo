@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _jsonl_path(root: Path, split: str) -> Path:
+def jsonl_path(root: Path, split: str) -> Path:
     data = root / "data"
     mapping = {
         "train": data / "kof_1k_pre_q_060_train.jsonl",
@@ -47,7 +47,7 @@ def _jsonl_path(root: Path, split: str) -> Path:
     return path
 
 
-def _clip_id(row: dict) -> str:
+def clip_id_of(row: dict) -> str:
     for key in ("id", "clip_id", "name", "sample_id"):
         value = row.get(key)
         if value:
@@ -55,7 +55,7 @@ def _clip_id(row: dict) -> str:
     raise KeyError(f"row has no id-like field: keys={sorted(row)}")
 
 
-def _prompt(row: dict, root: Path, clip_id: str) -> str:
+def prompt_of(row: dict, root: Path, clip_id: str) -> str:
     for key in ("prompt", "caption", "text"):
         value = row.get(key)
         if isinstance(value, str) and value.strip():
@@ -66,7 +66,7 @@ def _prompt(row: dict, root: Path, clip_id: str) -> str:
     return ""
 
 
-def _resolve_videos(row: dict, root: Path, clip_id: str) -> tuple[str, str]:
+def resolve_videos(row: dict, root: Path, clip_id: str) -> tuple[str, str]:
     """Return (target, source) paths relative to root."""
     # Prefer explicit fields if the pack jsonl already carries them.
     target = row.get("video_target") or row.get("target") or row.get("teacher_video")
@@ -80,7 +80,7 @@ def _resolve_videos(row: dict, root: Path, clip_id: str) -> tuple[str, str]:
 def main() -> None:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
-    src = _jsonl_path(root, args.split)
+    src = jsonl_path(root, args.split)
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -91,9 +91,9 @@ def main() -> None:
             if not line:
                 continue
             row = json.loads(line)
-            clip_id = _clip_id(row)
-            target, source = _resolve_videos(row, root, clip_id)
-            prompt = _prompt(row, root, clip_id)
+            clip_id = clip_id_of(row)
+            target, source = resolve_videos(row, root, clip_id)
+            prompt = prompt_of(row, root, clip_id)
             # Flat cache name: list_dir only picks *.pt in one directory.
             name = clip_id.replace("/", "__")
 
