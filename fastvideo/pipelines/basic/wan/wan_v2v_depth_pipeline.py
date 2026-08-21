@@ -7,9 +7,12 @@ It differs from ``WanVideoToVideoPipeline`` in two ways that matter:
 * Conditioning goes through ``WanV2VDepthConditioningStage``, which reproduces
   the training plugin's ``[noise | mask | source]`` channel layout instead of
   the Wan-Fun-Control ``[noise | source | zeros]`` one.
-* No CLIP image encoder is required. Video-to-video conditions on the source
-  clip's latent, so the I2V vision tower is dead weight -- and the Fun-InP
-  snapshots this recipe starts from do not ship one.
+* No CLIP image encoder is loaded. The Fun-InP and A14B snapshots do ship one,
+  and their transformers keep an image cross-attention branch, but the training
+  plugin never populates ``encoder_hidden_states_image`` -- the cached samples
+  carry no CLIP feature. Leaving the encoder out of the required modules is what
+  guarantees validation runs that branch in the same inactive state training
+  did, rather than depending on a stage happening not to fill it in.
 """
 
 from fastvideo.fastvideo_args import FastVideoArgs
