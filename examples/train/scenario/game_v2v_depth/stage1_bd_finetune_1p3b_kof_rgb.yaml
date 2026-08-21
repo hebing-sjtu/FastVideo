@@ -33,7 +33,8 @@ training:
     hsdp_shard_dim: 8
 
   data:
-    data_path: /data/cache/kof_1k_pre_q_060_fun1p3b/train
+    # VAE-encoded .pt cache (not the RGB pack). Keep under /data/raw/.
+    data_path: /data/raw/kof_1k_pre_q_060_fun1p3b_latents/train
     dataloader_num_workers: 4
     train_batch_size: 1
     training_cfg_rate: 0.1
