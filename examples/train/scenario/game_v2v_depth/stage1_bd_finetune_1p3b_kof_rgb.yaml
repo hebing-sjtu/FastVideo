@@ -1,0 +1,74 @@
+# Stage 1 pipeline smoke on Fun-1.3B + kof_1k RGB (no depth yet).
+#
+# This pack has video_src / video_target / prompt only. ControlNet is OFF so the
+# run validates: encode → dataloader → V2V channel concat → BD finetune.
+# Turn enable_controlnet/enable_depth back on after depth is available.
+
+models:
+  student:
+    _target_: fastvideo.train.models.wan.WanV2VDepthModel
+    init_from: /data/models/Wan2.1-Fun-1.3B-InP-Diffusers
+    trainable: true
+    flow_shift: 5.0
+    expert: high
+    enable_controlnet: false
+    enable_depth: false
+    freeze_backbone: false
+    enable_wide_fov: false
+    control_dropout: 0.1
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    num_gpus: 8
+    sp_size: 1
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 8
+
+  data:
+    data_path: /data/cache/kof_1k_pre_q_060_fun1p3b/train
+    dataloader_num_workers: 4
+    train_batch_size: 1
+    training_cfg_rate: 0.1
+    seed: 42
+    # 81 RGB frames → 21 latent frames for Wan VAE (4x temporal).
+    num_latent_t: 21
+    num_height: 480
+    num_width: 832
+    num_frames: 81
+
+  optimizer:
+    learning_rate: 1.0e-5
+    betas: [0.9, 0.95]
+    weight_decay: 0.0
+    lr_scheduler: constant_with_warmup
+    lr_warmup_steps: 50
+
+  loop:
+    max_train_steps: 200
+    gradient_accumulation_steps: 1
+
+  checkpoint:
+    output_dir: /data/outputs/kof_1k_fun1p3b/stage1_bd_rgb_smoke
+    training_state_checkpointing_steps: 100
+    checkpoints_total_limit: 2
+
+  tracker:
+    project_name: kof_v2v_1p3b
+    run_name: stage1_bd_rgb_smoke
+
+  model:
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: fp32
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+pipeline:
+  flow_shift: 5

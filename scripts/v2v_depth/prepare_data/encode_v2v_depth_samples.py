@@ -245,7 +245,9 @@ def main() -> None:
 
     written = skipped = failed = 0
     for index, entry in enumerate(entries):
-        name = entry.get("name") or Path(str(entry["target"])).stem
+        # Flatten ids like ``kof-video-0809/seg_0001`` — the train loader only
+        # scans one directory level for ``*.pt``.
+        name = str(entry.get("name") or Path(str(entry["target"])).stem).replace("/", "__")
         out_path = output_dir / f"{name}.pt"
         if out_path.exists() and not args.overwrite:
             skipped += 1
