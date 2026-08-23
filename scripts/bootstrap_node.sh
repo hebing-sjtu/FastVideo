@@ -13,8 +13,12 @@
 #     bash /workspace/FastVideo/scripts/bootstrap_node.sh
 #
 # This script pulls, reinstalls the editable package (no torch rebuild),
-# creates local data dirs, and hooks the env into ~/.bashrc.
+# creates local data dirs, and hooks the env into ~/.bashrc and ~/.zshrc.
 # It does not start training and does not configure laptop SSH.
+#
+# Running it does not change your current shell: it is a child process, so its
+# PATH and venv die with it. For an already-open shell:
+#   . /workspace/FastVideo/scripts/node_env.sh
 #
 # Usage:
 #   bash scripts/bootstrap_node.sh [--no-pull] [--no-install] [--no-bashrc]
@@ -127,7 +131,6 @@ if [[ "${DO_INSTALL}" -eq 1 ]]; then
 fi
 
 if [[ "${DO_BASHRC}" -eq 1 ]]; then
-    bashrc="${HOME}/.bashrc"
     marker_begin="# >>> fastvideo-node >>>"
     marker_end="# <<< fastvideo-node <<<"
     block=$(cat <<EOF
@@ -139,19 +142,22 @@ export FV_VENV="${FV_VENV}"
 ${marker_end}
 EOF
 )
-    if [[ -f "${bashrc}" ]] && grep -q "${marker_begin}" "${bashrc}"; then
-        tmp="$(mktemp)"
-        awk -v b="${marker_begin}" -v e="${marker_end}" '
-            $0 == b { skip=1; next }
-            $0 == e { skip=0; next }
-            !skip { print }
-        ' "${bashrc}" > "${tmp}"
-        printf '\n%s\n' "${block}" >> "${tmp}"
-        mv "${tmp}" "${bashrc}"
-    else
-        printf '\n%s\n' "${block}" >> "${bashrc}"
-    fi
-    echo "Hooked env into ${bashrc}"
+    # Web consoles land in either shell, and each reads only its own rc.
+    for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
+        if [[ -f "${rc}" ]] && grep -q "${marker_begin}" "${rc}"; then
+            tmp="$(mktemp)"
+            awk -v b="${marker_begin}" -v e="${marker_end}" '
+                $0 == b { skip=1; next }
+                $0 == e { skip=0; next }
+                !skip { print }
+            ' "${rc}" > "${tmp}"
+            printf '\n%s\n' "${block}" >> "${tmp}"
+            mv "${tmp}" "${rc}"
+        else
+            printf '\n%s\n' "${block}" >> "${rc}"
+        fi
+        echo "Hooked env into ${rc}"
+    done
 fi
 
 echo
