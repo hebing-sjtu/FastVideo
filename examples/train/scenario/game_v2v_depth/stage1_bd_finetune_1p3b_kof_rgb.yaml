@@ -11,7 +11,9 @@
 models:
   student:
     _target_: fastvideo.train.models.wan.WanV2VDepthModel
-    init_from: /data/models/Wan2.1-Fun-1.3B-InP-Diffusers
+    # Local disk, not the GCS mount: safetensors loads via mmap, which turns
+    # a mounted read into thousands of random object fetches.
+    init_from: /workspace/models/Wan2.1-Fun-1.3B-InP-Diffusers
     trainable: true
     flow_shift: 5.0
     expert: high
@@ -34,7 +36,7 @@ training:
 
   data:
     # VAE-encoded .pt cache (not the RGB pack). Keep under /data/raw/.
-    data_path: /data/raw/kof_1k_pre_q_060_fun1p3b_latents/train
+    data_path: /data/raw/kof_v2v_depth/train
     dataloader_num_workers: 4
     train_batch_size: 1
     training_cfg_rate: 0.1
