@@ -6,10 +6,15 @@
 
 : "${FV_REPO_DIR:=/workspace/FastVideo}"
 : "${FV_DATA_ROOT:=/data}"
+: "${FV_LOCAL_ROOT:=/workspace}"
 : "${FV_VENV:=/opt/venv}"
 
-export FV_REPO_DIR FV_DATA_ROOT FV_VENV
-export HF_HOME="${HF_HOME:-${FV_DATA_ROOT}/hf}"
+export FV_REPO_DIR FV_DATA_ROOT FV_LOCAL_ROOT FV_VENV
+
+# Weights must stay on local disk. safetensors loads via mmap, and mmap over
+# the gcsfuse mount at FV_DATA_ROOT turns one load into thousands of random
+# GCS reads — it hangs, and a mount hiccup faults the process with SIGBUS.
+export HF_HOME="${HF_HOME:-${FV_LOCAL_ROOT}/hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}}"
 export TOKENIZERS_PARALLELISM=false

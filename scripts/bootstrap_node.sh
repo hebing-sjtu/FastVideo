@@ -78,7 +78,8 @@ if [[ ! -f "${FV_VENV}/bin/activate" ]]; then
 fi
 
 mkdir -p \
-    "${FV_DATA_ROOT}/hf" \
+    "${FV_LOCAL_ROOT}/hf" \
+    "${FV_LOCAL_ROOT}/models" \
     "${FV_DATA_ROOT}/ckpt" \
     "${FV_DATA_ROOT}/raw" \
     "${FV_DATA_ROOT}/preprocessed" \
