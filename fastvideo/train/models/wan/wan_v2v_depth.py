@@ -292,7 +292,9 @@ class WanV2VDepthModel(WanModel):
         # source clip on a fraction of steps is what lets inference trade off
         # control strength. The text dropout is handled by the training method.
         if self._control_dropout > 0.0 and self.training_config is not None:
-            drop = torch.rand((), generator=generator, device="cpu").item() < self._control_dropout
+            # The training loop hands a CUDA generator; torch.rand requires the
+            # output device to match the generator's device.
+            drop = (torch.rand((), generator=generator, device=generator.device).item() < self._control_dropout)
             if drop:
                 training_batch.control_latent = torch.zeros_like(training_batch.control_latent)
         return training_batch
