@@ -75,18 +75,13 @@ def largest_valid_num_frames(usable: int) -> int:
     return (usable - FRAME_OFFSET) // FRAME_MULTIPLE * FRAME_MULTIPLE + FRAME_OFFSET
 
 
-def split_ids(root: Path, split: str) -> set[str] | None:
-    """Ids named by the split manifest, or None to accept every seg directory."""
-    if split == "all":
-        return None
+def read_split(root: Path, split: str) -> tuple[set[str], list[Path]]:
+    """Ids mentioned by one split's manifests, and the files they came from."""
     directory = root / "manifests"
     if not directory.is_dir():
         raise SystemExit(f"--split {split} needs {directory}, which does not exist. Use --split all to take every "
                          "seg directory.")
     matches = sorted(directory.glob(f"*_{split}.jsonl"))
-    if not matches:
-        listing = ", ".join(path.name for path in sorted(directory.iterdir())) or "(empty)"
-        raise SystemExit(f"No '*_{split}.jsonl' in {directory}. Found: {listing}")
     ids: set[str] = set()
     for path in matches:
         with open(path, encoding="utf-8") as handle:
@@ -97,9 +92,36 @@ def split_ids(root: Path, split: str) -> set[str] | None:
                 # Match against the raw line rather than parsed fields: the split file's schema is
                 # not part of this contract, only the seg ids it mentions.
                 ids.update(SEG_PATTERN.findall(line))
+    return ids, matches
+
+
+def split_ids(root: Path, split: str) -> set[str] | None:
+    """Ids named by the split manifest, or None to accept every seg directory.
+
+    Also cross-checks the sibling split. Two splits that share ids are not a situation any caller
+    asked for, and it is invisible downstream: training would simply include the held-out clips and
+    report a validation loss on data it had already fitted.
+    """
+    if split == "all":
+        return None
+    ids, matches = read_split(root, split)
+    if not matches:
+        directory = root / "manifests"
+        listing = ", ".join(path.name for path in sorted(directory.iterdir())) or "(empty)"
+        raise SystemExit(f"No '*_{split}.jsonl' in {directory}. Found: {listing}")
     if not ids:
         raise SystemExit(f"{', '.join(str(path) for path in matches)} mention no 'seg_NNNN' ids.")
     print(f"Split '{split}': {len(ids)} ids from {', '.join(path.name for path in matches)}")
+
+    sibling = "val" if split == "train" else "train"
+    other, other_matches = read_split(root, sibling)
+    if other_matches:
+        shared = ids & other
+        if shared:
+            print(f"  WARNING: {len(shared)} of these ids are also in '{sibling}' "
+                  f"({', '.join(sorted(shared)[:8])}{' ...' if len(shared) > 8 else ''}).")
+            print("  train and val are not disjoint, so every shared clip would be both trained on and "
+                  "validated on. Fix the split files before encoding.")
     return ids
 
 
@@ -201,6 +223,9 @@ def main() -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"Wrote {len(rows)} rows -> {out}")
+    # State the total explicitly: without it the reader has to add the lines below to notice that
+    # the split files reference more clips than the directory tree holds.
+    print(f"  {len(seg_dirs)} seg directories on disk, {len(rows)} of them usable in split '{args.split}'")
     if skipped_split:
         print(f"  {skipped_split} seg directories are not in split '{args.split}'")
     if incomplete:
