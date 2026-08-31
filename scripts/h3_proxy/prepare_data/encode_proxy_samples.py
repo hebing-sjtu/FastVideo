@@ -263,10 +263,26 @@ class Encoders:
 # ----------------------------------------------------------------------
 
 
+def free_localhost_port() -> str:
+    """Reserve an ephemeral port by binding it, then release it for the store to rebind."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return str(probe.getsockname()[1])
+
+
 def init_single_process_distributed() -> None:
-    """Initialize the one-rank process groups the component loaders require."""
+    """Initialize the one-rank process groups the component loaders require.
+
+    The port has to be per-process, not a fixed constant: sharding a manifest across eight GPUs
+    means eight of these running at once, and each rank-0 group stands up its own TCP store. A
+    shared port lets exactly one shard start and the other seven die on ``EADDRINUSE`` seconds in,
+    which looks like a data problem and is not one. An explicit ``MASTER_PORT`` still wins, so a
+    caller that needs a fixed port can set one.
+    """
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29533")
+    os.environ.setdefault("MASTER_PORT", free_localhost_port())
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
