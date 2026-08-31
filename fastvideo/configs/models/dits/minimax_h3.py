@@ -10,11 +10,18 @@ from fastvideo.platforms import AttentionBackendEnum
 
 
 def _is_minimax_h3_block(name: str, module: object) -> bool:
-    """Select the main and text-refiner transformer blocks for FSDP."""
+    """Select the main, text-refiner, and control-trunk blocks for FSDP.
+
+    The camera ControlNet's blocks are listed too: a 25-block trunk is a few hundred million
+    parameters, and leaving them out of the shard plan replicates them — plus their optimizer
+    state, the larger cost — on every rank. They are absent from a plain H3 model, so the extra
+    pattern matches nothing there.
+    """
     del module
     parts = name.split(".")
     return ((len(parts) == 2 and parts[0] == "transformer_blocks" and parts[1].isdigit())
-            or (len(parts) == 3 and parts[:2] == ["token_refiner", "refiner_blocks"] and parts[2].isdigit()))
+            or (len(parts) == 3 and parts[:2] == ["token_refiner", "refiner_blocks"] and parts[2].isdigit())
+            or (len(parts) == 3 and parts[:2] == ["camera_controlnet", "control_blocks"] and parts[2].isdigit()))
 
 
 @dataclass
@@ -31,6 +38,14 @@ class MiniMaxH3ArchConfig(DiTArchConfig):
         AttentionBackendEnum.ATTN_QAT_INFER,
         AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
     )
+
+    # LoRA targets are matched by substring against the full parameter path, so the leaf names in
+    # the 50 main blocks (`attn.to_*`, `ff.fc_*`) also occur in places that must not be adapted:
+    # the two text-refiner blocks, the timestep MLP (also named fc_in/fc_out after
+    # `param_names_mapping`), and the from-scratch control trunk, whose zero-initialised `proj_out`
+    # is the reason an untrained ControlNet is a no-op.
+    exclude_lora_layers: list[str] = field(
+        default_factory=lambda: ["token_refiner", "time_embedder", "camera_controlnet"])
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
@@ -59,6 +74,18 @@ class MiniMaxH3ArchConfig(DiTArchConfig):
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+
+    # Camera ControlNet. Absent from the released checkpoint: these describe a branch built on the
+    # meta device and initialized by the loader, so leaving `camera_enable_controlnet` false keeps
+    # the model bit-identical to the release.
+    camera_enable_controlnet: bool = False
+    camera_freeze_backbone: bool = True
+    camera_enable_depth: bool = False
+    camera_control_layer_stride: int = 2
+    camera_control_dim: int = 1024
+    camera_control_ffn_dim: int = 4096
+    camera_control_num_heads: int = 8
+    camera_control_temb_dim: int = 256
 
     def __post_init__(self) -> None:
         super().__post_init__()

@@ -130,7 +130,10 @@ def load_module_from_path(
     if transformer_override_safetensor:
         fastvideo_args.init_weights_from_safetensors = str(transformer_override_safetensor)
 
-    if attention_backend is not None and module_type != "transformer":
+    # Prefix rather than equality: `transformer_2` (a Wan MoE expert) and `transformer_ref` (H3's
+    # Ref2VA partition) are transformers too, and refusing them here would leave those roles unable
+    # to request a backend at all.
+    if attention_backend is not None and not module_type.startswith("transformer"):
         raise ValueError("attention_backend can only be set when loading "
                          f"a transformer, got module_type={module_type!r}")
     resolved_attention_backend = coerce_attn_backend(attention_backend)

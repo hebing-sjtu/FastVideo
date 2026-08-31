@@ -18,6 +18,10 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     MiniMaxH3PackedLayout,
     build_row_timesteps,
 )
+from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_camera_conditioning import (
+    MINIMAX_H3_CAMERA_LATENT_KEY,
+    MINIMAX_H3_CAMERA_ROWS_KEY,
+)
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import MINIMAX_H3_LAYOUT_KEY
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
@@ -133,6 +137,16 @@ class MiniMaxH3DenoisingStage(PipelineStage):
         text_indices = layout.text_indices.to(device)
         prompt_embeds = batch.prompt_embeds[0].to(device)
 
+        # Camera control is loop-invariant, so it is built once here rather than per step. Absent
+        # unless MiniMaxH3CameraConditioningStage ran and the request carried a trajectory; the
+        # plain backbone rejects these kwargs rather than ignoring them, so an empty dict is the
+        # only thing that keeps a non-ControlNet transformer working.
+        control_kwargs: dict[str, torch.Tensor] = {}
+        camera_latent = batch.extra.get(MINIMAX_H3_CAMERA_LATENT_KEY)
+        if camera_latent is not None:
+            control_kwargs[MINIMAX_H3_CAMERA_LATENT_KEY] = camera_latent.to(device)
+            control_kwargs[MINIMAX_H3_CAMERA_ROWS_KEY] = batch.extra[MINIMAX_H3_CAMERA_ROWS_KEY].to(device)
+
         vsa_metadata_builder = _h3_vsa_metadata_builder(self.transformer, fastvideo_args)
         if vsa_metadata_builder is not None:
             vsa_patch_size = fastvideo_args.pipeline_config.dit_config.patch_size
@@ -190,6 +204,7 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                             video_indices=video_indices,
                             audio_indices=audio_indices,
                             text_indices=text_indices,
+                            **control_kwargs,
                         )
 
                     video_start = layout.num_condition_video_rows

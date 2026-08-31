@@ -328,6 +328,11 @@ class TrainingBatch:
     # MiniMax H3 reuses the packed row boundaries from batch preparation to
     # split the transformer's joint sequence back into video and audio outputs.
     minimax_h3_layout: Any | None = None
+    # Already-patchified rows for H3's reference and control branches: the
+    # Ref2VA condition rows that prefix the video stream, and the camera or
+    # depth rows its ControlNet reads. Kept as one dict because the set varies
+    # with which branches a run enables.
+    minimax_h3_control: dict[str, Any] | None = None
 
     attn_metadata_vsa: AttentionMetadata | None = None
     attn_metadata: AttentionMetadata | None = None

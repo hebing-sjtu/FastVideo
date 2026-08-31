@@ -460,12 +460,18 @@ def load_model_from_full_model_state_dict(
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
     # List of allowed parameter name patterns
+    # Train-time control branches own parameters the base checkpoint cannot carry, so they are
+    # built on meta and initialized here. Listed separately from the patterns below because
+    # `_init_missing_full_param` needs to tell a whole trunk (initialize properly) from a lone
+    # missing tensor (zero is the intended no-op).
+    CONTROL_BRANCH_PATTERNS = [
+        "depth_controlnet",
+        "camera_controlnet",
+    ]
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "proj_l",
-        # Train-time control branches own parameters the base checkpoint cannot
-        # carry, so they are built on meta and initialized here.
-        "depth_controlnet",
+        *CONTROL_BRANCH_PATTERNS,
     ]  # Can be extended as needed
 
     def _generator_for_missing_param(name: str, target_device: torch.device | str) -> torch.Generator:
@@ -500,7 +506,7 @@ def load_model_from_full_model_state_dict(
         so the rest follows the module's own scheme.
         """
         shape = tuple(meta_tensor.shape)
-        if "depth_controlnet" not in name:
+        if not any(pattern in name for pattern in CONTROL_BRANCH_PATTERNS):
             return torch.zeros(shape, device=device, dtype=target_dtype)
         if name.endswith("bias"):
             return torch.zeros(shape, device=device, dtype=target_dtype)

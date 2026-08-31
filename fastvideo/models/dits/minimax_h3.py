@@ -31,6 +31,27 @@ MINIMAX_H3_MODALITY_NUM = 3
 _CFG = MiniMaxH3Config()
 
 
+def local_shard_rows(
+    row_indices: torch.Tensor,
+    row_start: int,
+    row_stop: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Intersect global packed-row indices with one sequence-parallel shard.
+
+    `sequence_model_parallel_shard` pads the packed sequence to a multiple of the sequence-parallel
+    world size and hands each rank one contiguous block, so a rank owns global rows
+    ``[row_start, row_stop)``. A control branch that writes into that block needs to know both where
+    each of its rows lands locally and which of its own rows survive the intersection.
+
+    Returns ``(local_rows, source_rows)``: offsets within the shard, and the positions in
+    ``row_indices`` they came from. Both are empty when the shard holds none of the rows, which is a
+    normal outcome for a short target section on a wide sequence-parallel group.
+    """
+    inside = (row_indices >= row_start) & (row_indices < row_stop)
+    source_rows = torch.nonzero(inside, as_tuple=False).flatten()
+    return row_indices.index_select(0, source_rows) - row_start, source_rows
+
+
 class MiniMaxH3RotaryPosEmbed(nn.Module):
     """Three-axis rotary frequencies over packed `(t, h, w)` coordinates."""
 
@@ -678,6 +699,39 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
             self._text_cache = (encoder_hidden_states, text_embeds)
         return text_embeds
 
+    def _run_blocks(
+        self,
+        packed_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        local_timestep_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        original_seq_len: int,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Run the backbone trunk over this rank's shard of the packed sequence.
+
+        Subclasses that add a parallel control branch override this to interleave their own blocks
+        with the backbone's; keeping the loop behind one method means they inherit the sharding and
+        rotary setup above rather than restating it.
+        """
+        del local_timestep_indices
+        if kwargs:
+            # Control kwargs reaching the plain backbone mean the caller expects a conditioning
+            # branch this class does not have. Silently dropping them would train or sample an
+            # unconditioned model that looks correct from the outside.
+            raise TypeError(f"{type(self).__name__} received unsupported forward arguments {sorted(kwargs)}; it has "
+                            "no control branch to consume them.")
+        for block in self.transformer_blocks:
+            packed_hidden_states = block(
+                packed_hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                original_seq_len,
+            )
+        return packed_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -690,6 +744,7 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
         video_indices: torch.Tensor,
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict video and audio velocities from one caller-defined packed layout."""
         if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
@@ -734,14 +789,15 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
             local_timestep_indices, _ = sequence_model_parallel_shard(local_timestep_indices, dim=0)
             rotary_emb = (rotary_cos, rotary_sin)
 
-        for block in self.transformer_blocks:
-            packed_hidden_states = block(
-                packed_hidden_states,
-                temb,
-                adaln_indices,
-                rotary_emb,
-                original_seq_len,
-            )
+        packed_hidden_states = self._run_blocks(
+            packed_hidden_states,
+            temb,
+            adaln_indices,
+            local_timestep_indices,
+            rotary_emb,
+            original_seq_len,
+            **kwargs,
+        )
 
         packed_hidden_states = self.norm_out(
             packed_hidden_states,

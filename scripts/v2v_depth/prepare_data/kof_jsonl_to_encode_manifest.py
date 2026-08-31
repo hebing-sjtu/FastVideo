@@ -31,6 +31,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", choices=("train", "val", "all"), default="train")
     p.add_argument("--out", required=True, help="Output encode manifest jsonl.")
     p.add_argument("--check-files", action="store_true", help="Skip rows whose mp4/prompt are missing.")
+    # The two encoders name the low-poly clip differently: for Wan V2V it is the `source` the model
+    # re-renders, for H3 it is the `proxy` that rides a reference slot. Same file either way.
+    p.add_argument("--source-key",
+                   choices=("source", "proxy"),
+                   default="source",
+                   help="Field name for the low-poly clip: 'source' for encode_v2v_depth_samples, "
+                   "'proxy' for encode_proxy_samples.")
     return p.parse_args()
 
 
@@ -107,7 +114,7 @@ def main() -> None:
             entry = {
                 "name": name,
                 "target": target,
-                "source": source,
+                args.source_key: source,
                 "prompt": prompt,
                 "id": clip_id,
             }

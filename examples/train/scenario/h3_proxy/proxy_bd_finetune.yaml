@@ -1,0 +1,137 @@
+# MiniMax-H3 proxy-to-video, bidirectional stage, LoRA on the backbone, no camera branch.
+#
+# Hyperparameters follow the CWM H3 recipe: rank-128 LoRA across all 50 transformer blocks starting
+# from the official Ref2VA checkpoint, video loss only, AdamW with weight decay 0.01, grad-norm clip
+# 1.0, BF16, gradient checkpointing, global batch size 8, 100-step warmup then cosine decay from
+# 2e-5 to 1e-6.
+#
+# Two deliberate departures, both because this repo's H3 differs from CWM's:
+#   * Trainable parameter count lands at ~665M, not CWM's ~596M. Rank 128 on q/k/v/out (5376<->7168)
+#     plus the SwiGLU (5376<->28672 and 14336->5376) across 50 blocks is 665M here. The paper's
+#     figure does not reproduce under any clean subset of this module decomposition -- attention
+#     alone is 321M, attention plus the output projection 447M -- so this targets every projection
+#     in the block, which is the closest structural reading of "throughout all 50 transformer
+#     blocks". AdaLN is left out (it would add 224M); adapting the timestep modulation is not
+#     standard practice and the paper's number is below the figure that would include it.
+#   * FlashAttention-3 is not requested. The H3 plugin requires TORCH_SDPA, which is dense and
+#     numerically equivalent, just slower.
+#
+# Step count is for CWM's corpus. Three epochs at global batch 8 over the 950-clip KOF train split
+# is 357 steps, not 3534 -- leaving 3534 here would be ~30 epochs on that data. Set
+# `max_train_steps` to `3 * ceil(num_clips / 8)` for the dataset actually in `data_path`, and note
+# that a 100-step warmup is then a quarter of the run; scale it down too.
+#
+# Sequence length at the settings below: 37296 target rows (37 latent frames x 24 x 42 after the
+# 2x2 patch) + 2442 proxy + 1008 anchor + 414 audio + text, so ~41.5k tokens.
+#
+# Smoke first anyway. Resolution is fixed when the cache is written, not here -- this plugin reads
+# the shape off the cached latent -- so smoke by encoding a handful of clips small and pointing
+# `data_path` at them:
+#   --num-frames 39 --height 384 --width 672   (39 = 17*2+5, giving 12 latent frames, 3024 rows)
+# then set num_frames/num_latent_t/num_height/num_width below to match.
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
+    init_from: /workspace/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    lora:
+      enable: true
+      rank: 128
+      # alpha defaults to rank, giving scale 1.0. CWM does not state alpha.
+      alpha: 128
+      # Substring-matched against the full parameter path. The two text-refiner blocks, the timestep
+      # MLP (also fc_in/fc_out after param_names_mapping) and the control trunk share these leaf
+      # names and are held out by the arch config's exclude_lora_layers.
+      target_modules: [to_q, to_k, to_v, to_out, fc_in, fc_out]
+
+    # No trajectory in the KOF data, so there is nothing for the control trunk to read. With the
+    # branch off the DiT is the released model unchanged.
+    enable_camera_controlnet: false
+    enable_control_depth: false
+    # LoRA *is* how this stage trains the backbone, so freezing it would leave nothing to optimize.
+    # The plugin rejects freeze_backbone=true together with lora.enable=true.
+    freeze_backbone: false
+    camera_dropout: 0.0
+
+    # --- reference conditioning ---
+    # Anchor first, proxy second: the cached text embedding was tokenized around `<Picture 1>` then
+    # `<Video 1>`, so this has to match how the data was encoded.
+    enable_anchor: true
+    # "the audio loss is disabled" -- returning a video-only prediction is what tells the finetune
+    # loss to leave the audio head alone rather than train it against placeholder silence.
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    num_gpus: 16
+    # One document per data-parallel replica. sp_size is set by sequence length, not dataset size.
+    # 8 is a conservative first choice at ~41.5k tokens; lowering it trades memory headroom for
+    # more data-parallel replicas, which reaches global batch 8 with less gradient accumulation and
+    # so fewer forward passes per optimizer step. CWM used sp_size 1 on eight GPUs.
+    sp_size: 8
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 16
+    pin_cpu_memory: true
+
+  data:
+    data_path: /data/raw/h3_proxy/kof_train
+    # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    # Both are contracts, not tuning knobs: packed row indices carry no batch offset, and H3 has no
+    # zero-embedding branch for text CFG.
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_frames: 124
+    num_latent_t: 37
+    num_height: 768
+    num_width: 1344
+
+  optimizer:
+    learning_rate: 2.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    lr_scheduler: cosine_with_min_lr
+    lr_warmup_steps: 100
+    # 1e-6 / 2e-5. The scheduler floors the cosine at this ratio rather than decaying to zero.
+    min_lr_ratio: 0.05
+
+  loop:
+    # 3 epochs over CWM's corpus. Recompute for yours: 3 * ceil(num_clips / global_batch_size).
+    max_train_steps: 3534
+    # global batch = (num_gpus / sp_size) * train_batch_size * this = 2 * 1 * 4 = 8.
+    gradient_accumulation_steps: 4
+
+  checkpoint:
+    output_dir: runs/h3_proxy_bd_lora/checkpoints
+    training_state_checkpointing_steps: 250
+    checkpoints_total_limit: 3
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: h3_proxy_bd_lora_r128
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+pipeline: {}

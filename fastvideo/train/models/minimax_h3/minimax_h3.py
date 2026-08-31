@@ -51,6 +51,10 @@ class MiniMaxH3Model(ModelBase):
     """Adapt the H3 joint transformer to the modular fine-tuning contract."""
 
     _transformer_cls_name = "MiniMaxH3Transformer3DModel"
+    # The release ships two transformer partitions. `transformer` is the T2VA/FL2VA model; Ref2VA
+    # weights live in `transformer_ref` and are what a plugin conditioning on references must start
+    # from, since the T2VA partition has never been trained to read reference rows.
+    _transformer_module_type = "transformer"
 
     def __init__(
         self,
@@ -62,10 +66,12 @@ class MiniMaxH3Model(ModelBase):
         enable_gradient_checkpointing_type: str | None = None,
         transformer_override_safetensor: str | None = None,
         attention_backend: AttentionBackendEnum | str | None = AttentionBackendEnum.TORCH_SDPA,
+        lora: Any = None,
     ) -> None:
         """Validate the single-document T2VA contract and load the transformer."""
         super().__init__(
             trainable=trainable,
+            lora=lora,
             attention_backend=attention_backend,
         )
         # PyTorch scaled dot product attention (SDPA) provides dense attention
@@ -74,18 +80,7 @@ class MiniMaxH3Model(ModelBase):
             raise ValueError("MiniMaxH3Model requires the TORCH_SDPA attention backend")
         if training_config.pipeline_config is None:
             raise ValueError("MiniMaxH3Model requires a resolved MiniMax H3 pipeline config")
-        # Packed row indices describe one text-video-audio document without a
-        # batch offset, so each data-parallel replica consumes one sample.
-        if int(training_config.data.train_batch_size) != 1:
-            raise ValueError("MiniMaxH3Model requires training.data.train_batch_size=1")
-        # Classifier-free guidance (CFG) dropout replaces text embeddings with
-        # zeros, but H3 training does not define a zero-vector branch.
-        if float(training_config.data.training_cfg_rate) != 0.0:
-            raise ValueError("MiniMaxH3Model requires training.data.training_cfg_rate=0.0")
-        # Joint supervision requires paired video and stereo-audio latents from
-        # every parquet row.
-        if str(training_config.data.preprocessed_data_type) != "t2va":
-            raise ValueError("MiniMaxH3Model requires training.data.preprocessed_data_type='t2va'")
+        self._validate_data_contract(training_config)
 
         # FastVideo's Fully Sharded Data Parallel loading path requires one BF16
         # parameter dtype, including modules that H3 inference keeps in FP32.
@@ -106,6 +101,26 @@ class MiniMaxH3Model(ModelBase):
         self.start_step = 0
         self.sp_group: Any = None
 
+    def _validate_data_contract(self, training_config: TrainingConfig) -> None:
+        """Reject configurations the packed T2VA batch layout cannot represent.
+
+        Split out so that plugins reading a different corpus — a cached reference/control store
+        rather than the T2VA parquet, say — can restate the parts that still apply without
+        inheriting the parquet requirement.
+        """
+        # Packed row indices describe one text-video-audio document without a
+        # batch offset, so each data-parallel replica consumes one sample.
+        if int(training_config.data.train_batch_size) != 1:
+            raise ValueError(f"{type(self).__name__} requires training.data.train_batch_size=1")
+        # Classifier-free guidance (CFG) dropout replaces text embeddings with
+        # zeros, but H3 training does not define a zero-vector branch.
+        if float(training_config.data.training_cfg_rate) != 0.0:
+            raise ValueError(f"{type(self).__name__} requires training.data.training_cfg_rate=0.0")
+        # Joint supervision requires paired video and stereo-audio latents from
+        # every parquet row.
+        if str(training_config.data.preprocessed_data_type) != "t2va":
+            raise ValueError(f"{type(self).__name__} requires training.data.preprocessed_data_type='t2va'")
+
     def _load_transformer(
         self,
         *,
@@ -117,7 +132,7 @@ class MiniMaxH3Model(ModelBase):
         """Load H3 through the training FSDP loader and apply block checkpointing."""
         transformer = load_module_from_path(
             model_path=self._init_from,
-            module_type="transformer",
+            module_type=self._transformer_module_type,
             training_config=self.training_config,
             disable_custom_init_weights=disable_custom_init_weights,
             override_transformer_cls_name=self._transformer_cls_name,
@@ -131,7 +146,20 @@ class MiniMaxH3Model(ModelBase):
                 transformer,
                 checkpointing_type=checkpointing_type,
             )
+        if self._enable_lora_if_configured(transformer):
+            # `enable_lora_training` freezes the whole module before adding adapters, so anything
+            # that must keep training alongside them has to be re-enabled afterwards.
+            self._restore_trainable_after_lora(transformer)
+            return transformer
         return apply_trainable(transformer, trainable=trainable)
+
+    def _restore_trainable_after_lora(self, transformer: torch.nn.Module) -> None:
+        """Re-enable non-LoRA parameters that a subclass still needs to train.
+
+        Nothing to do for plain H3: LoRA there means adapters only. Subclasses that add a
+        from-scratch branch override this, because a branch built on the meta device and initialized
+        by the loader cannot be expressed as a low-rank update of weights that do not exist.
+        """
 
     def init_preprocessors(self, training_config: TrainingConfig) -> None:
         """Load precomputed text embeddings and paired video-audio latents."""

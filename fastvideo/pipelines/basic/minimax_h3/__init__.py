@@ -3,6 +3,7 @@
 from fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline import (
     EntryClass,
     MiniMaxH3ModularPipeline,
+    MiniMaxH3ProxyCameraPipeline,
     MiniMaxH3Ref2VAModularPipeline,
 )
 from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3Reference
@@ -10,6 +11,7 @@ from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3Reference
 __all__ = [
     "EntryClass",
     "MiniMaxH3ModularPipeline",
+    "MiniMaxH3ProxyCameraPipeline",
     "MiniMaxH3Ref2VAModularPipeline",
     "MiniMaxH3Reference",
 ]

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_camera_conditioning import (
+    MiniMaxH3CameraConditioningStage, )
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_conditioning import MiniMaxH3ConditioningStage
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_decoding import (
     MiniMaxH3AudioDecodingStage,
@@ -11,6 +13,7 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation i
 
 __all__ = [
     "MiniMaxH3AudioDecodingStage",
+    "MiniMaxH3CameraConditioningStage",
     "MiniMaxH3ConditioningStage",
     "MiniMaxH3DenoisingStage",
     "MiniMaxH3InputPreparationStage",

@@ -7,6 +7,7 @@ from fastvideo.configs.pipelines.minimax_h3 import MiniMaxH3PipelineConfig
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.pipelines.basic.minimax_h3.stages import (
     MiniMaxH3AudioDecodingStage,
+    MiniMaxH3CameraConditioningStage,
     MiniMaxH3ConditioningStage,
     MiniMaxH3DenoisingStage,
     MiniMaxH3InputPreparationStage,
@@ -45,7 +46,7 @@ class MiniMaxH3BasePipeline(ComposedPipelineBase):
             if shift is None or float(shift) != expected_shift:
                 raise ValueError(f"MiniMax-H3 {modality} scheduler must expose shift={expected_shift:g}, got {shift}.")
 
-    def _add_stages(self, *, ref2va: bool) -> None:
+    def _add_stages(self, *, ref2va: bool, camera_control: bool = False) -> None:
         transformer = self.get_module("transformer")
         vae = self.get_module("vae")
         audio_vae = self.get_module("audio_vae")
@@ -79,6 +80,10 @@ class MiniMaxH3BasePipeline(ComposedPipelineBase):
                 ref2va=ref2va,
             ),
         )
+        if camera_control:
+            # After latent preparation: the ray field is sampled on the target latent grid, and the
+            # rows it writes are indices into the layout that stage builds.
+            self.add_stage("camera_conditioning_stage", MiniMaxH3CameraConditioningStage(transformer=transformer))
         self.add_stage(
             "denoising_stage",
             MiniMaxH3DenoisingStage(
@@ -109,6 +114,20 @@ class MiniMaxH3RefPipeline(MiniMaxH3BasePipeline):
         self._add_stages(ref2va=True)
 
 
+class MiniMaxH3ProxyCameraPipeline(MiniMaxH3RefPipeline):
+    """Ref2VA plus a camera ControlNet: the sampling counterpart of ``MiniMaxH3ProxyModel``.
+
+    The proxy render and its anchor frame go in as ordered references exactly as any Ref2VA request
+    does, so nothing here differs from the base pipeline except the extra stage that turns a
+    requested trajectory into control rows. A request that omits the trajectory samples with the
+    branch inert, which is the unconditional side of camera guidance.
+    """
+
+    def create_pipeline_stages(self, fastvideo_args: FastVideoArgs) -> None:
+        del fastvideo_args
+        self._add_stages(ref2va=True, camera_control=True)
+
+
 class MiniMaxH3ModularPipeline(MiniMaxH3Pipeline):
     """Public T2VA/FL2VA entry matching the official manifest class name."""
 
@@ -117,13 +136,14 @@ class MiniMaxH3Ref2VAModularPipeline(MiniMaxH3RefPipeline):
     """Public Ref2VA entry using the checkpoint's ``transformer_ref`` partition."""
 
 
-EntryClass = [MiniMaxH3ModularPipeline, MiniMaxH3Ref2VAModularPipeline]
+EntryClass = [MiniMaxH3ModularPipeline, MiniMaxH3Ref2VAModularPipeline, MiniMaxH3ProxyCameraPipeline]
 
 __all__ = [
     "EntryClass",
     "MiniMaxH3BasePipeline",
     "MiniMaxH3ModularPipeline",
     "MiniMaxH3Pipeline",
+    "MiniMaxH3ProxyCameraPipeline",
     "MiniMaxH3Ref2VAModularPipeline",
     "MiniMaxH3RefPipeline",
 ]

@@ -1,0 +1,107 @@
+# MiniMax-H3 proxy-to-video with a camera ControlNet.
+#
+# The proxy render enters through H3's Ref2VA reference slots (anchor image, then proxy video) and
+# the camera trajectory through a zero-initialised ControlNet trunk. The backbone is frozen, so only
+# `camera_controlnet.*` trains and step 0 reproduces the released model exactly.
+#
+# Cache the data first:
+#   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
+#       --manifest data/h3_proxy/manifest.jsonl --root data/h3_proxy/raw \
+#       --output /data/raw/h3_proxy/train --model-path /workspace/models/MiniMax-H3
+#
+# Then launch (64 GPUs, sp_size 8):
+#   torchrun --nnodes 8 --nproc_per_node 8 -m fastvideo.train.entrypoint.train \
+#       --config examples/train/scenario/h3_proxy/proxy_camera_finetune.yaml
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    init_from: /workspace/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    # --- camera control branch ---
+    enable_camera_controlnet: true
+    # depth as a second control modality. Off by default: the proxy already carries geometry
+    # through the reference slot, and a second copy of it on the trunk mostly costs memory.
+    enable_control_depth: false
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    # 1024 / 8 = 128 channels per head, which clears the 96 the H3 rotary table rotates. Must also
+    # divide sp_size.
+    controlnet_num_heads: 8
+    # One control block every two backbone blocks: 25 injection points over 50 layers.
+    controlnet_layer_stride: 2
+    freeze_backbone: true
+    # Drop the whole trunk on 10% of steps so the model still works without a trajectory, which is
+    # also what makes camera guidance possible at sampling time.
+    camera_dropout: 0.1
+
+    # --- reference conditioning ---
+    enable_anchor: true
+    # Game and engine footage is silent; supervising the audio head against placeholder latents
+    # would train it towards silence for no benefit.
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    num_gpus: 64
+    sp_size: 8
+    tp_size: 1
+    hsdp_replicate_dim: 8
+    hsdp_shard_dim: 8
+    pin_cpu_memory: true
+
+  data:
+    data_path: /data/raw/h3_proxy/train
+    # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_latent_t: 37
+    num_height: 768
+    num_width: 1344
+    num_frames: 124
+
+  optimizer:
+    # A from-scratch trunk in front of a frozen backbone tolerates — and needs — more than the 5e-5
+    # a full finetune would use.
+    learning_rate: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    lr_scheduler: constant_with_warmup
+    lr_warmup_steps: 200
+
+  loop:
+    max_train_steps: 20000
+    gradient_accumulation_steps: 1
+
+  checkpoint:
+    output_dir: runs/h3_proxy_camera/checkpoints
+    training_state_checkpointing_steps: 500
+    checkpoints_total_limit: 3
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: h3_proxy_camera_controlnet
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+pipeline: {}
