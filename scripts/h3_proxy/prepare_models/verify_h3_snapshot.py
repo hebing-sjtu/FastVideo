@@ -27,7 +27,7 @@ components, 134 GB each.
 Usage::
 
     # after downloading, and again after a bucket round-trip
-    python scripts/h3_proxy/prepare_models/verify_h3_snapshot.py --path /workspace/models/MiniMax-H3
+    python scripts/h3_proxy/prepare_models/verify_h3_snapshot.py --path /data/models/MiniMax-H3
 
     # on a node without Hub access, reuse a manifest fetched earlier
     python .../verify_h3_snapshot.py --path /data/models/MiniMax-H3 \\

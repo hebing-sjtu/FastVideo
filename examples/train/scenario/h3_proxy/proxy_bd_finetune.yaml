@@ -34,7 +34,7 @@ models:
   student:
     _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
     # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
-    init_from: /workspace/models/MiniMax-H3
+    init_from: /data/models/MiniMax-H3
     trainable: true
     enable_gradient_checkpointing_type: full
     attention_backend: TORCH_SDPA

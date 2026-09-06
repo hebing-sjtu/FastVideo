@@ -7,7 +7,7 @@
 # Cache the data first:
 #   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
 #       --manifest data/h3_proxy/manifest.jsonl --root data/h3_proxy/raw \
-#       --output /data/raw/h3_proxy/train --model-path /workspace/models/MiniMax-H3
+#       --output /data/raw/h3_proxy/train --model-path /data/models/MiniMax-H3
 #
 # Then launch (64 GPUs, sp_size 8):
 #   torchrun --nnodes 8 --nproc_per_node 8 -m fastvideo.train.entrypoint.train \
@@ -16,7 +16,7 @@
 models:
   student:
     _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
-    init_from: /workspace/models/MiniMax-H3
+    init_from: /data/models/MiniMax-H3
     trainable: true
     enable_gradient_checkpointing_type: full
     attention_backend: TORCH_SDPA

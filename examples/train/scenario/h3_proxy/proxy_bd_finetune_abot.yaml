@@ -24,12 +24,15 @@
 #   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
 #       --manifest /data/binghe/h3_proxy/abot_train.jsonl \
 #       --root /data/binghe/datasets/ABot-sub-2000-clips \
-#       --output /data/binghe/h3_proxy/cache/abot_train --model-path /workspace/models/MiniMax-H3 \
+#       --output /data/binghe/h3_proxy/cache/abot_train --model-path /data/models/MiniMax-H3 \
 #       --num-frames 124 --height 768 --width 1344 --anchor-short-edge 768
 #
-# Every path this file writes to is on the `/data/binghe` disk, not under `/workspace`. The cache is
-# hours of H200 time and the checkpoints are the run itself, and `/workspace` does not outlive the
-# node. Only `--model-path` reads from `/workspace`, because a snapshot is re-downloadable.
+# Every path here is on the persistent `/data` disk rather than under `/workspace`, which does not
+# outlive the node: the cache is hours of H200 time, the checkpoints are the run itself, and the
+# snapshot is 134 GB. Verify the snapshot before spending the encode on it -- a truncated download
+# otherwise surfaces after a 32B text encoder has loaded:
+#   python scripts/h3_proxy/prepare_models/verify_h3_snapshot.py \
+#       --path /data/models/MiniMax-H3 --profile ref2va
 #
 # Hyperparameters follow the CWM H3 recipe: rank-128 LoRA across all 50 transformer blocks starting
 # from the official Ref2VA checkpoint, video loss only, AdamW with weight decay 0.01, grad-norm clip
@@ -65,7 +68,7 @@ models:
   student:
     _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
     # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
-    init_from: /workspace/models/MiniMax-H3
+    init_from: /data/models/MiniMax-H3
     trainable: true
     enable_gradient_checkpointing_type: full
     attention_backend: TORCH_SDPA

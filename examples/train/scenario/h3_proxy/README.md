@@ -55,7 +55,7 @@ python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
     --manifest data/h3_proxy/manifest.jsonl \
     --root data/h3_proxy/raw \
     --output /data/raw/h3_proxy/train \
-    --model-path /workspace/models/MiniMax-H3
+    --model-path /data/models/MiniMax-H3
 ```
 
 For a dataset laid out as flat `seg_*/` directories holding `video_src.mp4`, `video_target.mp4` and
