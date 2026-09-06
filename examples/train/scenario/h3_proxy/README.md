@@ -58,6 +58,27 @@ python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
     --model-path /data/models/MiniMax-H3
 ```
 
+That is one process on one GPU. For a set of any size, fan it across the node instead — the wrapper
+takes the same arguments and adds `--shard-index` / `--num-shards` per process:
+
+```bash
+scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
+    --manifest /data/binghe/h3_proxy/abot_train.jsonl \
+    --root /data/binghe/datasets/ABot-sub-2000-clips \
+    --output /data/binghe/h3_proxy/cache/abot_train \
+    --model-path /data/models/MiniMax-H3 \
+    --anchor-short-edge 768 --proxy-height 192 --proxy-width 336
+```
+
+Shard `i` takes `entries[i::n]` and the encoder skips a clip whose `.pt` is already there, so
+re-running the identical command retries only what is missing — which is also how a shard that hit
+an OOM is recovered. The wrapper waits for every shard even after one fails, prints the tail of
+each failing log, and finishes by comparing the cache against the manifest row count.
+
+Starts are staggered (`STAGGER_SEC`, default 45) because each shard deserialises its own copy of a
+~64 GB bf16 text encoder. Eight simultaneous starts is one ~500 GB read burst and a host-RAM spike;
+the GPUs are idle through that window regardless, so the stagger costs nothing real.
+
 For a dataset laid out as flat `seg_*/` directories holding `video_src.mp4`, `video_target.mp4` and
 `prompt.txt`, with the train/val split in `manifests/*_{train,val}.jsonl`, build that manifest with:
 
