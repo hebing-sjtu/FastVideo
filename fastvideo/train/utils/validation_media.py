@@ -93,8 +93,15 @@ def _encode_mp4(
     waveform: np.ndarray | None,
     sample_rate: int | None,
 ) -> None:
-    """Encode H.264 and optional Advanced Audio Coding into one MP4 artifact."""
-    with av.open(output_path, mode="w") as container:
+    """Encode H.264 and optional Advanced Audio Coding into one MP4 artifact.
+
+    ``+faststart`` moves the ``moov`` atom ahead of the media data when the container closes.
+    Without it the index lands at the end of the file, which every desktop player handles and an
+    HTML ``<video>`` element streaming the file generally does not -- so the artifact plays locally
+    and shows an empty player in a tracker's web viewer. It costs one rewrite of the file at close,
+    which is nothing next to generating the clip.
+    """
+    with av.open(output_path, mode="w", options={"movflags": "+faststart"}) as container:
         video_stream = container.add_stream("libx264", rate=fps)
         video_stream.width = int(frames.shape[2])
         video_stream.height = int(frames.shape[1])
