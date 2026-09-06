@@ -20,12 +20,16 @@
 # Build the manifests and cache, holding out whole episodes:
 #   python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \
 #       --root /data/binghe/datasets/ABot-sub-2000-clips \
-#       --split train --val-episodes 24 --out /workspace/h3_abot_train.jsonl
+#       --split train --val-episodes 24 --out /data/binghe/h3_proxy/abot_train.jsonl
 #   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
-#       --manifest /workspace/h3_abot_train.jsonl \
+#       --manifest /data/binghe/h3_proxy/abot_train.jsonl \
 #       --root /data/binghe/datasets/ABot-sub-2000-clips \
-#       --output /workspace/h3_abot/train --model-path /workspace/models/MiniMax-H3 \
+#       --output /data/binghe/h3_proxy/cache/abot_train --model-path /workspace/models/MiniMax-H3 \
 #       --num-frames 124 --height 768 --width 1344 --anchor-short-edge 768
+#
+# Every path this file writes to is on the `/data/binghe` disk, not under `/workspace`. The cache is
+# hours of H200 time and the checkpoints are the run itself, and `/workspace` does not outlive the
+# node. Only `--model-path` reads from `/workspace`, because a snapshot is re-downloadable.
 #
 # Hyperparameters follow the CWM H3 recipe: rank-128 LoRA across all 50 transformer blocks starting
 # from the official Ref2VA checkpoint, video loss only, AdamW with weight decay 0.01, grad-norm clip
@@ -115,7 +119,9 @@ training:
     pin_cpu_memory: true
 
   data:
-    # Written by encode_proxy_samples.py. Cache to local disk, not to a network mount.
+    # Written by encode_proxy_samples.py, on the persistent data disk. At ~15 MB of latents plus
+    # text embeddings per clip across ~9.9k clips this is a ~150 GB artifact costing hours of H200
+    # time, so it is worth keeping across nodes rather than re-deriving.
     #
     # Prompts: this dataset ships no per-clip text. `annotations/caption.json` is episode-level, so
     # it describes the whole 60 seconds rather than the 5.17 the clip covers, and the manifest
@@ -124,7 +130,7 @@ training:
     # embedding is built over the anchor and the proxy as well as the words, so the caption is one
     # of three conditioning sources rather than the only one. Writing per-clip `prompt.txt` files
     # upgrades this without touching anything here -- the builder prefers them when present.
-    data_path: /workspace/h3_abot/train
+    data_path: /data/binghe/h3_proxy/cache/abot_train
     # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
     preprocessed_data_type: t2va
     dataloader_num_workers: 2
@@ -157,7 +163,11 @@ training:
     gradient_accumulation_steps: 8
 
   checkpoint:
-    output_dir: runs/h3_proxy_bd_lora_abot/checkpoints
+    # Absolute, and on the data disk. A relative path resolves against the launch directory, which
+    # is the checked-out repo under `/workspace` -- so the LoRA weights, the optimizer state and the
+    # validation mp4s (the callback saves media under this directory) would all go with the node.
+    # This is also what `resume_from_checkpoint` has to be able to find after a restart.
+    output_dir: /data/binghe/h3_proxy/runs/h3_proxy_bd_lora_abot/checkpoints
     training_state_checkpointing_steps: 250
     checkpoints_total_limit: 3
     resume_from_checkpoint: ""

@@ -63,7 +63,7 @@ For a dataset laid out as flat `seg_*/` directories holding `video_src.mp4`, `vi
 
 ```bash
 python scripts/h3_proxy/prepare_data/seg_dir_to_encode_manifest.py \
-    --root /data/tmp --split train --out /workspace/h3_train.jsonl
+    --root /data/tmp --split train --out /data/binghe/h3_proxy/h3_train.jsonl
 ```
 
 It also reports the largest `--num-frames` the clips support. That is worth reading before
@@ -110,7 +110,7 @@ For a dataset that ships one already-windowed clip per directory — `target/rgb
 ```bash
 python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \
     --root /data/binghe/datasets/ABot-sub-2000-clips \
-    --split train --val-episodes 24 --out /workspace/h3_abot_train.jsonl
+    --split train --val-episodes 24 --out /data/binghe/h3_proxy/abot_train.jsonl
 ```
 
 It splits **episodes**, not clips. Five windows cut from one 60-second episode share weather,
@@ -130,8 +130,16 @@ in pixel units, and optionally `pixel_size` naming the resolution the intrinsics
 They are normalised at build time — rebased onto frame 0, recentred, rescaled — so the model never
 sees the dataset's world origin or unit scale.
 
-Cache to local disk, not to the GCS FUSE mount. Writing at speed through `gcsfuse` is what produced
-the earlier `Errno 107` and `SIGBUS` failures; write to `/workspace` or `/tmp` and copy afterwards.
+Write the cache to the persistent data disk. The `gcsfuse` faults that once forced a staged
+write — `Errno 107` and `SIGBUS` under sustained throughput — are fixed, so the detour through
+`/workspace` followed by a copy is no longer worth its cost: at ~15 MB per clip a 10k-clip set is a
+~150 GB round trip, and anything left under `/workspace` dies with the node.
+
+That applies to `training.checkpoint.output_dir` too, and it has a second reason. The path must be
+absolute: a relative one resolves against the launch directory, which is the checked-out repo. Both
+the checkpoints and the validation mp4s the callback writes live under it, so a relative path puts
+every artifact a run produces on the ephemeral disk. Only the model snapshot belongs on
+`/workspace`, since it can be downloaded again.
 
 ## Training
 

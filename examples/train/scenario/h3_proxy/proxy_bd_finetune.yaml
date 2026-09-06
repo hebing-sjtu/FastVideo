@@ -120,7 +120,9 @@ training:
     gradient_accumulation_steps: 8
 
   checkpoint:
-    output_dir: runs/h3_proxy_bd_lora/checkpoints
+    # Absolute and on the data disk: a relative path resolves against the launch directory, and the
+    # checkpoints and the validation mp4s both live under here.
+    output_dir: /data/binghe/h3_proxy/runs/h3_proxy_bd_lora/checkpoints
     training_state_checkpointing_steps: 250
     checkpoints_total_limit: 3
     resume_from_checkpoint: ""
