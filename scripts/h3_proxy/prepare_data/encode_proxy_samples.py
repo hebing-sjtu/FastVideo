@@ -12,15 +12,26 @@ Manifest, one JSON object per line::
      "target": "hq/0001.mp4",
      "proxy": "proxy/0001.mp4",
      "proxy_duv": "duv/0001",
+     "proxy_duv_video": "duv/0001.mp4",
      "anchor": "anchor/0001.png",
      "camera": "poses/0001.npz",
      "prompt": "a knight walks through a ruined cathedral"}
 
-Exactly one of ``proxy`` and ``proxy_duv`` is required. ``proxy`` is an ordinary RGB render, used
-as-is. ``proxy_duv`` is a directory of per-frame ``NNNNNN.depth.f32`` and ``NNNNNN.semantic_id.png``
-pairs, packed into three channels by :mod:`fastvideo.pipelines.basic.minimax_h3.proxy`; prefer it
+Exactly one of ``proxy``, ``proxy_duv`` and ``proxy_duv_video`` is required. Prefer either DUV form
 when the renderer can emit depth, because a geometry channel constrains the output far more tightly
 than a shaded render does.
+
+``proxy``
+    An ordinary RGB render, used as-is and resized to the proxy grid.
+``proxy_duv``
+    A directory of per-frame ``NNNNNN.depth.f32`` and ``NNNNNN.semantic_id.png`` pairs, packed into
+    three channels by :mod:`fastvideo.pipelines.basic.minimax_h3.proxy` -- log depth over 0.3 m to
+    256 m plus a two-channel class code.
+``proxy_duv_video``
+    A DUV that some upstream pipeline already composed into a lossless video. The frames reach the
+    VAE unchanged, so the channel convention is whatever the producer used rather than this repo's;
+    it only has to be the same one at sampling time. Nothing is resized -- see
+    :func:`read_duv_video_clip`.
 
 ``anchor`` defaults to the target's first frame. Supplying a separate one is what lets the anchor
 carry an appearance the target clip never shows — a different art style, a reference photograph.
@@ -53,6 +64,8 @@ from PIL import Image
 import torch
 
 REQUIRED_MEDIA_KEYS = ("target", "prompt")
+# Exactly one of these names the proxy. Order is only for error messages.
+PROXY_KEYS = ("proxy", "proxy_duv", "proxy_duv_video")
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,6 +135,37 @@ def read_duv_clip(directory: Path, num_frames: int, height: int, width: int) -> 
     pixels = pack_duv_clip(np.stack(depth_frames), np.stack(semantic_frames))
     preview = (pixels[0].permute(1, 2, 3, 0) * 255.0).round().clamp_(0, 255).to(torch.uint8).numpy()
     return pixels, preview
+
+
+def read_duv_video_clip(path: Path, num_frames: int, height: int, width: int) -> tuple[torch.Tensor, np.ndarray]:
+    """Read a pre-composed DUV video, refusing to resample it.
+
+    Returns ``([1, 3, T, H, W]`` float32 in ``[0, 1]``, ``[T, H, W, 3]`` uint8``). Unlike
+    :func:`read_duv_clip` this does no packing: the producer already encoded depth and class into
+    the three channels, so the frames go to the VAE as they were written and the same bytes are
+    what Qwen previews.
+
+    There is deliberately no resize branch, which is the one way this differs from
+    :func:`read_video_frames`. A DUV frame is three integer codes wearing an RGB costume, so any
+    interpolation averages unrelated depths and paints class boundaries a code no segmenter ever
+    predicted -- and produces a perfectly plausible-looking image while doing it. A grid mismatch is
+    therefore an error to report, not a difference to smooth over.
+    """
+    from fastvideo.pipelines.basic.minimax_h3.proxy import rgb_clip_to_pixels
+    from fastvideo.pipelines.basic.minimax_h3.reference import decode_reference_video, resample_reference_frames
+
+    frames, source_fps, _ = decode_reference_video(path)
+    # Resampling to 24 fps only ever selects, repeats or drops whole frames, so it is safe on codes.
+    frames = resample_reference_frames(frames, source_fps)
+    if frames.shape[0] < num_frames:
+        raise ValueError(f"{path} yields {frames.shape[0]} frames at 24 fps; {num_frames} are required.")
+    frames = frames[:num_frames]
+    if frames.shape[1:3] != (height, width):
+        raise ValueError(f"{path} is {frames.shape[2]}x{frames.shape[1]} but the proxy grid is {width}x{height}. A "
+                         "DUV video carries integer codes, so it has to be encoded at the grid it is consumed on; "
+                         "resampling it would average unrelated depth codes and blend class colours. Re-encode the "
+                         "clip, or set --proxy-width/--proxy-height to the grid it was written at.")
+    return rgb_clip_to_pixels(frames), frames
 
 
 def read_anchor_image(path: Path | None, target_frames: np.ndarray, short_edge: int) -> Image.Image:
@@ -295,8 +339,9 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
     missing = [key for key in REQUIRED_MEDIA_KEYS if not entry.get(key)]
     if missing:
         raise KeyError(f"Manifest entry is missing {missing}")
-    if bool(entry.get("proxy")) == bool(entry.get("proxy_duv")):
-        raise KeyError("A manifest entry needs exactly one of 'proxy' and 'proxy_duv'")
+    supplied = [key for key in PROXY_KEYS if entry.get(key)]
+    if len(supplied) != 1:
+        raise KeyError(f"A manifest entry needs exactly one of {list(PROXY_KEYS)}, got {supplied}")
 
     def resolve(key: str) -> Path | None:
         value = entry.get(key)
@@ -308,6 +353,9 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
     if entry.get("proxy_duv"):
         proxy_pixels, proxy_preview = read_duv_clip(root / str(entry["proxy_duv"]), args.num_frames, args.proxy_height,
                                                     args.proxy_width)
+    elif entry.get("proxy_duv_video"):
+        proxy_pixels, proxy_preview = read_duv_video_clip(root / str(entry["proxy_duv_video"]), args.num_frames,
+                                                          args.proxy_height, args.proxy_width)
     else:
         proxy_preview = read_video_frames(root / str(entry["proxy"]), args.num_frames, args.proxy_height,
                                           args.proxy_width)

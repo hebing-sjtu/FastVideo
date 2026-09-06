@@ -145,6 +145,13 @@ class ValidationCallback(Callback):
     contract.
     """
 
+    # Names for the optional second video stream, the one `_post_process_validation_frames` fills.
+    # Class attributes rather than constructor arguments because a subclass decides what it puts
+    # there, and the filename and tracker key have to agree with that: the base uses the stream for
+    # action overlays, but nothing about the plumbing is specific to overlays.
+    _secondary_video_suffix = "_overlay"
+    _secondary_video_key_suffix = "_overlay"
+
     def __init__(
         self,
         *,
@@ -595,7 +602,7 @@ class ValidationCallback(Callback):
                     step=step,
                     num_inference_steps=num_inference_steps,
                     fps=sp.fps,
-                    suffix="_overlay",
+                    suffix=self._secondary_video_suffix,
                 )
                 local_video_filenames = local_videos.filenames
                 local_overlay_video_filenames = local_overlay_videos.filenames
@@ -684,7 +691,7 @@ class ValidationCallback(Callback):
                             all_overlay_video_filenames,
                             all_overlay_captions,
                             key=(f"validation_videos_{num_inference_steps}"
-                                 f"_steps_overlay"),
+                                 f"_steps{self._secondary_video_key_suffix}"),
                             step=step,
                             fps=sp.fps,
                         )

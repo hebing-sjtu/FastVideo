@@ -42,6 +42,8 @@ class MiniMaxH3Reference:
     soundtrack: Any | None = None
     fps: float | None = None
     sample_rate: int | None = None
+    short_edge: int | None = None
+    size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.source is None:
@@ -56,6 +58,17 @@ class MiniMaxH3Reference:
         if self.sample_rate is not None and (self.media_type == "image" or isinstance(self.sample_rate, bool)
                                              or not isinstance(self.sample_rate, Integral) or self.sample_rate <= 0):
             raise ValueError("Reference `sample_rate` must be positive and is only valid for audio-bearing media.")
+        if self.short_edge is not None and (self.media_type != "image" or isinstance(self.short_edge, bool)
+                                            or not isinstance(self.short_edge, Integral) or self.short_edge <= 0):
+            raise ValueError("Reference `short_edge` must be positive and is only valid for image references.")
+        if self.size is not None:
+            if self.media_type != "video":
+                raise ValueError("Reference `size` is only valid for video references; an image resolves its canvas "
+                                 "from `short_edge`.")
+            edges = tuple(self.size)
+            if len(edges) != 2 or any(
+                    isinstance(edge, bool) or not isinstance(edge, Integral) or edge <= 0 for edge in edges):
+                raise ValueError(f"Reference `size` must be a positive (height, width) pair, got {self.size!r}.")
 
 
 @dataclass
@@ -165,13 +178,18 @@ def decode_reference_video(source: str | os.PathLike[str]) -> tuple[np.ndarray, 
     return result, float(rate), soundtrack
 
 
-def resolve_reference_image_size(width: int, height: int) -> tuple[int, int]:
-    """Resolve the released 2048-short-edge reference-image canvas."""
+def resolve_reference_image_size(width: int, height: int, *, short_edge: int | None = None) -> tuple[int, int]:
+    """Resolve the reference-image canvas, defaulting to the released 2048 short edge.
+
+    ``short_edge`` exists because the anchor's canvas sets its vision-token count, so a caller that
+    encoded anchors at another size has to reproduce it here or present the model a token grid it
+    was not trained on.
+    """
     if width <= 0 or height <= 0:
         raise ValueError(f"A reference image must have a positive size, got {width}x{height}.")
     if width > 4 * height or height > 4 * width:
         raise ValueError(f"A reference image must be within 1:4 and 4:1, got {width}x{height}.")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    scale = (short_edge or MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE) / min(width, height)
     multiple = MINIMAX_H3_CANVAS_MULTIPLE
     return (
         max(multiple,
@@ -216,12 +234,30 @@ def resample_reference_frames(frames: np.ndarray, fps: float) -> np.ndarray:
     return np.repeat(frames, repeats, axis=0)
 
 
-def prepare_reference_frames(frames: np.ndarray, num_frames: int) -> np.ndarray:
-    """Trim a reference video to the request and resize every RGB frame."""
+def prepare_reference_frames(
+    frames: np.ndarray,
+    num_frames: int,
+    size: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Trim a reference video to the request and resize every RGB frame.
+
+    ``size`` pins the canvas to ``(height, width)`` instead of resolving it from the aspect ratio.
+    Two reasons a caller needs that, both specific to a proxy render:
+
+    * The canvas decides how many rows the reference occupies, so it has to match the grid the
+      training cache was encoded on. Resolving from the aspect ratio puts a 336x192 proxy on the
+      full 1344x768 canvas -- 37296 rows where training used 2442.
+    * A DUV proxy's three channels hold integer codes, not colour. Resampling averages unrelated
+      depth codes and paints classes a value no segmenter predicted, and nothing downstream can
+      detect that it happened.
+    """
     if frames.ndim != 4 or frames.shape[-1] != 3 or frames.shape[0] == 0:
         raise ValueError(f"A reference video must be non-empty RGB frames, got {tuple(frames.shape)}.")
     frames = frames[:num_frames]
-    height, width = resolve_canvas_size(frames.shape[2], frames.shape[1])
+    if size is not None:
+        height, width = int(size[0]), int(size[1])
+    else:
+        height, width = resolve_canvas_size(frames.shape[2], frames.shape[1])
     if frames.shape[1:3] == (height, width):
         return frames
     return np.stack(
@@ -316,7 +352,7 @@ def prepare_reference(
                 raise ValueError(f"An image reference must be RGB, got {tuple(pixels.shape)}.")
             image = Image.fromarray(pixels)
         image = ImageOps.exif_transpose(image).convert("RGB")
-        height, width = resolve_reference_image_size(*image.size)
+        height, width = resolve_reference_image_size(*image.size, short_edge=reference.short_edge)
         prepared.image = prepare_reference_image(image, height, width)
         return prepared
 
@@ -331,7 +367,7 @@ def prepare_reference(
             frames = reference_media_to_uint8(reference.source)
             decoded_fps = float(MINIMAX_H3_FPS)
         fps = float(reference.fps if reference.fps is not None else decoded_fps)
-        prepared.frames = prepare_reference_frames(resample_reference_frames(frames, fps), num_frames)
+        prepared.frames = prepare_reference_frames(resample_reference_frames(frames, fps), num_frames, reference.size)
 
         if reference.soundtrack is not None:
             waveform, source_rate = _resolve_audio_source(reference.soundtrack)

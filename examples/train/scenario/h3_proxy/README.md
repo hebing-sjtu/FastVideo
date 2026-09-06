@@ -72,16 +72,58 @@ clip contributes 99 frames and would fail `--num-frames 124` — for every clip,
 encoder has loaded.
 
 Each manifest line names a target clip, a proxy, an optional anchor frame, an optional camera
-trajectory, and a prompt. The proxy may be either RGB video or a DUV directory — depth as
-`.depth.f32` plus semantic ID as `.semantic_id.png` per frame, which
-`fastvideo/pipelines/basic/minimax_h3/proxy.py` packs into the 3-channel image the VAE encodes.
-Depth is log-normalised over 0.3 m to 256 m and the semantic ID is split across the two chroma
-channels, which is what lets one RGB VAE carry both.
+trajectory, and a prompt. The proxy comes in one of three forms, exactly one per line:
+
+| Key | What it is |
+| --- | --- |
+| `proxy` | An ordinary RGB render, resized to the proxy grid and used as-is |
+| `proxy_duv` | A directory of per-frame `NNNNNN.depth.f32` and `NNNNNN.semantic_id.png` |
+| `proxy_duv_video` | A DUV some upstream pipeline already composed into a lossless video |
+
+For `proxy_duv`, `fastvideo/pipelines/basic/minimax_h3/proxy.py` packs the pair into the 3-channel
+image the VAE encodes: depth log-normalised over 0.3 m to 256 m, and the semantic ID split across
+the two chroma channels, which is what lets one RGB VAE carry both.
+
+`proxy_duv_video` skips that packing, so the channel convention is the producer's rather than this
+repo's. That is workable because this stage starts from the base Ref2VA checkpoint, which has no DUV
+prior of any kind — what the three channels mean is learned here either way. The requirement is only
+that sampling presents the same convention the cache was written with, which is why nothing rewrites
+the pixels on the way in and why validation reads the same files. It is also why a set must not mix
+conventions: a depth channel that means near-is-bright on some clips and near-is-dark on others is
+unreadable, and no shape, count or loss check would show it.
 
 The proxy is encoded at `--proxy-height 192 --proxy-width 336` regardless of the resolution the
 render was supplied at: a quarter of the target's edge length, a sixteenth of its area, a sixteenth
 of its tokens. A proxy carries layout and motion, and both survive downsampling in a way appearance
 would not — which is also why the appearance comes from the anchor instead.
+
+`proxy_duv_video` is the one proxy form that is never resized. A DUV frame holds integer codes
+wearing an RGB costume, so interpolating it averages unrelated depths and paints class boundaries a
+code no backend predicted, while producing a perfectly plausible-looking image. A grid mismatch is
+therefore an error rather than something to resample away.
+
+### A clip-per-directory dataset
+
+For a dataset that ships one already-windowed clip per directory — `target/rgb.mp4`,
+`target/anchor.png`, `proxy/duv.mp4` and a `clip_report.json` — build the manifest with:
+
+```bash
+python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \
+    --root /data/binghe/datasets/ABot-sub-2000-clips \
+    --split train --val-episodes 24 --out /workspace/h3_abot_train.jsonl
+```
+
+It splits **episodes**, not clips. Five windows cut from one 60-second episode share weather,
+lighting and terrain, so splitting by clip validates on footage already trained on and reports a
+loss that looks much better than the model is. Train and val are complements of one another for a
+given `--val-episodes`, so there is no split file to keep in sync — but the two scripts have to be
+passed the same number.
+
+It also refuses to write a manifest for a set that would fail late: mixed DUV conventions, clips
+whose `deliverable` flag is false, and — on a machine that has the decoder — a sampled palette check
+that catches a DUV arriving in the wrong channel order or through a lossy re-encode. All three are
+invisible downstream. The cache would be written, training would converge, and the proxy would be
+describing noise.
 
 Trajectories are `.npz` files with `extrinsics` `[F, 4, 4]` world-to-camera, `intrinsics` `[F, 3, 3]`
 in pixel units, and optionally `pixel_size` naming the resolution the intrinsics were measured at.
@@ -98,6 +140,7 @@ Two configs, in this order:
 | Config | What trains | Needs camera poses |
 | --- | --- | --- |
 | `proxy_bd_finetune.yaml` | rank-128 LoRA on all 50 blocks (~665M params) | no |
+| `proxy_bd_finetune_abot.yaml` | the same stage, wired to a `clip_*/` dataset | no |
 | `proxy_camera_finetune.yaml` | only `camera_controlnet.*`, backbone frozen | yes |
 
 Run the first on its own if the dataset has no trajectories; that is the entire usable stage in that
@@ -141,6 +184,63 @@ zero-initialised `proj_out` is what makes an untrained branch a no-op. That is a
 `camera_controlnet` sits in the arch config's `exclude_lora_layers`, alongside `token_refiner` and
 `time_embedder` — all three share leaf names (`to_q`, `fc_in`, ...) with the 50 main blocks and would
 otherwise be adapted by substring match.
+
+## Validation
+
+Proxy-to-video is judged on whether the output follows its proxy, which a prediction on its own
+cannot show. `MiniMaxH3ProxyValidationCallback` therefore logs a `proxy | prediction | target` panel
+per held-out clip, as one video the tracker keeps aligned across steps, rather than three artifacts
+the viewer has to scrub in sync.
+
+Build the dataset file from the same tree and the same held-out split the encode step used:
+
+```bash
+python scripts/h3_proxy/prepare_data/seg_dir_to_validation_json.py \
+    --root /data/tmp --split val --limit 6 \
+    --out /data/binghe/h3_proxy/validation_val6.json
+
+# or, for a clip-per-directory dataset, with the same --val-episodes the encode manifest used
+python scripts/h3_proxy/prepare_data/clip_dir_to_validation_json.py \
+    --root /data/binghe/datasets/ABot-sub-2000-clips \
+    --val-episodes 24 --limit 6 \
+    --out /data/binghe/h3_proxy/abot_validation_val6.json
+```
+
+Paths in that file are absolute on purpose. `ValidationDataset` resolves only the media keys it
+already knows about against the dataset directory, and the proxy and target arrive through keys it
+does not know.
+
+With `trackers: [wandb]` already set under `training.tracker`, each event logs two keys:
+`validation_videos_50_steps` for the predictions alone and `validation_videos_50_steps_compare` for
+the panels, both captioned with the prompt. MP4s also land in `training.checkpoint.output_dir`, so a
+run whose W&B is offline still keeps them.
+
+Three settings exist to keep validation comparable to training rather than to the released defaults:
+
+- **`anchor_short_edge`** must equal the encoder's `--anchor-short-edge`. An anchor's canvas decides
+  how many vision tokens it occupies, and the pipeline otherwise applies the released 2048 short
+  edge — roughly 7x the anchor tokens a 768 run trains against, which would make the checkpoint look
+  worse for a reason that has nothing to do with the checkpoint.
+- **`proxy_height` / `proxy_width`** must equal the encoder's `--proxy-height` / `--proxy-width`,
+  for the same reason and then some. A video reference otherwise resolves its canvas from its aspect
+  ratio, which puts a 336x192 proxy on the full 1344x768 canvas: 37296 reference rows where training
+  used 2442, from LANCZOS-upsampled frames. On a DUV that upsampling is not merely off-distribution
+  — on a synthetic blocky frame it leaves the majority of pixels carrying a class code no backend
+  predicted, and moves decoded depth by far more than the encoding's own quantisation step.
+- **`use_validation_media_conditioning`** must stay false. H3 Ref2VA conditions on an ordered
+  reference list, so `image_path` would present the proxy a second time; the callback rejects true
+  rather than silently doubling it.
+
+A record whose proxy or anchor cannot be read fails the run rather than sampling without it, because
+a clip generated from the wrong conditioning is worse than no clip: it looks like a model result.
+Keep `run_at_start: true` so that surfaces at step 0, before the run has spent anything, instead of
+at the first scheduled event hours in.
+
+Validation re-encodes text and references through the pipeline; it does not read the training
+`.pt` caches. That is what makes it an end-to-end check, and also what makes it expensive: every
+record is a full sampling trajectory at ~41.5k tokens, alongside a second text encoder and VAE. Six
+clips every 250 steps is a few percent of wall clock, `every_steps: 20` would dominate the run.
+`offload_training_state` and `unload_pipeline_after_validation` are both on for the same reason.
 
 ## Sampling
 

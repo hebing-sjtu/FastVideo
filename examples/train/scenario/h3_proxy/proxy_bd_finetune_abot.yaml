@@ -1,4 +1,31 @@
-# MiniMax-H3 proxy-to-video, bidirectional stage, LoRA on the backbone, no camera branch.
+# MiniMax-H3 proxy-to-video on ABot-sub-2000-clips. Same stage as `proxy_bd_finetune.yaml`; only
+# the data plumbing differs. Read that file for why the hyperparameters are what they are.
+#
+# What is different about this dataset:
+#
+#   * The proxy arrives as a pre-composed DUV video (336x192, lossless), not as per-frame
+#     `.depth.f32` + `.semantic_id.png`. It is passed through unconverted, so its channels carry the
+#     delivery convention -- log depth over 0.1 m to 8000 m rising away from the camera, 255 as a
+#     sky sentinel, class codes in green and blue -- rather than the one `proxy.py` would write.
+#     That is fine here and only here: this stage starts from the base Ref2VA checkpoint, which has
+#     no DUV prior of any kind, so the meaning of those channels is learned from scratch. It does
+#     mean sampling has to present the same convention, which is why validation reads the same
+#     duv.mp4 files rather than anything re-encoded.
+#   * The anchor is a lossless `target/anchor.png`, not frame 0 of the lossy target mp4.
+#   * There are no camera trajectories to use. The dataset ships COLMAP poses, but they are sparse
+#     (fewer than 124) and non-metric, so they cannot be mixed with the metric depth in the DUV.
+#     `proxy_camera_finetune.yaml` stays out of reach until that scale factor is solved.
+#   * There is no per-clip text. See the prompt note on `data_path` below.
+#
+# Build the manifests and cache, holding out whole episodes:
+#   python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \
+#       --root /data/binghe/datasets/ABot-sub-2000-clips \
+#       --split train --val-episodes 24 --out /workspace/h3_abot_train.jsonl
+#   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
+#       --manifest /workspace/h3_abot_train.jsonl \
+#       --root /data/binghe/datasets/ABot-sub-2000-clips \
+#       --output /workspace/h3_abot/train --model-path /workspace/models/MiniMax-H3 \
+#       --num-frames 124 --height 768 --width 1344 --anchor-short-edge 768
 #
 # Hyperparameters follow the CWM H3 recipe: rank-128 LoRA across all 50 transformer blocks starting
 # from the official Ref2VA checkpoint, video loss only, AdamW with weight decay 0.01, grad-norm clip
@@ -88,7 +115,16 @@ training:
     pin_cpu_memory: true
 
   data:
-    data_path: /data/raw/h3_proxy/kof_train
+    # Written by encode_proxy_samples.py. Cache to local disk, not to a network mount.
+    #
+    # Prompts: this dataset ships no per-clip text. `annotations/caption.json` is episode-level, so
+    # it describes the whole 60 seconds rather than the 5.17 the clip covers, and the manifest
+    # builder inherits it only because having some text beats having none. It is a weaker signal
+    # than it looks like, but also less load-bearing than in a text-to-video run: the Qwen3-VL
+    # embedding is built over the anchor and the proxy as well as the words, so the caption is one
+    # of three conditioning sources rather than the only one. Writing per-clip `prompt.txt` files
+    # upgrades this without touching anything here -- the builder prefers them when present.
+    data_path: /workspace/h3_abot/train
     # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
     preprocessed_data_type: t2va
     dataloader_num_workers: 2
@@ -112,15 +148,16 @@ training:
     min_lr_ratio: 0.05
 
   loop:
-    # 3 epochs over CWM's corpus. Recompute for yours: 3 * ceil(num_clips / global_batch_size).
-    max_train_steps: 3534
+    # 3 epochs over the ~9865 clips left after holding out 24 episodes: 3 * ceil(9865 / 8). The
+    # manifest builder prints the exact figure for the split it wrote; use that rather than this.
+    max_train_steps: 3702
     # global batch = (num_gpus / sp_size) * train_batch_size * this = 1 * 1 * 8 = 8.
     # sp_size equals num_gpus here, so there is a single data-parallel replica and accumulation is
     # the only thing supplying the batch. Learning rate 2e-5 is stated for global batch 8.
     gradient_accumulation_steps: 8
 
   checkpoint:
-    output_dir: runs/h3_proxy_bd_lora/checkpoints
+    output_dir: runs/h3_proxy_bd_lora_abot/checkpoints
     training_state_checkpointing_steps: 250
     checkpoints_total_limit: 3
     resume_from_checkpoint: ""
@@ -128,7 +165,7 @@ training:
   tracker:
     trackers: [wandb]
     project_name: fastvideo_h3_proxy
-    run_name: h3_proxy_bd_lora_r128
+    run_name: h3_proxy_bd_lora_r128_abot
 
   model:
     precondition_outputs: false
@@ -144,14 +181,17 @@ callbacks:
   # Logs a proxy | prediction | target panel per held-out clip, under the tracker key
   # `validation_videos_50_steps_compare`. The prediction alone is also logged, as
   # `validation_videos_50_steps`. Build `dataset_file` with:
-  #   scripts/h3_proxy/prepare_data/seg_dir_to_validation_json.py --root <data> --split val --limit 6
+  #   scripts/h3_proxy/prepare_data/clip_dir_to_validation_json.py \
+  #       --root /data/binghe/datasets/ABot-sub-2000-clips --val-episodes 24 --limit 6 \
+  #       --out /data/binghe/h3_proxy/abot_validation_val6.json
+  # Pass the same --val-episodes the encode manifest used, or the two disagree on what was held out.
   #
   # Cost is the thing to watch. Each record is a full 50-step trajectory at ~41.5k tokens, so six
   # clips every 250 steps is a few percent of wall clock; every 20 steps would dominate the run.
   validation:
     _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
     pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
-    dataset_file: /data/binghe/h3_proxy/validation_val6.json
+    dataset_file: /data/binghe/h3_proxy/abot_validation_val6.json
     every_steps: 250
     run_at_start: true
     sampling_steps: [50]
@@ -166,6 +206,12 @@ callbacks:
     # Must equal the --anchor-short-edge used by encode_proxy_samples.py. The released default is
     # 2048, which is ~7x the anchor vision tokens this run trains on.
     anchor_short_edge: 768
+    # Must equal the encoder's --proxy-height/--proxy-width. Left unset, a video reference resolves
+    # its canvas from its aspect ratio, which puts this 336x192 proxy on the full 1344x768 canvas:
+    # 37296 reference rows where training used 2442, from LANCZOS-upsampled frames. On a DUV that
+    # upsampling also averages unrelated depth codes into values no backend ever predicted.
+    proxy_height: 192
+    proxy_width: 336
     # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
     # edge and still shows whether the output tracks the proxy. Unset uses the full height.
     panel_height: 384

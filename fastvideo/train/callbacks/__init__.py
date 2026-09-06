@@ -8,6 +8,8 @@ from fastvideo.train.callbacks.ema import (
     EMACallback, )
 from fastvideo.train.callbacks.grad_clip import (
     GradNormClipCallback, )
+from fastvideo.train.callbacks.minimax_h3_proxy_validation import (
+    MiniMaxH3ProxyValidationCallback, )
 from fastvideo.train.callbacks.validation import (
     ValidationCallback, )
 
@@ -16,5 +18,6 @@ __all__ = [
     "CallbackDict",
     "EMACallback",
     "GradNormClipCallback",
+    "MiniMaxH3ProxyValidationCallback",
     "ValidationCallback",
 ]
