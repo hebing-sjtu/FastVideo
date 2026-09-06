@@ -99,6 +99,16 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def progress(message: str) -> None:
+    """Report where the scan has got to, on stderr so stdout stays the manifest report.
+
+    The report at the end is the useful output, but it arrives after every clip has been stat-ed and
+    a sample of DUV videos decoded. On a set of ten thousand clips on a network mount that is long
+    enough that a silent process is indistinguishable from a hung one.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
 def episode_of(name: str) -> str:
     match = CLIP_PATTERN.match(name)
     if match is None:
@@ -239,6 +249,7 @@ def main() -> None:
     if not root.is_dir():
         raise SystemExit(f"--root does not exist: {root}")
 
+    progress(f"Listing clip directories under {root} ...")
     clip_dirs = sorted(path for path in root.glob("clip_*") if path.is_dir() and CLIP_PATTERN.match(path.name))
     if not clip_dirs:
         raise SystemExit(f"No 'clip_<episode>_<window>' directories under {root}")
@@ -257,15 +268,26 @@ def main() -> None:
     else:
         keep_episodes = set(episodes)
 
+    in_split = sum(1 for path in clip_dirs if episode_of(path.name) in keep_episodes)
+    progress(f"  {len(clip_dirs)} clips over {len(episodes)} episodes; split '{args.split}' selects {in_split} clips "
+             f"over {len(keep_episodes)} episodes. Reading each clip_report.json ...")
+
     rows: list[dict] = []
     rejected: list[str] = []
     out_of_split = 0
     prompt_sources: dict[str, int] = {}
     conventions: dict[tuple, list[str]] = {}
+    # Roughly ten updates over the scan, whatever the set size, and never more often than every 200
+    # clips: the point is to show movement, not to turn the scan into a write-heavy log.
+    every = max(200, -(-in_split // 10))
     for clip in clip_dirs:
         if episode_of(clip.name) not in keep_episodes:
             out_of_split += 1
             continue
+        scanned = len(rows) + len(rejected)
+        if scanned and scanned % every == 0:
+            progress(f"  scanned {scanned}/{in_split}: {len(rows)} usable, {len(rejected)} rejected "
+                     f"(at {clip.name})")
         target, anchor, duv = (clip / "target" / "rgb.mp4", clip / "target" / "anchor.png", clip / "proxy" / "duv.mp4")
         report_file = clip / "clip_report.json"
         missing = [path.name for path in (target, anchor, duv, report_file) if not path.is_file()]
@@ -312,8 +334,13 @@ def main() -> None:
     # Everything that can reject the set runs before the file exists. A manifest left on disk beside
     # an error message is worse than no manifest: the encode step takes a path, not this script's
     # exit code, so a stale file is indistinguishable from a good one hours later.
+    progress(f"  scan done: {len(rows)} usable, {len(rejected)} rejected.")
     check_conventions(conventions)
     sampled = evenly_spaced(rows, args.preflight_limit) if args.preflight_limit > 0 else []
+    if sampled:
+        # Worth naming: the import behind this pulls in torch, which on a cold page cache is tens of
+        # seconds of a process that looks stuck.
+        progress(f"  decoding {len(sampled)} DUV clip(s) for the palette preflight (first call imports torch) ...")
     problems, skipped = preflight_duv(
         [root / row["proxy_duv_video"] for row in sampled],
         args.proxy_height,
@@ -370,6 +397,7 @@ def main() -> None:
 def report_frame_budget(rows: list[dict], root: Path, limit: int, num_frames: int) -> None:
     """Report the shortest clip's 24-fps budget, the way the encoder will measure it."""
     sample = evenly_spaced(rows, limit) if limit > 0 else rows
+    progress(f"  probing the 24-fps frame budget on {len(sample)} clip(s) ...")
     budgets: list[tuple[str, int]] = []
     for row in sample:
         for key in ("target", "proxy_duv_video"):
