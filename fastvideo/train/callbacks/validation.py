@@ -807,7 +807,12 @@ class ValidationCallback(Callback):
         fps: int,
         scalar_metrics: dict[str, float] | None = None,
     ) -> None:
-        """Log validation media and its scalar verification data at one step."""
+        """Log validation media and its scalar verification data at one step.
+
+        The scalar counts go out whether or not media does. They are what says an event happened at
+        all, so bundling them behind the media would hide exactly the run this is meant to explain:
+        a tracker that drops video leaves a run with no validation trace and no reason why.
+        """
         video_logs = []
         for fname, cap in zip(
                 video_filenames,
@@ -821,10 +826,32 @@ class ValidationCallback(Callback):
             )
             if art is not None:
                 video_logs.append(art)
+
+        artifacts: dict[str, Any] = dict(scalar_metrics) if scalar_metrics else {}
         if video_logs:
-            artifacts: dict[str, Any] = {key: video_logs}
-            if scalar_metrics:
-                artifacts.update(scalar_metrics)
+            artifacts[key] = video_logs
+            logger.info(
+                "Logged %d validation video(s) under %r at step %s (%s).",
+                len(video_logs),
+                key,
+                step,
+                type(self.tracker).__name__,
+            )
+        elif video_filenames:
+            # The files were written, so this is the tracker refusing them rather than a failed
+            # render: `BaseTracker.video` returns None for every backend without video support.
+            logger.warning(
+                "%s produced no video artifact for %d file(s) under %r; the media is on disk at %s "
+                "but will not appear in the tracker.",
+                type(self.tracker).__name__,
+                len(video_filenames),
+                key,
+                os.path.dirname(video_filenames[0]),
+            )
+        else:
+            logger.warning("No validation media survived encoding for %r at step %s.", key, step)
+
+        if artifacts:
             self.tracker.log_artifacts(
                 artifacts,
                 step,

@@ -431,6 +431,44 @@ class TestH3ValidationContract:
         assert artifacts["validation_videos_50_steps"] == filenames
         assert {key: artifacts[key] for key in scalar_metrics} == scalar_metrics
 
+    def test_scalar_evidence_survives_a_tracker_without_video_support(self) -> None:
+        """A tracker that drops media must still leave the counts that prove the event ran.
+
+        ``BaseTracker.video`` returns None for every backend with no video support, so this is the
+        difference between a run that reports "validation happened, media went nowhere" and one that
+        reports nothing at all.
+        """
+
+        class VideolessTracker:
+
+            def __init__(self) -> None:
+                self.artifact_calls = []
+
+            def video(self, filename, *, caption, fps):
+                return None
+
+            def log_artifacts(self, artifacts, step):
+                self.artifact_calls.append((artifacts, step))
+
+        cb = _make_callback()
+        cb.tracker = VideolessTracker()
+        scalar_metrics = {"validation/50_steps_video_count": 4.0}
+
+        cb._log_validation_video_artifacts(
+            [f"validation-{index}.mp4" for index in range(4)],
+            [f"caption-{index}" for index in range(4)],
+            key="validation_videos_50_steps",
+            step=20,
+            fps=24,
+            scalar_metrics=scalar_metrics,
+        )
+
+        assert len(cb.tracker.artifact_calls) == 1
+        artifacts, step = cb.tracker.artifact_calls[0]
+        assert step == 20
+        assert artifacts == scalar_metrics
+        assert "validation_videos_50_steps" not in artifacts
+
 
 class TestAttnQatInferValidation:
 
