@@ -53,27 +53,34 @@ def _checkpoint_inner(module: torch.nn.Module) -> torch.nn.Module | None:
 
 @contextlib.contextmanager
 def _eager_validation_forward(transformer: torch.nn.Module):
-    """Run validation on the bare blocks, not the training checkpoint wrappers.
+    """Call the inner block and skip ``checkpoint_wrapper.forward``.
 
-    ``checkpoint_wrapper`` compiles each block through AOTAutograd + inductor.
-    ``torch.compiler.set_stance("force_eager")`` only suppresses dynamo; it does
-    not stop those wrappers from launching the already-compiled Triton kernel.
-    On this cluster's H200 image that launch is ``CUDA driver error: invalid
-    argument``. Swap the inner modules back in for the sampling loop, then
-    restore the wrappers so the next training step still checkpoints.
+    ``register_module`` does not reliably replace FSDP-held children, so the
+    compiled AOT ``forward`` still ran and launched the H200-invalid Triton
+    permute. Patching ``.forward`` on the wrapper itself is what actually
+    bypasses inductor. Training still uses the original wrapped forward.
     """
-    restored: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
-    for parent in list(transformer.modules()):
-        for name, child in list(parent.named_children()):
-            inner = _checkpoint_inner(child)
-            if inner is None:
-                continue
-            parent.register_module(name, inner)
-            restored.append((parent, name, child))
+    patched: list[tuple[torch.nn.Module, Any]] = []
+    for module in transformer.modules():
+        inner = _checkpoint_inner(module)
+        if inner is None:
+            continue
+        original_forward = module.forward
+
+        def _bypass(*args: Any, _inner: torch.nn.Module = inner, **kwargs: Any) -> Any:
+            return _inner(*args, **kwargs)
+
+        module.forward = _bypass
+        patched.append((module, original_forward))
     logger.info(
-        "Unwrapped %d activation-checkpoint wrapper(s) for validation.",
-        len(restored),
+        "Bypassed %d activation-checkpoint wrapper forward(s) for validation.",
+        len(patched),
     )
+    if not patched:
+        logger.warning(
+            "No checkpoint wrappers found on the validation transformer; "
+            "an inductor permute crash on H200 means the compiled path is elsewhere."
+        )
 
     previous_inductor = os.environ.get("TORCHINDUCTOR_DISABLE")
     os.environ["TORCHINDUCTOR_DISABLE"] = "1"
@@ -87,8 +94,8 @@ def _eager_validation_forward(transformer: torch.nn.Module):
             os.environ.pop("TORCHINDUCTOR_DISABLE", None)
         else:
             os.environ["TORCHINDUCTOR_DISABLE"] = previous_inductor
-        for parent, name, wrapped in restored:
-            parent.register_module(name, wrapped)
+        for module, original_forward in patched:
+            module.forward = original_forward
 
 
 if TYPE_CHECKING:
