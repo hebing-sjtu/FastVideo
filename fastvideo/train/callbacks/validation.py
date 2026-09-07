@@ -38,25 +38,56 @@ from fastvideo.train.utils.moduleloader import (
     make_inference_args, )
 from fastvideo.train.utils.validation_media import write_validation_mp4
 from fastvideo.training.trackers import DummyTracker
+from fastvideo.utils import shallow_asdict
+
+
+def _checkpoint_inner(module: torch.nn.Module) -> torch.nn.Module | None:
+    """Return the module inside an activation-checkpoint wrapper, if this is one."""
+    inner = getattr(module, "_checkpoint_wrapped_module", None)
+    if inner is None:
+        inner = getattr(module, "mod", None)
+    if inner is None or inner is module:
+        return None
+    if type(module).__name__ not in ("CheckpointWrapper", "ActivationWrapper"):
+        return None
+    return inner if isinstance(inner, torch.nn.Module) else None
 
 
 @contextlib.contextmanager
-def _eager_validation_forward():
-    """Keep validation off the inductor path the training checkpoint wrappers use.
+def _eager_validation_forward(transformer: torch.nn.Module):
+    """Run validation on the bare blocks, not the training checkpoint wrappers.
 
-    Training wraps every block in ``checkpoint_wrapper``, which goes through
-    AOTAutograd. Under ``no_grad`` that still compiles a Triton permute/copy, and
-    on this cluster's H200 image the launch fails with ``CUDA driver error:
-    invalid argument``. Validation is already a 50-step sampling loop; eager is
-    the right default.
+    ``checkpoint_wrapper`` compiles each block through AOTAutograd + inductor.
+    ``torch.compiler.set_stance("force_eager")`` only suppresses dynamo; it does
+    not stop those wrappers from launching the already-compiled Triton kernel.
+    On this cluster's H200 image that launch is ``CUDA driver error: invalid
+    argument``. Swap the inner modules back in for the sampling loop, then
+    restore the wrappers so the next training step still checkpoints.
     """
+    restored: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
+    for parent in list(transformer.modules()):
+        for name, child in list(parent.named_children()):
+            inner = _checkpoint_inner(child)
+            if inner is None:
+                continue
+            parent.register_module(name, inner)
+            restored.append((parent, name, child))
+
+    previous_inductor = os.environ.get("TORCHINDUCTOR_DISABLE")
+    os.environ["TORCHINDUCTOR_DISABLE"] = "1"
     set_stance = getattr(torch.compiler, "set_stance", None)
-    if set_stance is None:
-        yield
-        return
-    with set_stance("force_eager"):
-        yield
-from fastvideo.utils import shallow_asdict
+    stance_ctx = set_stance("force_eager") if set_stance is not None else contextlib.nullcontext()
+    try:
+        with stance_ctx:
+            yield
+    finally:
+        if previous_inductor is None:
+            os.environ.pop("TORCHINDUCTOR_DISABLE", None)
+        else:
+            os.environ["TORCHINDUCTOR_DISABLE"] = previous_inductor
+        for parent, name, wrapped in restored:
+            parent.register_module(name, wrapped)
+
 
 if TYPE_CHECKING:
     from fastvideo.train.methods.base import TrainingMethod
@@ -345,7 +376,7 @@ class ValidationCallback(Callback):
                 # EMA weights during validation.
                 ema_cb = self._find_ema_callback()
                 ctx = ema_cb.ema_context(transformer) if ema_cb is not None else contextlib.nullcontext(transformer)
-                with ctx as t, self._attn_qat_infer_context(t), _eager_validation_forward():
+                with ctx as t, self._attn_qat_infer_context(t), _eager_validation_forward(t):
                     self._run_validation_inner(
                         method,
                         step,

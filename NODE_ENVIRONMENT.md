@@ -122,6 +122,8 @@ source /usr/local/gib/scripts/set_nccl_env.sh
 export LD_LIBRARY_PATH=/usr/local/gib/lib64:${LD_LIBRARY_PATH}
 export TORCH_NCCL_ENABLE_MONITORING=0
 export TOKENIZERS_PARALLELISM=false
+# H200 + checkpoint_wrapper otherwise compiles a Triton permute that the driver rejects.
+export TORCHINDUCTOR_DISABLE=1
 unset NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_NET_PLUGIN FASTVIDEO_NCCL_SO_PATH LD_PRELOAD
 ```
 
