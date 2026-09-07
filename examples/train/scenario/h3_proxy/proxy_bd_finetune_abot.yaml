@@ -205,8 +205,12 @@ callbacks:
     _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
     pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
     dataset_file: /data/binghe/h3_proxy/abot_validation_val6.json
-    every_steps: 250
-    run_at_start: true
+    # Off on A3-Ultra H200 until validation sampling is confirmed past the
+    # inductor permute crash. Training itself is fine (16-GPU smoke completed).
+    # Re-enable with every_steps: 250 and run_at_start: true after a green
+    # sampling pass; the DiT now skips checkpoint_wrapper under no_grad.
+    every_steps: 0
+    run_at_start: false
     sampling_steps: [50]
     # H3 has no zero-embedding branch for text CFG, matching training_cfg_rate: 0.0 above.
     guidance_scale: 1.0

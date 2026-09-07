@@ -27,6 +27,30 @@ _TRANSFORMER_BLOCK_NAMES = [
 ]
 
 
+class _NoGradBypassCheckpoint(torch.nn.Module):
+    """Skip AOT/inductor when autograd is off.
+
+    ``checkpoint_wrapper`` (NO_REENTRANT) compiles each block through
+    AOTAutograd + inductor even under ``no_grad``. Training needs that path
+    (FSDP + LoRA keep their grad_fn). Validation does not: it runs the same
+    wrapped DiT without grad, and on A3-Ultra H200 the compiled Triton permute
+    is ``CUDA driver error: invalid argument``. Calling the inner module when
+    grad is off avoids inductor without changing the training checkpoint impl.
+    """
+
+    def __init__(self, checkpointed: torch.nn.Module) -> None:
+        super().__init__()
+        self.checkpointed = checkpointed
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if torch.is_grad_enabled():
+            return self.checkpointed(*args, **kwargs)
+        inner = getattr(self.checkpointed, "_checkpoint_wrapped_module", None)
+        if inner is None:
+            inner = getattr(self.checkpointed, "mod", self.checkpointed)
+        return inner(*args, **kwargs)
+
+
 class CheckpointType(str, Enum):
     """Supported activation checkpointing policies."""
 
@@ -84,7 +108,7 @@ def _apply_activation_checkpointing_blocks(
                 # avoids inductor by unwrapping these modules, not by changing
                 # the training checkpoint impl.
                 checkpointed_block = checkpoint_wrapper(block, preserve_rng_state=False)
-                blocks.register_module(layer_id, checkpointed_block)
+                blocks.register_module(layer_id, _NoGradBypassCheckpoint(checkpointed_block))
         applied = True
     if not applied:
         raise ValueError("Activation checkpointing is not applied successfully")

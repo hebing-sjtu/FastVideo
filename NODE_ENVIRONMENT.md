@@ -122,10 +122,9 @@ source /usr/local/gib/scripts/set_nccl_env.sh
 export LD_LIBRARY_PATH=/usr/local/gib/lib64:${LD_LIBRARY_PATH}
 export TORCH_NCCL_ENABLE_MONITORING=0
 export TOKENIZERS_PARALLELISM=false
-# H200 + checkpoint_wrapper otherwise compiles a Triton permute that the driver rejects.
-# Must be in the shell *before* torchrun. `python -m fastvideo...` imports torch via
-# fastvideo/__init__.py; setting this only inside train.py is too late.
-export TORCHINDUCTOR_DISABLE=1
+# AOT/inductor is not torch.compile. These are the switches PyTorch actually reads.
+export TORCH_COMPILE_DISABLE=1
+export TORCHDYNAMO_DISABLE=1
 unset NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_NET_PLUGIN FASTVIDEO_NCCL_SO_PATH LD_PRELOAD
 ```
 
@@ -341,7 +340,7 @@ new lines. This is several minutes even with a warm cache; without one, individu
 | `tee: … Stale file handle` | FUSE dropped the log fd. Training itself is fine if artifacts are on `/data`. |
 | `destroy_process_group() was not called` after a real `Training completed` | Shutdown noise. After a crash it means the *other* symptom, not the cause. |
 | W&B `View run` | Printed on any exit after `wandb.init`, including crashes. Look for `Steps: 2/2` / `Training completed` before treating it as success. |
-| `RuntimeError: CUDA driver error: invalid argument` inside `torch/_inductor` / `triton_poi_fused_*` during validation | The training DiT is wrapped in `checkpoint_wrapper` (AOTAutograd). Validation unwraps those modules and the entrypoint sets `TORCHINDUCTOR_DISABLE=1`. Do **not** switch checkpointing to `REENTRANT` to dodge this — FSDP + LoRA then yields `element 0 of tensors does not require grad` on the first training backward. |
+| `RuntimeError: CUDA driver error: invalid argument` inside `torch/_inductor` / `triton_poi_fused_*` during validation | `checkpoint_wrapper` compiles through AOT+inductor even under `no_grad`. Training (with grad) is fine — the 16-GPU smoke completed. The abot YAML currently has `every_steps: 0` so a full launch trains instead of dying at step 0. Blocks now skip the wrapper when grad is off. Do **not** switch checkpointing to `REENTRANT`. |
 
 A real failure has a `Traceback`, `NCCL error`, `CUDA out of memory`, `mesh should not be bigger
 than the default world size`, or one node printing `View run` and exiting while the other is still
