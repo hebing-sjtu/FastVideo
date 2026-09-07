@@ -20,6 +20,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     build_packed_sequence,
     build_ref2va_packed_sequence,
     keyframe_condition_noise,
+    pad_video_latents_to_patch,
     patchify_video_latents,
 )
 from fastvideo.pipelines.basic.minimax_h3.reference import (
@@ -124,6 +125,10 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
                 posterior = self.vae.encode(self.vae.normalize_pixels(pixels)).latent_dist
                 latents = self.vae.normalize_latents(_sample_visual_posterior(posterior).to(
                     torch.float16).float()).cpu()
+            # Same pad the training cache applies: a 336x192 proxy is 21 x 12 after the VAE, and
+            # 21 is not a multiple of the 2x2 patch. Geometry on the reference has to be the padded
+            # size so the packed layout and the condition noise agree with the rows.
+            latents = pad_video_latents_to_patch(latents, patch_size)
             reference.num_latent_frames = int(latents.shape[2])
             reference.latent_height = int(latents.shape[3])
             reference.latent_width = int(latents.shape[4])

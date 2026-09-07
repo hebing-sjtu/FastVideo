@@ -111,8 +111,29 @@ def prepare_keyframe_image(image: Image.Image, height: int, width: int, stretch:
     return resized.crop((left, top, left + width, top + height))
 
 
+def pad_video_latents_to_patch(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
+    """Pad a latent grid's height and width up to the spatial patch.
+
+    A reference is encoded at whatever resolution its render happened to have, and 16x VAE
+    downsampling readily lands on an odd latent extent that the 2x2 patch cannot tile. A 336x192
+    proxy is the case that showed up first: 21 x 12 latents. Zero padding on the far edge adds at
+    most one row and one column of tokens; cropping would silently drop a strip of the scene, and
+    resizing would break pixel alignment with the target. Training and validation have to do this
+    the same way or the token counts diverge.
+    """
+    if latents.ndim != 5:
+        raise ValueError(f"Video latents must be [B, C, T, H, W], got shape {tuple(latents.shape)}.")
+    _, patch_h, patch_w = patch_size
+    pad_h = (-latents.shape[-2]) % patch_h
+    pad_w = (-latents.shape[-1]) % patch_w
+    if not pad_h and not pad_w:
+        return latents
+    return torch.nn.functional.pad(latents, (0, pad_w, 0, pad_h), value=0.0)
+
+
 def patchify_video_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
     patch_t, patch_h, patch_w = patch_size
+    latents = pad_video_latents_to_patch(latents, patch_size)
     batch_size, channels, num_frames, height, width = latents.shape
     if num_frames % patch_t or height % patch_h or width % patch_w:
         raise ValueError(f"Latents of shape {tuple(latents.shape)} are not divisible by the patch {patch_size}.")

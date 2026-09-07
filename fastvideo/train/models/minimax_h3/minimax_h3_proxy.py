@@ -45,6 +45,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     audio_latent_num_frames,
     build_ref2va_packed_sequence,
     build_row_timesteps,
+    pad_video_latents_to_patch,
     patchify_video_latents,
     unpack_audio_tokens,
     unpatchify_video_tokens,
@@ -61,21 +62,6 @@ logger = init_logger(__name__)
 
 _VIDEO_LATENT_CHANNELS = 24
 _AUDIO_LATENT_CHANNELS = 32
-
-
-def _pad_to_patch(latents: torch.Tensor, patch_h: int, patch_w: int) -> torch.Tensor:
-    """Pad a latent grid's height and width up to the patch size.
-
-    A reference is encoded at whatever resolution its render happened to have, and 16x VAE
-    downsampling readily lands on an odd latent extent that the 2x2 patch cannot tile. Zero padding
-    on the far edge adds at most one row and one column of tokens; cropping instead would silently
-    drop a strip of the scene, and resizing would break pixel alignment with the target.
-    """
-    pad_h = (-latents.shape[-2]) % patch_h
-    pad_w = (-latents.shape[-1]) % patch_w
-    if not pad_h and not pad_w:
-        return latents
-    return torch.nn.functional.pad(latents, (0, pad_w, 0, pad_h), value=0.0)
 
 
 class MiniMaxH3ProxyModel(MiniMaxH3Model):
@@ -255,7 +241,6 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         encoded away.
         """
         patch_size = self.transformer.patch_size
-        _, patch_h, patch_w = patch_size
         references: list[MiniMaxH3PreparedReference] = []
         rows: list[torch.Tensor] = []
 
@@ -268,7 +253,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         ordered.append(("video", raw_batch["proxy_latent"]))
 
         for media_type, latents in ordered:
-            latents = _pad_to_patch(latents.to(device=device, dtype=dtype), patch_h, patch_w)
+            latents = pad_video_latents_to_patch(latents.to(device=device, dtype=dtype), patch_size)
             if latents.ndim != 5 or latents.shape[1] != _VIDEO_LATENT_CHANNELS:
                 raise ValueError(f"A cached {media_type} reference must have shape "
                                  f"[1, {_VIDEO_LATENT_CHANNELS}, frames, height, width], got {tuple(latents.shape)}")
