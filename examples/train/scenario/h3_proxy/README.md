@@ -181,7 +181,6 @@ the only stage it has — the three-stage BD/AR/DMD ladder belongs to the causal
 `examples/train/scenario/game_v2v_depth/`.
 
 ```bash
-export NCCL_P2P_DISABLE=1
 export TORCH_NCCL_ENABLE_MONITORING=0
 export TOKENIZERS_PARALLELISM=false
 
@@ -189,11 +188,25 @@ torchrun --nnodes 2 --nproc_per_node 8 -m fastvideo.train.entrypoint.train \
     --config examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml
 ```
 
-The first two are what every other launcher under `examples/` sets, and they are not optional in a
-container: where peer-to-peer access is not actually available between devices, `ncclCommInitRank`
-fails during world-group construction with `NCCL error: internal error`, which names neither P2P nor
-the container. Add `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,ENV` to see the real reason rather than
-that wrapper.
+Do not copy the `NCCL_P2P_DISABLE=1` that the older launchers under `examples/` carry. On a node
+whose GPUs are linked by NVLink it disables that path and pushes every collective onto the network
+plugin, which costs both throughput and — if the plugin is not fully configured — the run.
+
+On a Google Cloud A3-Ultra or A4 node, source the platform's NCCL environment before launching and
+put its libraries on the loader path:
+
+```bash
+source /usr/local/gib/scripts/set_nccl_env.sh
+export LD_LIBRARY_PATH=/usr/local/gib/lib64:${LD_LIBRARY_PATH}
+```
+
+Skipping this is not a performance footnote. The gIB config checker terminates a workload whose NCCL
+variables it does not recognise, and the failure arrives as `ncclCommInitRank` raising
+`NCCL error: internal error` while the world group is built — after the rings and trees have been
+laid out, so the log looks healthy right up to the last line. `NCCL_DEBUG=INFO` distinguishes the
+two states in one line: `Using network gIB` is configured, `Using network Socket` means the plugin
+loaded and was then passed over, usually because `/usr/local/gib/lib64` is missing from
+`LD_LIBRARY_PATH`.
 
 On a single node, `unset PET_NNODES` first and add `--standalone`; the platform injects multi-node
 rendezvous variables even for single-node jobs and `torchrun` will otherwise wait for a second node
