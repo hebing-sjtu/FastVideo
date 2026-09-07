@@ -181,13 +181,27 @@ the only stage it has — the three-stage BD/AR/DMD ladder belongs to the causal
 `examples/train/scenario/game_v2v_depth/`.
 
 ```bash
+export NCCL_P2P_DISABLE=1
+export TORCH_NCCL_ENABLE_MONITORING=0
+export TOKENIZERS_PARALLELISM=false
+
 torchrun --nnodes 2 --nproc_per_node 8 -m fastvideo.train.entrypoint.train \
     --config examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml
 ```
 
+The first two are what every other launcher under `examples/` sets, and they are not optional in a
+container: where peer-to-peer access is not actually available between devices, `ncclCommInitRank`
+fails during world-group construction with `NCCL error: internal error`, which names neither P2P nor
+the container. Add `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,ENV` to see the real reason rather than
+that wrapper.
+
 On a single node, `unset PET_NNODES` first and add `--standalone`; the platform injects multi-node
 rendezvous variables even for single-node jobs and `torchrun` will otherwise wait for a second node
 that never arrives.
+
+Check the GPUs are actually free before launching. The encode step runs one process per GPU, each
+holding a ~64 GB text encoder, and a detached shard that outlived its shell leaves too little memory
+for NCCL to build its buffers — which also surfaces as an unhelpful init error rather than an OOM.
 
 `train_batch_size` must stay 1 and `training_cfg_rate` must stay 0. Packed row indices describe one
 document with no batch offset, and H3 has no zero-embedding branch for text CFG. Drop conditioning
