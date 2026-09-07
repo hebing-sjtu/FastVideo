@@ -192,21 +192,33 @@ Do not copy the `NCCL_P2P_DISABLE=1` that the older launchers under `examples/` 
 whose GPUs are linked by NVLink it disables that path and pushes every collective onto the network
 plugin, which costs both throughput and — if the plugin is not fully configured — the run.
 
-On a Google Cloud A3-Ultra or A4 node, source the platform's NCCL environment before launching and
-put its libraries on the loader path:
+A Google Cloud A3-Ultra or A4 node needs one decision made explicitly, and the single-node answer is
+the opposite of the multi-node one.
+
+Those images ship the gIB NCCL plugins in a system library directory, so `libnccl-net.so` is found
+and loaded with no configuration at all, and `/usr/local/gib/scripts/set_nccl_env.sh` points
+`NCCL_CONF_FILE` at a file whose first setting is `NCCL_NET=gIB`. That forces every communicator
+onto the RDMA network. Across nodes that is the whole point. Within one node it is not: eight GPUs
+on one board talk over NVLink through NCCL's P2P transport and the network module carries no data,
+so forcing gIB only adds a dependency on IB devices being exposed to the container. When they are
+not, `ncclCommInitRank` raises `NCCL error: internal error` — and it does so *after* the rings and
+trees are laid out, so `NCCL_DEBUG=INFO` reads healthy right up to the last line.
+
+For a single-node run, decline the plugin:
 
 ```bash
-source /usr/local/gib/scripts/set_nccl_env.sh
-export LD_LIBRARY_PATH=/usr/local/gib/lib64:${LD_LIBRARY_PATH}
+unset NCCL_CONF_FILE
+export NCCL_NET_PLUGIN=none
 ```
 
-Skipping this is not a performance footnote. The gIB config checker terminates a workload whose NCCL
-variables it does not recognise, and the failure arrives as `ncclCommInitRank` raising
-`NCCL error: internal error` while the world group is built — after the rings and trees have been
-laid out, so the log looks healthy right up to the last line. `NCCL_DEBUG=INFO` distinguishes the
-two states in one line: `Using network gIB` is configured, `Using network Socket` means the plugin
-loaded and was then passed over, usually because `/usr/local/gib/lib64` is missing from
-`LD_LIBRARY_PATH`.
+Both are needed. `NCCL_NET_PLUGIN=none` stops the plugin from loading, but a surviving
+`NCCL_NET=gIB` from the config file then names a network that no longer exists.
+
+For a multi-node run, do the opposite — source the script and add `/usr/local/gib/lib64` to
+`LD_LIBRARY_PATH`. Note that the `nccl-gib-plugins` package installs plugins only: there is no
+`libnccl.so.2` under `/usr/local/gib/lib64`, because it is meant to run against the NCCL that
+PyTorch already brings. `FASTVIDEO_NCCL_SO_PATH` exists to override which `libnccl.so.2` this repo's
+ctypes wrapper loads, and pointing it into that directory finds nothing.
 
 On a single node, `unset PET_NNODES` first and add `--standalone`; the platform injects multi-node
 rendezvous variables even for single-node jobs and `torchrun` will otherwise wait for a second node
