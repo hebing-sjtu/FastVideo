@@ -22,6 +22,11 @@ import os
 import sys
 from typing import Any
 
+# Must be set before inductor's first compile. ``checkpoint_wrapper``'s default
+# NO_REENTRANT path goes through AOTAutograd and on A3-Ultra H200 the compiled
+# Triton permute launch is ``CUDA driver error: invalid argument``.
+os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
+
 import torch
 
 from fastvideo.logger import init_logger

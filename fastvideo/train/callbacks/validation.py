@@ -46,11 +46,9 @@ def _checkpoint_inner(module: torch.nn.Module) -> torch.nn.Module | None:
     inner = getattr(module, "_checkpoint_wrapped_module", None)
     if inner is None:
         inner = getattr(module, "mod", None)
-    if inner is None or inner is module:
+    if inner is None or inner is module or not isinstance(inner, torch.nn.Module):
         return None
-    if type(module).__name__ not in ("CheckpointWrapper", "ActivationWrapper"):
-        return None
-    return inner if isinstance(inner, torch.nn.Module) else None
+    return inner
 
 
 @contextlib.contextmanager
@@ -72,6 +70,10 @@ def _eager_validation_forward(transformer: torch.nn.Module):
                 continue
             parent.register_module(name, inner)
             restored.append((parent, name, child))
+    logger.info(
+        "Unwrapped %d activation-checkpoint wrapper(s) for validation.",
+        len(restored),
+    )
 
     previous_inductor = os.environ.get("TORCHINDUCTOR_DISABLE")
     os.environ["TORCHINDUCTOR_DISABLE"] = "1"

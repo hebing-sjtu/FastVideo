@@ -10,7 +10,10 @@ from enum import Enum
 from typing import Any
 
 import torch
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    checkpoint_wrapper,
+)
 
 # Model families expose transformer layers under these stable attributes. The
 # shared policy discovers them without importing each model implementation.
@@ -78,7 +81,14 @@ def _apply_activation_checkpointing_blocks(
             if n_layer is None or index % n_layer == 0:
                 # The wrapped transformer blocks contain no stochastic masks
                 # that must replay during recomputation.
-                checkpointed_block = checkpoint_wrapper(block, preserve_rng_state=False)
+                # REENTRANT avoids AOTAutograd+inductor. NO_REENTRANT compiles a Triton
+                # permute that the A3-Ultra H200 driver rejects with
+                # ``CUDA driver error: invalid argument`` during validation (no_grad).
+                checkpointed_block = checkpoint_wrapper(
+                    block,
+                    preserve_rng_state=False,
+                    checkpoint_impl=CheckpointImpl.REENTRANT,
+                )
                 blocks.register_module(layer_id, checkpointed_block)
         applied = True
     if not applied:
