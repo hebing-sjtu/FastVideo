@@ -337,6 +337,7 @@ new lines. This is several minutes even with a warm cache; without one, individu
 | `tee: … Stale file handle` | FUSE dropped the log fd. Training itself is fine if artifacts are on `/data`. |
 | `destroy_process_group() was not called` after a real `Training completed` | Shutdown noise. After a crash it means the *other* symptom, not the cause. |
 | W&B `View run` | Printed on any exit after `wandb.init`, including crashes. Look for `Steps: 2/2` / `Training completed` before treating it as success. |
+| `RuntimeError: CUDA driver error: invalid argument` inside `torch/_inductor` / `triton_poi_fused_*` during validation | The training DiT is wrapped in `checkpoint_wrapper` (AOTAutograd). Validation used to compile a Triton permute on that path; H200's driver rejects the launch. Current tree forces eager for the validation forward. If an older checkout hits this, `export TORCHINDUCTOR_DISABLE=1` or `--callbacks.validation.run_at_start false` unblocks training. |
 
 A real failure has a `Traceback`, `NCCL error`, `CUDA out of memory`, `mesh should not be bigger
 than the default world size`, or one node printing `View run` and exiting while the other is still

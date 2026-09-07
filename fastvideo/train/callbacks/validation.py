@@ -38,6 +38,24 @@ from fastvideo.train.utils.moduleloader import (
     make_inference_args, )
 from fastvideo.train.utils.validation_media import write_validation_mp4
 from fastvideo.training.trackers import DummyTracker
+
+
+@contextlib.contextmanager
+def _eager_validation_forward():
+    """Keep validation off the inductor path the training checkpoint wrappers use.
+
+    Training wraps every block in ``checkpoint_wrapper``, which goes through
+    AOTAutograd. Under ``no_grad`` that still compiles a Triton permute/copy, and
+    on this cluster's H200 image the launch fails with ``CUDA driver error:
+    invalid argument``. Validation is already a 50-step sampling loop; eager is
+    the right default.
+    """
+    set_stance = getattr(torch.compiler, "set_stance", None)
+    if set_stance is None:
+        yield
+        return
+    with set_stance("force_eager"):
+        yield
 from fastvideo.utils import shallow_asdict
 
 if TYPE_CHECKING:
@@ -327,7 +345,7 @@ class ValidationCallback(Callback):
                 # EMA weights during validation.
                 ema_cb = self._find_ema_callback()
                 ctx = ema_cb.ema_context(transformer) if ema_cb is not None else contextlib.nullcontext(transformer)
-                with ctx as t, self._attn_qat_infer_context(t):
+                with ctx as t, self._attn_qat_infer_context(t), _eager_validation_forward():
                     self._run_validation_inner(
                         method,
                         step,
