@@ -181,44 +181,30 @@ the only stage it has — the three-stage BD/AR/DMD ladder belongs to the causal
 `examples/train/scenario/game_v2v_depth/`.
 
 ```bash
+source /usr/local/gib/scripts/set_nccl_env.sh
+export LD_LIBRARY_PATH=/usr/local/gib/lib64:${LD_LIBRARY_PATH}
 export TORCH_NCCL_ENABLE_MONITORING=0
 export TOKENIZERS_PARALLELISM=false
 
 torchrun --nnodes 2 --nproc_per_node 8 -m fastvideo.train.entrypoint.train \
-    --config examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml
+    --config examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml \
+    --training.distributed.num_gpus 16 \
+    --training.distributed.hsdp_shard_dim 16 \
+    --training.loop.gradient_accumulation_steps 4
 ```
 
-Do not copy the `NCCL_P2P_DISABLE=1` that the older launchers under `examples/` carry. On a node
-whose GPUs are linked by NVLink it disables that path and pushes every collective onto the network
-plugin, which costs both throughput and — if the plugin is not fully configured — the run.
+On a Google Cloud A3-Ultra or A4 node that environment is the whole of it, but it has a
+prerequisite the image does not satisfy: the gIB plugin `dlopen`s `libibverbs.so.1`, which is not
+installed, and `set_nccl_env.sh` forces `NCCL_NET=gIB` — so a forced network with no usable devices
+takes down `ncclCommInitRank` with `invalid usage` or `internal error`, on one node as readily as on
+two. `NODE_ENVIRONMENT.md` at the repo root has the one-line fix, the log lines that identify it,
+and three plausible-looking workarounds that are wrong — including the `NCCL_P2P_DISABLE=1` that
+older launchers under `examples/` carry, which disables NVLink and makes things worse.
 
-A Google Cloud A3-Ultra or A4 node needs one decision made explicitly, and the single-node answer is
-the opposite of the multi-node one.
-
-Those images ship the gIB NCCL plugins in a system library directory, so `libnccl-net.so` is found
-and loaded with no configuration at all, and `/usr/local/gib/scripts/set_nccl_env.sh` points
-`NCCL_CONF_FILE` at a file whose first setting is `NCCL_NET=gIB`. That forces every communicator
-onto the RDMA network. Across nodes that is the whole point. Within one node it is not: eight GPUs
-on one board talk over NVLink through NCCL's P2P transport and the network module carries no data,
-so forcing gIB only adds a dependency on IB devices being exposed to the container. When they are
-not, `ncclCommInitRank` raises `NCCL error: internal error` — and it does so *after* the rings and
-trees are laid out, so `NCCL_DEBUG=INFO` reads healthy right up to the last line.
-
-For a single-node run, decline the plugin:
-
-```bash
-unset NCCL_CONF_FILE
-export NCCL_NET_PLUGIN=none
-```
-
-Both are needed. `NCCL_NET_PLUGIN=none` stops the plugin from loading, but a surviving
-`NCCL_NET=gIB` from the config file then names a network that no longer exists.
-
-For a multi-node run, do the opposite — source the script and add `/usr/local/gib/lib64` to
-`LD_LIBRARY_PATH`. Note that the `nccl-gib-plugins` package installs plugins only: there is no
-`libnccl.so.2` under `/usr/local/gib/lib64`, because it is meant to run against the NCCL that
-PyTorch already brings. `FASTVIDEO_NCCL_SO_PATH` exists to override which `libnccl.so.2` this repo's
-ctypes wrapper loads, and pointing it into that directory finds nothing.
+Do not skip `--dry-run` on two GPUs before a 16-rank launch. It builds the config, dataloader and
+process groups and then exits, so it catches a wrong path, a mesh that disagrees with torchrun's
+process count, and every NCCL problem above — in two minutes rather than after a 32B text encoder
+has loaded.
 
 On a single node, `unset PET_NNODES` first and add `--standalone`; the platform injects multi-node
 rendezvous variables even for single-node jobs and `torchrun` will otherwise wait for a second node
