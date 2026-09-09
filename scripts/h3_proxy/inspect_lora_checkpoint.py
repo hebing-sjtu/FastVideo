@@ -133,6 +133,10 @@ def report(name: str, items: list[tuple[str, Any]]) -> None:
 def main() -> None:
     args = parse_args()
     ckpt = resolve(Path(args.checkpoint))
+    leftover = ckpt / "_inspect_flat.pt"
+    if leftover.is_file():
+        leftover.unlink()
+        print(f"removed leftover flatten dump {leftover}")
     meta_file = ckpt / "metadata.json"
     if meta_file.is_file():
         meta = json.loads(meta_file.read_text())
