@@ -21,6 +21,13 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     MINIMAX_H3_VISION_END_TOKEN,
     MINIMAX_H3_VISION_START_TOKEN,
 )
+from fastvideo.pipelines.basic.minimax_h3.cwm_presentation import (
+    CWM_SYSTEM_PROMPT_KEY,
+    canonical_caption,
+    load_cwm_system_prompt,
+    resolve_cwm_system_role,
+    wrap_ref2va_chat,
+)
 from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference, sample_reference_video_frames
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import MINIMAX_H3_KEYFRAMES_KEY
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
@@ -110,7 +117,7 @@ def build_ref2va_presentation(
             raise ValueError(f"Unsupported prepared reference type: {reference.media_type!r}.")
     if counts["image"] != len(image_token_counts) or counts["video"] != len(video_block_token_counts):
         raise ValueError("Qwen vision token counts do not match the ordered references.")
-    emit(text(prompt))
+    emit(text(canonical_caption(prompt) if prompt.strip() else prompt))
     return token_ids, token_tags
 
 
@@ -274,6 +281,16 @@ class MiniMaxH3ConditioningStage(PipelineStage):
             image_token_counts,
             video_block_token_counts,
         )
+        role = resolve_cwm_system_role(batch.extra.get(CWM_SYSTEM_PROMPT_KEY))
+        if role is not None:
+            token_ids, token_tags = wrap_ref2va_chat(
+                self.tokenizer,
+                self.processor,
+                load_cwm_system_prompt(role),
+                token_ids,
+                token_tags,
+                caption=str(batch.prompt),
+            )
         return self._encode_tokens(
             token_ids,
             token_tags,

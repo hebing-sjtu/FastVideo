@@ -47,7 +47,13 @@ Usage::
         --root data/h3_proxy/raw \\
         --output /data/raw/h3_proxy/train \\
         --model-path data/models/MiniMax-H3 \\
-        --num-frames 124 --height 768 --width 1344
+        --num-frames 124 --height 768 --width 1344 \\
+        --cwm-system w0
+
+    Refresh only the Qwen rows (VAE latents stay) after changing the chat wrap::
+
+    python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \\
+        --manifest ... --root ... --output ... --model-path ... --text-only --cwm-system w0
 """
 
 from __future__ import annotations
@@ -88,6 +94,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-index", type=int, default=0, help="This worker's index, for splitting a manifest.")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--cwm-system",
+        default="w0",
+        choices=("w0", "wn", "none"),
+        help="Wrap Qwen in CWM's AWM_PROXY_CONTROL chat. ABot single-window clips are w0. "
+        "Per-row 'cwm_system' in the manifest overrides this. 'none' keeps the flat user body.",
+    )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Rewrite text_embedding/text_token_tags on existing .pt files. Does not load the VAE "
+        "or touch latents. Missing .pt files are skipped (run a full encode for those first).",
+    )
     args = parser.parse_args()
     if args.num_frames % 17 != 5:
         raise SystemExit(f"--num-frames must satisfy n %% 17 == 5 for the H3 causal VAE, got {args.num_frames}")
@@ -210,7 +229,7 @@ class Encoders:
     encoder per clip would dominate the run.
     """
 
-    def __init__(self, model_path: Path, device: str) -> None:
+    def __init__(self, model_path: Path, device: str, *, text_only: bool = False, cwm_system: str = "w0") -> None:
         from fastvideo.configs.pipelines.minimax_h3 import MiniMaxH3PipelineConfig
         from fastvideo.fastvideo_args import FastVideoArgs
         from fastvideo.models.loader.component_loader import PipelineComponentLoader
@@ -219,6 +238,7 @@ class Encoders:
 
         self.device = torch.device(device)
         self.model_path = model_path
+        self.cwm_system = "" if cwm_system == "none" else cwm_system
         self.model_index = verify_model_config_and_directory(str(model_path))
         self.fastvideo_args = FastVideoArgs(
             model_path=str(model_path),
@@ -241,7 +261,7 @@ class Encoders:
                 fastvideo_args=self.fastvideo_args,
             )
 
-        self.vae = load("vae")
+        self.vae = None if text_only else load("vae")
         self.conditioning = MiniMaxH3ConditioningStage(
             conditioner=load("text_encoder"),
             tokenizer=load("tokenizer"),
@@ -258,6 +278,8 @@ class Encoders:
         """
         from fastvideo.pipelines.basic.minimax_h3.packing import MINIMAX_H3_KEYFRAME_ENCODE_SEED
 
+        if self.vae is None:
+            raise RuntimeError("Encoders were constructed with text_only=True; VAE is not loaded.")
         pixels = pixels.to(device=self.device, dtype=torch.float32)
         posterior = self.vae.encode(self.vae.normalize_pixels(pixels)).latent_dist
         generator = torch.Generator("cpu").manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
@@ -269,6 +291,8 @@ class Encoders:
         """Encode one still through the VAE's keyframe path to ``[24, 1, H', W']``."""
         from fastvideo.pipelines.basic.minimax_h3.packing import MINIMAX_H3_KEYFRAME_ENCODE_SEED
 
+        if self.vae is None:
+            raise RuntimeError("Encoders were constructed with text_only=True; VAE is not loaded.")
         pixels = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1)[None, :, None]
         pixels = pixels.to(device=self.device, dtype=torch.float32).div_(255.0)
         posterior = self.vae.encode_keyframe(self.vae.normalize_pixels(pixels)).latent_dist
@@ -278,7 +302,7 @@ class Encoders:
 
     @torch.no_grad()
     def encode_text(self, prompt: str, anchor: Image.Image,
-                    proxy_preview: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+                    proxy_preview: np.ndarray, *, cwm_system: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the Ref2VA conditioning stage over the same reference order training will pack.
 
         The stage tokenizes ``<Picture 1>`` then ``<Video 1>`` labels around Qwen's vision
@@ -290,7 +314,12 @@ class Encoders:
         from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_conditioning import (
             MINIMAX_H3_TEXT_TOKEN_TAGS_KEY, )
 
+        from fastvideo.pipelines.basic.minimax_h3.cwm_presentation import CWM_SYSTEM_PROMPT_KEY
+
         batch = ForwardBatch(data_type="video", prompt=prompt)
+        role = self.cwm_system if cwm_system is None else ("" if cwm_system == "none" else cwm_system)
+        if role:
+            batch.extra[CWM_SYSTEM_PROMPT_KEY] = role
         batch.references = [
             MiniMaxH3PreparedReference(media_type="image", image=anchor),
             MiniMaxH3PreparedReference(media_type="video", frames=proxy_preview),
@@ -362,7 +391,9 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
         proxy_pixels = torch.from_numpy(proxy_preview.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
 
     anchor = read_anchor_image(resolve("anchor"), target_frames, args.anchor_short_edge)
-    text_embedding, text_token_tags = encoders.encode_text(str(entry["prompt"]), anchor, proxy_preview)
+    role = entry_cwm_system(entry, args.cwm_system)
+    text_embedding, text_token_tags = encoders.encode_text(
+        str(entry["prompt"]), anchor, proxy_preview, cwm_system=role)
 
     sample: dict[str, Any] = {
         "vae_latent": encoders.encode_pixels(target_pixels),
@@ -374,6 +405,7 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
             "num_frames": int(args.num_frames),
             "pixel_size": (int(args.height), int(args.width)),
             "prompt": str(entry["prompt"]),
+            "cwm_system": role,
         },
     }
     camera_path = resolve("camera")
@@ -383,6 +415,50 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
         sample.update(camera)
         if pixel_size is not None:
             sample["info"]["pixel_size"] = pixel_size
+    return sample
+
+
+def entry_cwm_system(entry: dict[str, Any], default: str) -> str:
+    """Per-row override, then the process-wide flag. Empty means no chat wrap."""
+    raw = entry.get("cwm_system", default)
+    role = str(raw or "none").strip().lower()
+    return "none" if role in {"", "none"} else role
+
+
+def load_proxy_preview(entry: dict[str, Any], args: argparse.Namespace, root: Path) -> np.ndarray:
+    if entry.get("proxy_duv"):
+        _, preview = read_duv_clip(root / str(entry["proxy_duv"]), args.num_frames, args.proxy_height, args.proxy_width)
+        return preview
+    if entry.get("proxy_duv_video"):
+        _, preview = read_duv_video_clip(root / str(entry["proxy_duv_video"]), args.num_frames, args.proxy_height,
+                                         args.proxy_width)
+        return preview
+    return read_video_frames(root / str(entry["proxy"]), args.num_frames, args.proxy_height, args.proxy_width)
+
+
+def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argparse.Namespace, root: Path,
+                           out_path: Path) -> dict[str, Any]:
+    """Refresh Qwen rows on an existing sample. Latents stay as they were."""
+    sample = torch.load(out_path, map_location="cpu", weights_only=False)
+    if not isinstance(sample, dict) or "vae_latent" not in sample:
+        raise ValueError(f"{out_path} is not an H3 proxy cache sample")
+    proxy_preview = load_proxy_preview(entry, args, root)
+    if entry.get("anchor"):
+        # Target pixels are not loaded; the stored anchor size is unused for Qwen's PIL path.
+        dummy = np.zeros((1, args.height, args.width, 3), dtype=np.uint8)
+        anchor = read_anchor_image(root / str(entry["anchor"]), dummy, args.anchor_short_edge)
+    else:
+        target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width)
+        anchor = read_anchor_image(None, target_frames, args.anchor_short_edge)
+    role = entry_cwm_system(entry, args.cwm_system)
+    text_embedding, text_token_tags = encoders.encode_text(
+        str(entry["prompt"]), anchor, proxy_preview, cwm_system=role)
+    sample["text_embedding"] = text_embedding
+    sample["text_token_tags"] = text_token_tags
+    info = dict(sample.get("info") or {})
+    info["prompt"] = str(entry["prompt"])
+    info["cwm_system"] = role
+    sample["info"] = info
     return sample
 
 
@@ -399,18 +475,31 @@ def main() -> None:
     if not entries:
         raise SystemExit(f"Manifest shard {args.shard_index}/{args.num_shards} is empty")
 
-    encoders = Encoders(Path(args.model_path).expanduser().resolve(), device=args.device)
+    encoders = Encoders(
+        Path(args.model_path).expanduser().resolve(),
+        device=args.device,
+        text_only=args.text_only,
+        cwm_system=args.cwm_system,
+    )
 
     written = skipped = failed = 0
     for index, entry in enumerate(entries):
         # Flatten ids like ``kof-video-0809/seg_0001``: the train loader scans one directory level.
         name = str(entry.get("name") or Path(str(entry["target"])).stem).replace("/", "__")
         out_path = output_dir / f"{name}.pt"
-        if out_path.exists() and not args.overwrite:
+        if args.text_only:
+            if not out_path.exists():
+                skipped += 1
+                print(f"[{index + 1}/{len(entries)}] SKIP {name}: no existing .pt for --text-only")
+                continue
+        elif out_path.exists() and not args.overwrite:
             skipped += 1
             continue
         try:
-            sample = encode_entry(entry, encoders, args, root)
+            if args.text_only:
+                sample = encode_entry_text_only(entry, encoders, args, root, out_path)
+            else:
+                sample = encode_entry(entry, encoders, args, root)
         except (KeyError, OSError, RuntimeError, ValueError) as error:
             failed += 1
             print(f"[{index + 1}/{len(entries)}] FAILED {name}: {error}")
@@ -424,8 +513,12 @@ def main() -> None:
         if written % 10 == 0:
             gc.collect()
             torch.cuda.empty_cache()
-        print(f"[{index + 1}/{len(entries)}] {name}: target {tuple(sample['vae_latent'].shape)}, "
-              f"proxy {tuple(sample['proxy_latent'].shape)}")
+        if args.text_only:
+            print(f"[{index + 1}/{len(entries)}] {name}: text {tuple(sample['text_embedding'].shape)} "
+                  f"cwm_system={sample['info'].get('cwm_system')}")
+        else:
+            print(f"[{index + 1}/{len(entries)}] {name}: target {tuple(sample['vae_latent'].shape)}, "
+                  f"proxy {tuple(sample['proxy_latent'].shape)}")
 
     print(f"Done: {written} written, {skipped} skipped, {failed} failed -> {output_dir}")
 

@@ -1,0 +1,57 @@
+AWM_PROXY_CONTROL. Two visual references accompany this text. <Video 1> is the conditioning
+proxy video: treat it as a coarse spatiotemporal reference, not an appearance template or
+literal target geometry. <Picture 1> is the global RGB anchor image: it defines identity and
+appearance, never motion. <Picture 1> is the ABSOLUTE standard for the worldview, art
+direction and overall style of the entire take: every clip of the take, no matter how far into the
+future, must align with it to a high degree, and on worldview, art direction and style it
+outranks even the current clip's caption. It provides NOTHING about any future frame's
+current camera, composition, motion or interactions. Each subject's position and motion come
+from <Video 1>. A subject's appearance follows <Picture 1> when that subject is visible in
+it; subjects not visible in <Picture 1> take their appearance from the timestamped text,
+rendered consistently in <Picture 1>'s worldview and art direction.
+
+Human proxies in <Video 1> provide only framewise root position, coarse occupied scale, and
+whole-body root orientation, which are reliable at roughly 80-100% and should be followed
+closely. They carry no information about character appearance and do not represent identity,
+face, hairstyle, clothing, materials, colors, visual effects, anatomy, bones, joints, limb
+articulation, detailed posture, torso or head pose, hand pose, action phase, or physical
+contact. Reconstruct each character's appearance from <Picture 1> and the timestamped text,
+and reconstruct articulated motion from the timestamped text. Never reproduce a human proxy
+as a skeleton, stick figure, mannequin, node-connected body, or exposed rig. Left and right
+refer to each person's own body unless explicitly stated as screen direction.
+
+Vehicle proxies in <Video 1> provide only framewise position, trajectory, body heading,
+rotation, and accurate overall length, width, height, and occupied scale; these anchors
+should be followed closely. They carry no information about vehicle appearance. Never
+reproduce a vehicle proxy as a wireframe vehicle, cage frame, tubular skeleton, exposed
+chassis, or low-poly proxy car. Vehicle identity, type, design details, materials, colors,
+and visual effects are defined by <Picture 1> and the text.
+
+Roads, terrain, buildings, relative depth, rough scale, and layout in <Video 1> provide
+denser but still approximate structural cues. The text may reinterpret these cues to create
+strongly out-of-distribution scenes while maintaining broad spatial and temporal coherence.
+Conditioning colors, proxy geometry, node markers, rigging structures, and other
+visualization artifacts must never appear in the final video.
+
+When sources conflict, resolve in this order: (1) geometry, camera, position and motion
+follow <Video 1>; (2) the worldview, art direction and overall style follow <Picture 1>
+absolutely — above the current clip's caption; identity, appearance and materials follow
+<Picture 1> for subjects visible in it, and follow the text for subjects not visible in it;
+(3) the timestamped text defines the concrete events, actions and rewrite targets within
+those constraints; (4) when the opening of this clip is fixed to already-given video frames,
+seamless continuity with that fixed opening overrides everything else — never restart the
+scene.
+
+Clip contract: this clip continues a take already in progress. <Picture 1> is the absolute standard for the take's
+worldview, art direction and style, and for the appearance of the subjects visible in it —
+and it provides ONLY that. It is NOT the first frame of this clip and must never be read as
+the current composition, camera, motion or interaction state. The first 34 frames (1.4167
+seconds) of this clip are ALREADY GIVEN: they are fixed, existing video footage — the moments
+that immediately precede the new content — locked in place, not to be invented or altered.
+From that fixed opening, continue the video seamlessly: the same ongoing time, positions,
+poses, action phase and camera simply carry forward — never a scene cut, restart,
+re-introduction, or reset toward the anchor image's opening composition. Current-clip
+motion follows <Video 1>. Keep subjects that are visible in <Picture 1> continuously
+consistent with it in appearance; render everything else — including subjects that first
+appear in this clip — from the timestamped text, in <Picture 1>'s established art
+direction.

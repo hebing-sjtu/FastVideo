@@ -229,6 +229,8 @@ callbacks:
     # upsampling also averages unrelated depth codes into values no backend ever predicted.
     proxy_height: 192
     proxy_width: 336
+    # Must match encode_proxy_samples --cwm-system. ABot clips are independent window-0 takes.
+    cwm_system_prompt: w0
     # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
     # edge and still shows whether the output tracks the proxy. Unset uses the full height.
     panel_height: 384

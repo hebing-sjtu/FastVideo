@@ -33,6 +33,8 @@ env
 **/build/
 **.pyc
 **.txt
+!fastvideo/pipelines/basic/minimax_h3/prompts/system_w0.txt
+!fastvideo/pipelines/basic/minimax_h3/prompts/system_wn.txt
 *.log
 weights/
 logs/

@@ -49,6 +49,7 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         anchor_short_edge: int = 768,
         proxy_height: int = 192,
         proxy_width: int = 336,
+        cwm_system_prompt: str = "w0",
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -76,6 +77,8 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         self.proxy_size = (int(proxy_height), int(proxy_width))
         if min(self.proxy_size) <= 0:
             raise ValueError(f"proxy_height and proxy_width must be positive, got {self.proxy_size}.")
+        # Must match how the training cache's text embedding was wrapped. ABot clips are window 0.
+        self.cwm_system_prompt = str(cwm_system_prompt or "none")
         # The base gates its second video stream on `overlay_actions`. Nothing about that plumbing
         # is overlay-specific -- it saves, gathers across sequence-parallel groups, and logs under
         # its own key -- so the comparison panel rides it rather than duplicating the 170-line
@@ -130,6 +133,11 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
             from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_camera_conditioning import (
                 MINIMAX_H3_CAMERA_TRAJECTORY_KEY, )
             batch.extra[MINIMAX_H3_CAMERA_TRAJECTORY_KEY] = camera
+
+        from fastvideo.pipelines.basic.minimax_h3.cwm_presentation import CWM_SYSTEM_PROMPT_KEY
+
+        if self.cwm_system_prompt and self.cwm_system_prompt != "none":
+            batch.extra[CWM_SYSTEM_PROMPT_KEY] = self.cwm_system_prompt
 
         # Held for `_post_process_validation_frames`, which the base calls later in the same loop
         # iteration and does not pass the record to.
