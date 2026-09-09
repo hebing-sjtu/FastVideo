@@ -86,8 +86,10 @@ def qwen_block_timestamps(num_frames: int) -> list[float]:
 
 
 def _vision_span(pad_token: str, count: int | None) -> str:
-    inner = f"{pad_token} ×{count}" if count is not None else f"{pad_token} ×?"
-    return f"{MINIMAX_H3_VISION_START_TOKEN}⟨{inner}⟩{MINIMAX_H3_VISION_END_TOKEN}"
+    # ASCII only: some terminals render ⟨⟩ / × as underscores and make "?" look like corruption.
+    n = str(count) if count is not None else "?"
+    return (f"{MINIMAX_H3_VISION_START_TOKEN}[{pad_token} x{n}]"
+            f"{MINIMAX_H3_VISION_END_TOKEN}")
 
 
 def user_body(caption: str, *, num_frames: int, image_pads: int | None, video_pads: int | None) -> str:
