@@ -59,7 +59,12 @@ def test_locked_rows_join_the_condition_prefix_without_a_new_timestep():
     fixed = layout.video_indices[layout.num_condition_video_rows:layout.num_condition_video_rows + rows_per_frame]
     denoised = layout.video_indices[layout.num_condition_video_rows + rows_per_frame:]
     amounts = locked[0][locked[1]]
-    assert torch.equal(amounts[fixed], amounts[condition][:rows_per_frame])
+    # The locked rows carry the reference prefix's own amount, which is what keeps them out of the
+    # denoised set without introducing a group of their own. Compared against the amount rather than
+    # against a slice of the prefix, which need not be as long as one target frame.
+    assert fixed.numel() == rows_per_frame
+    assert torch.all(amounts[condition] == 0.999)
+    assert torch.all(amounts[fixed] == 0.999)
     assert torch.all(amounts[denoised] == 0.25)
     # Exactly one latent frame moved out of the denoised set.
     assert denoised.numel() == plain[1][layout.video_indices].numel() - layout.num_condition_video_rows - rows_per_frame
