@@ -96,6 +96,12 @@ models:
     # Anchor first, proxy second: the cached text embedding was tokenized around `<Picture 1>` then
     # `<Video 1>`, so this has to match how the data was encoded.
     enable_anchor: true
+    # Lock target latent frame 0 to the anchor, as the released Ref2VA inference path does and as
+    # the `AWM_PROXY_CONTROL` system prompt already tells the model has happened. The reference
+    # prefix alone fixes appearance but not the starting camera pose, which leaves the proxy
+    # constraining motion relative to a pose the model invents. Must match
+    # `callbacks.validation.lock_first_frame` below.
+    lock_first_frame: true
     # "the audio loss is disabled" -- returning a video-only prediction is what tells the finetune
     # loss to leave the audio head alone rather than train it against placeholder silence.
     supervise_audio: false
@@ -231,6 +237,9 @@ callbacks:
     proxy_width: 336
     # Must match encode_proxy_samples --cwm-system. ABot clips are independent window-0 takes.
     cwm_system_prompt: w0
+    # Must match `models.student.lock_first_frame` above. The anchor is re-encoded onto the target
+    # canvas here rather than reused from its own: the row it lands in is a target row.
+    lock_first_frame: true
     # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
     # edge and still shows whether the output tracks the proxy. Unset uses the full height.
     panel_height: 384

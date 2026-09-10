@@ -50,6 +50,7 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         proxy_height: int = 192,
         proxy_width: int = 336,
         cwm_system_prompt: str = "w0",
+        lock_first_frame: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -79,6 +80,10 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
             raise ValueError(f"proxy_height and proxy_width must be positive, got {self.proxy_size}.")
         # Must match how the training cache's text embedding was wrapped. ABot clips are window 0.
         self.cwm_system_prompt = str(cwm_system_prompt or "none")
+        # Must match the model plugin's `lock_first_frame`. Sampling without the lock that training
+        # supervised under leaves the first latent frame to be invented, which is exactly the
+        # degree of freedom the lock exists to remove.
+        self.lock_first_frame = self._coerce_bool(lock_first_frame)
         # The base gates its second video stream on `overlay_actions`. Nothing about that plumbing
         # is overlay-specific -- it saves, gathers across sequence-parallel groups, and logs under
         # its own key -- so the comparison panel rides it rather than duplicating the 170-line
@@ -138,6 +143,11 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
 
         if self.cwm_system_prompt and self.cwm_system_prompt != "none":
             batch.extra[CWM_SYSTEM_PROMPT_KEY] = self.cwm_system_prompt
+
+        if self.lock_first_frame:
+            from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import (
+                MINIMAX_H3_LOCK_FIRST_FRAME_KEY, )
+            batch.extra[MINIMAX_H3_LOCK_FIRST_FRAME_KEY] = True
 
         # Held for `_post_process_validation_frames`, which the base calls later in the same loop
         # iteration and does not pass the record to.

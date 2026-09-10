@@ -32,6 +32,11 @@ from fastvideo.pipelines.stages.validators import VerificationResult
 
 MINIMAX_H3_KEYFRAMES_KEY = "minimax_h3_keyframes"
 MINIMAX_H3_KEYFRAME_ANCHORS_KEY = "minimax_h3_keyframe_anchors"
+# Set by the caller to ask that the target's first latent frame be locked to the appearance anchor
+# instead of denoised. `MINIMAX_H3_FIXED_FIRST_FRAME_KEY` is this stage's answer: the anchor on the
+# target canvas, ready for the target's own encode path.
+MINIMAX_H3_LOCK_FIRST_FRAME_KEY = "minimax_h3_lock_first_frame"
+MINIMAX_H3_FIXED_FIRST_FRAME_KEY = "minimax_h3_fixed_first_frame"
 
 
 def _has_negative_prompt(value: str | list[str] | None) -> bool:
@@ -204,6 +209,26 @@ class MiniMaxH3InputPreparationStage(PipelineStage):
         self._write_target_geometry(batch, height, width, ratio, num_frames)
         batch.extra[MINIMAX_H3_KEYFRAMES_KEY] = []
         batch.extra[MINIMAX_H3_KEYFRAME_ANCHORS_KEY] = ()
+        if batch.extra.get(MINIMAX_H3_LOCK_FIRST_FRAME_KEY):
+            batch.extra[MINIMAX_H3_FIXED_FIRST_FRAME_KEY] = self._fixed_first_frame(references, height, width)
+
+    @staticmethod
+    def _fixed_first_frame(references: list[Any], height: int, width: int) -> Image.Image:
+        """The appearance anchor on the target canvas, for locking target latent frame 0.
+
+        Loaded from the original source rather than from the already-prepared reference: the anchor
+        sits on its own canvas, which ``anchor_short_edge`` may put well above or below the target,
+        and going through it would resample the same pixels twice. Stretched rather than
+        centre-cropped because a locked frame that shows less of the scene than the anchor did would
+        contradict the layout the proxy is about to describe.
+        """
+        from fastvideo.pipelines.basic.minimax_h3.reference import load_reference_image
+
+        anchor = next((reference for reference in references if reference.media_type == "image"), None)
+        if anchor is None:
+            raise ValueError("Locking the target's first frame needs an image reference to lock it to; the reference "
+                             "list holds no image. Pass an anchor, or drop the lock request.")
+        return prepare_keyframe_image(load_reference_image(anchor.source), height, width, stretch=True)
 
     @torch.no_grad()
     def forward(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> ForwardBatch:
@@ -217,8 +242,10 @@ class MiniMaxH3InputPreparationStage(PipelineStage):
 
 
 __all__ = [
+    "MINIMAX_H3_FIXED_FIRST_FRAME_KEY",
     "MINIMAX_H3_KEYFRAME_ANCHORS_KEY",
     "MINIMAX_H3_KEYFRAMES_KEY",
+    "MINIMAX_H3_LOCK_FIRST_FRAME_KEY",
     "MiniMaxH3InputPreparationStage",
     "prepare_common_request",
     "resolve_target_canvas",

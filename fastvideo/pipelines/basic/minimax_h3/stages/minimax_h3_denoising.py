@@ -22,7 +22,10 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_camera_conditioning 
     MINIMAX_H3_CAMERA_LATENT_KEY,
     MINIMAX_H3_CAMERA_ROWS_KEY,
 )
-from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import MINIMAX_H3_LAYOUT_KEY
+from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
+    MINIMAX_H3_LAYOUT_KEY,
+    MINIMAX_H3_NUM_FIXED_VIDEO_ROWS_KEY,
+)
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
 from fastvideo.pipelines.stages.validators import StageValidators as V
@@ -116,6 +119,10 @@ class MiniMaxH3DenoisingStage(PipelineStage):
         if len(video_timesteps) != len(audio_timesteps):
             raise ValueError("MiniMax-H3 video and audio schedules must have the same number of intervals.")
 
+        # Leading target rows the latent-preparation stage locked to the appearance anchor. They are
+        # a given, so they are held at the reference prefix's amount and excluded from every step
+        # below -- the sampler never moves them, which is what "the first frame is this image" means.
+        num_fixed_video_rows = int(batch.extra.get(MINIMAX_H3_NUM_FIXED_VIDEO_ROWS_KEY, 0))
         row_timestep_plan = []
         for video_timestep, audio_timestep in zip(video_timesteps, audio_timesteps, strict=True):
             video_value = float(video_timestep.item())
@@ -126,6 +133,7 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                 audio_timestep=audio_value,
                 condition_video_timestep=max(video_value, MINIMAX_H3_KEYFRAME_NOISE_AUG),
                 condition_audio_timestep=1.0,
+                num_fixed_video_rows=num_fixed_video_rows,
             )
             row_timestep_plan.append((unique.to(device), inverse.to(device)))
         batch.timesteps = video_timesteps
@@ -207,7 +215,7 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                             **control_kwargs,
                         )
 
-                    video_start = layout.num_condition_video_rows
+                    video_start = layout.num_condition_video_rows + num_fixed_video_rows
                     audio_start = layout.num_condition_audio_rows
                     batch.latents[video_start:] = self.scheduler.step(
                         video_velocity[0, video_start:].float(),

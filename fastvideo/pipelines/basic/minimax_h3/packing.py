@@ -470,15 +470,39 @@ def build_ref2va_packed_sequence(
     )
 
 
+def target_rows_per_latent_frame(layout: MiniMaxH3PackedLayout, patch_size: tuple[int, int, int]) -> int:
+    """How many packed rows one latent frame of the target video occupies."""
+    _, patch_h, patch_w = patch_size
+    if layout.latent_height % patch_h or layout.latent_width % patch_w:
+        raise ValueError(f"Target latent grid {layout.latent_height}x{layout.latent_width} is not divisible by the "
+                         f"spatial patch {(patch_h, patch_w)}.")
+    return (layout.latent_height // patch_h) * (layout.latent_width // patch_w)
+
+
 def build_row_timesteps(
     layout: MiniMaxH3PackedLayout,
     video_timestep: float,
     audio_timestep: float,
     condition_video_timestep: float,
     condition_audio_timestep: float,
+    num_fixed_video_rows: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Group the packed sequence's rows by the noise amount each one is held at.
+
+    ``num_fixed_video_rows`` covers leading rows of the *target* video that are a given rather than
+    something to predict -- the first latent frame locked to the appearance anchor. They are held at
+    ``condition_video_timestep``, the same amount the reference prefix uses, because that is the
+    modulation the backbone already associates with "this row is shown to you, not asked of you".
+    Reusing it also means a locked frame adds no new unique timestep to the group.
+    """
+    if num_fixed_video_rows < 0:
+        raise ValueError(f"num_fixed_video_rows must be non-negative, got {num_fixed_video_rows}.")
+    num_target_video_rows = layout.video_indices.numel() - layout.num_condition_video_rows
+    if num_fixed_video_rows > num_target_video_rows:
+        raise ValueError(f"Cannot fix {num_fixed_video_rows} of {num_target_video_rows} target video rows.")
     row_timesteps = torch.full((layout.sequence_length, ), video_timestep, dtype=torch.float32)
-    row_timesteps[layout.video_indices[:layout.num_condition_video_rows]] = condition_video_timestep
+    fixed_stop = layout.num_condition_video_rows + num_fixed_video_rows
+    row_timesteps[layout.video_indices[:fixed_stop]] = condition_video_timestep
     row_timesteps[layout.audio_indices[layout.num_condition_audio_rows:]] = audio_timestep
     row_timesteps[layout.audio_indices[:layout.num_condition_audio_rows]] = condition_audio_timestep
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)

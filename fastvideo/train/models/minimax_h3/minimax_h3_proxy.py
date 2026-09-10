@@ -12,6 +12,15 @@ their own rotary coordinates, held at a near-clean timestep while the target den
 proxy there needs no architectural change at all. A single RGB anchor frame goes in the slot ahead
 of it to fix appearance, which the proxy by construction cannot supply.
 
+**The anchor also locks the target's first latent frame.** The reference prefix is read once for the
+whole clip and sits at its own rotary coordinates, so it says what the scene looks like but not
+where the camera starts. Writing the anchor into target latent frame 0 and holding it there says
+both, and it is what the released ``AWM_PROXY_CONTROL`` system prompt already promises the model
+("the first frame of the target is locked to this exact image ... camera framing and layout").
+Without it the proxy only ever constrains motion relative to an initial pose the model is free to
+invent. The locked row is a given rather than a target: it is held at the reference prefix's noise
+amount, excluded from the loss here, and excluded from every scheduler step at sampling time.
+
 **The camera rides a ControlNet.** A trajectory is not content; it is a per-token constraint, and it
 has to bind tightly enough that the same proxy under two trajectories yields two different videos. A
 reference in the prefix is read once for the whole clip and cannot do that. So the camera becomes a
@@ -47,6 +56,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     build_row_timesteps,
     pad_video_latents_to_patch,
     patchify_video_latents,
+    target_rows_per_latent_frame,
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
@@ -97,6 +107,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         camera_dropout: float = 0.1,
         # --- reference conditioning ---
         enable_anchor: bool = True,
+        lock_first_frame: bool = True,
         supervise_audio: bool = False,
         lora: Any = None,
     ) -> None:
@@ -110,8 +121,12 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         self._freeze_backbone = bool(freeze_backbone)
         self._camera_dropout = float(camera_dropout)
         self._enable_anchor = bool(enable_anchor)
+        self._lock_first_frame = bool(lock_first_frame)
         self._supervise_audio = bool(supervise_audio)
 
+        if self._lock_first_frame and not self._enable_anchor:
+            raise ValueError("lock_first_frame=true needs enable_anchor=true: the frame it locks is the anchor, and "
+                             "sampling has nothing else to put there.")
         if self._enable_control_depth and not self._enable_camera_controlnet:
             raise ValueError("enable_control_depth=true requires enable_camera_controlnet=true; depth is a second "
                              "modality on the camera trunk, not a branch of its own.")
@@ -381,6 +396,21 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         condition_rows = (MINIMAX_H3_KEYFRAME_NOISE_AUG * condition_rows +
                           (1.0 - MINIMAX_H3_KEYFRAME_NOISE_AUG) * condition_noise)
 
+        noisy_video = (1.0 - video_sigmas) * video_latents + video_sigmas * video_noise
+        if self._lock_first_frame:
+            # Target latent frame 0 is a given, not a target. Sampling hands the model the anchor
+            # there and never denoises it, so training has to present that row the same way: held at
+            # the reference prefix's own near-clean amount, and carrying no gradient.
+            #
+            # Two independent tensors do the two halves. `noisy_video` is what the model sees, so it
+            # gets the augmented anchor. `video_noise` is only ever read as the flow target
+            # `noise - clean`, so substituting the clean latent there makes frame 0's target exactly
+            # zero, which `predict_noise` matches by zeroing its prediction. The row still occupies
+            # 1/37 of the loss mean as zeros, a constant factor that changes nothing across steps.
+            aug = MINIMAX_H3_KEYFRAME_NOISE_AUG
+            noisy_video[:, :, :1] = aug * video_latents[:, :, :1] + (1.0 - aug) * video_noise[:, :, :1]
+            video_noise[:, :, :1] = video_latents[:, :, :1]
+
         control = self._camera_rows(
             raw_batch,
             latent_shape=(num_latent_frames, latent_height, latent_width),
@@ -397,7 +427,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         training_batch.encoder_attention_mask = torch.ones(text_embedding.shape[:2], device=device, dtype=dtype)
         training_batch.infos = raw_batch.get("info_list")
         training_batch.raw_latent_shape = tuple(video_latents.shape)
-        training_batch.noisy_model_input = (1.0 - video_sigmas) * video_latents + video_sigmas * video_noise
+        training_batch.noisy_model_input = noisy_video
         training_batch.audio_noisy_model_input = (1.0 - audio_sigmas) * audio_latents + audio_sigmas * audio_noise
         training_batch.noise = video_noise
         training_batch.audio_noise = audio_noise
@@ -455,6 +485,8 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         num_audio_latents = audio_latents.shape[-1]
         audio_rows = audio_latents.permute(0, 1, 3, 2).reshape(-1, _AUDIO_LATENT_CHANNELS)
 
+        num_fixed_video_rows = (target_rows_per_latent_frame(layout, self.transformer.patch_size)
+                                if self._lock_first_frame else 0)
         video_timestep = float(batch.timesteps[0])
         unique_timesteps, timestep_indices = build_row_timesteps(
             layout,
@@ -462,6 +494,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             audio_timestep=float(batch.audio_timesteps[0]),
             condition_video_timestep=max(video_timestep, MINIMAX_H3_KEYFRAME_NOISE_AUG),
             condition_audio_timestep=1.0,
+            num_fixed_video_rows=num_fixed_video_rows,
         )
         unique_timesteps = unique_timesteps.to(device)
         timestep_indices = timestep_indices.to(device)
@@ -501,6 +534,14 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             _VIDEO_LATENT_CHANNELS,
             self.transformer.patch_size,
         ).permute(0, 2, 1, 3, 4)
+        if num_fixed_video_rows:
+            # The locked frame's flow target was blanked in `prepare_batch`; blanking the prediction
+            # here is the other half, and keeps the row from pulling the adapters towards predicting
+            # zero velocity on frames that are genuinely being denoised.
+            video_prediction = torch.cat(
+                (torch.zeros_like(video_prediction[:, :1]), video_prediction[:, 1:]),
+                dim=1,
+            )
         if not self._supervise_audio:
             # A bare tensor selects the video-only branch of the finetune loss, which leaves the
             # audio head untouched rather than training it against placeholder silence.

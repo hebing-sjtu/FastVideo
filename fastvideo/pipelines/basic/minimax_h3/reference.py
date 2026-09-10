@@ -215,6 +215,22 @@ def reference_media_to_uint8(media: Any) -> np.ndarray:
     return media
 
 
+def load_reference_image(source: Any) -> Image.Image:
+    """Decode an image reference source to an upright RGB image at its native size.
+
+    Split out of :func:`prepare_reference` because the fixed first frame has to land on the *target*
+    canvas rather than the anchor's own, and resizing the already-resized anchor would resample the
+    same pixels twice.
+    """
+    image = load_image(str(source)) if isinstance(source, str | os.PathLike) else source
+    if not isinstance(image, Image.Image):
+        pixels = reference_media_to_uint8(image)
+        if pixels.ndim != 3 or pixels.shape[-1] != 3:
+            raise ValueError(f"An image reference must be RGB, got {tuple(pixels.shape)}.")
+        image = Image.fromarray(pixels)
+    return ImageOps.exif_transpose(image).convert("RGB")
+
+
 def prepare_reference_image(image: Image.Image, height: int, width: int) -> Image.Image:
     """Resize an RGB reference image to its resolved condition canvas."""
     return image if image.size == (width, height) else image.resize((width, height), Image.Resampling.LANCZOS)
@@ -344,14 +360,7 @@ def prepare_reference(
     """Decode and normalize one deferred Ref2VA medium."""
     prepared = MiniMaxH3PreparedReference(media_type=reference.media_type)
     if reference.media_type == "image":
-        source = reference.source
-        image = load_image(str(source)) if isinstance(source, str | os.PathLike) else source
-        if not isinstance(image, Image.Image):
-            pixels = reference_media_to_uint8(image)
-            if pixels.ndim != 3 or pixels.shape[-1] != 3:
-                raise ValueError(f"An image reference must be RGB, got {tuple(pixels.shape)}.")
-            image = Image.fromarray(pixels)
-        image = ImageOps.exif_transpose(image).convert("RGB")
+        image = load_reference_image(reference.source)
         height, width = resolve_reference_image_size(*image.size, short_edge=reference.short_edge)
         prepared.image = prepare_reference_image(image, height, width)
         return prepared
@@ -410,6 +419,7 @@ __all__ = [
     "MiniMaxH3Reference",
     "decode_reference_audio",
     "decode_reference_video",
+    "load_reference_image",
     "prepare_reference",
     "prepare_reference_frames",
     "prepare_reference_image",
