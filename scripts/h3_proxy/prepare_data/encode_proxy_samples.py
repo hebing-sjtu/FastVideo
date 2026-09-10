@@ -87,9 +87,12 @@ def parse_args() -> argparse.Namespace:
     # costs ~1/16 the tokens of a full-resolution one. 336x192 is the released CWM geometry.
     parser.add_argument("--proxy-height", type=int, default=192)
     parser.add_argument("--proxy-width", type=int, default=336)
-    # CWM anchors at 2048 short edge. That buys detail the target canvas cannot show and costs ~7x
-    # the anchor tokens, so the default here matches the target canvas instead.
-    parser.add_argument("--anchor-short-edge", type=int, default=768)
+    # The released short edge, which CWM also uses. It costs ~7x the anchor tokens of a 768 canvas
+    # -- both as Qwen vision tokens and as Ref2VA reference rows -- and buys detail the target
+    # canvas cannot show. That trade only looks bad if the anchor is treated as a picture of the
+    # first frame; it is the appearance dictionary for the whole take, and the run that cut it to
+    # 768 could not make the proxy steer the camera.
+    parser.add_argument("--anchor-short-edge", type=int, default=2048)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--shard-index", type=int, default=0, help="This worker's index, for splitting a manifest.")
     parser.add_argument("--num-shards", type=int, default=1)

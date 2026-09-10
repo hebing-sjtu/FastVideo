@@ -14,6 +14,17 @@ own rotary coordinates, held at a near-clean timestep while the target denoises.
 there needs no architectural change at all. A single RGB anchor frame goes in the slot ahead of it to
 fix appearance, which a depth/semantic proxy by construction cannot supply.
 
+**The anchor also locks the target's first latent frame** (`lock_first_frame`, on by default). The
+prefix is read once for the whole clip and sits at its own rotary coordinates, so it says what the
+scene looks like but not where the camera starts — which leaves the proxy constraining motion
+relative to an initial pose the model invents. Writing the anchor into target latent frame 0 and
+holding it there says both, and it is what the released `AWM_PROXY_CONTROL` system prompt already
+tells the model has happened: *"the first frame of the target is locked to this exact image …
+camera framing and layout"*. The locked row is a given rather than a target: held at the reference
+prefix's noise amount, left out of the loss, and left out of every scheduler step at sampling time.
+Sampling re-encodes the anchor onto the *target* canvas for this, since the row it lands in is a
+target row — the same thing the released inference cache does with its `input_video.safetensors`.
+
 **The camera is a per-token constraint**, not content. Token `(t, h, w)` must show whatever the world
 puts along one specific ray, and the binding has to be tight enough that the same proxy under two
 trajectories yields two different videos. A reference sitting in the prefix is read once for the
@@ -67,7 +78,7 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
     --root /data/binghe/datasets/ABot-sub-2000-clips \
     --output /data/binghe/h3_proxy/cache/abot_train \
     --model-path /data/models/MiniMax-H3 \
-    --anchor-short-edge 768 --proxy-height 192 --proxy-width 336
+    --anchor-short-edge 2048 --proxy-height 192 --proxy-width 336
 ```
 
 Shard `i` takes `entries[i::n]` and the encoder skips a clip whose `.pt` is already there, so
@@ -168,7 +179,7 @@ Two configs, in this order:
 
 | Config | What trains | Needs camera poses |
 | --- | --- | --- |
-| `proxy_bd_finetune.yaml` | rank-128 LoRA on all 50 blocks (~665M params) | no |
+| `proxy_bd_finetune.yaml` | rank-128 LoRA on all 50 blocks' attention (~321M params) | no |
 | `proxy_bd_finetune_abot.yaml` | the same stage, wired to a `clip_*/` dataset | no |
 | `proxy_camera_finetune.yaml` | only `camera_controlnet.*`, backbone frozen | yes |
 
@@ -224,8 +235,13 @@ parallel group through the same Ulysses all-to-all the backbone uses.
 
 ### LoRA
 
-Stage 1 adapts the backbone with LoRA rather than a full finetune, following CWM. Two things about
-how it interacts with this plugin:
+Stage 1 adapts the backbone with LoRA rather than a full finetune, following CWM. The module set is
+the 4 attention projections across all 50 blocks, which is 200 adapted modules — the count
+`cwm_h3_inference/constants.py` pins as `EXPECTED_LORA_MODULES` and `strict_merge_lora` refuses to
+deviate from. That lands at ~321M trainable at rank 128. Adding the SwiGLU (`fc_in`/`fc_out`) would
+make it 300 modules and a differently-shaped adapter than the released one.
+
+Two things about how LoRA interacts with this plugin:
 
 `freeze_backbone: true` and `lora.enable: true` are rejected together. LoRA is the mechanism by
 which the backbone trains here, so freezing it leaves nothing to optimize — the combination almost
@@ -271,10 +287,11 @@ run whose W&B is offline still keeps them.
 
 Three settings exist to keep validation comparable to training rather than to the released defaults:
 
-- **`anchor_short_edge`** must equal the encoder's `--anchor-short-edge`. An anchor's canvas decides
-  how many vision tokens it occupies, and the pipeline otherwise applies the released 2048 short
-  edge — roughly 7x the anchor tokens a 768 run trains against, which would make the checkpoint look
-  worse for a reason that has nothing to do with the checkpoint.
+- **`anchor_short_edge`** must equal the encoder's `--anchor-short-edge`. Both default to the
+  released 2048, so the two agree unless you move one. An anchor's canvas decides how many vision
+  tokens it occupies *and* how many Ref2VA reference rows it fills, so cutting it to 768 is a ~7x
+  reduction on both streams; a mismatch between encoder and validation presents the model a token
+  grid it never trained on and makes the checkpoint look worse for no reason of its own.
 - **`proxy_height` / `proxy_width`** must equal the encoder's `--proxy-height` / `--proxy-width`,
   for the same reason and then some. A video reference otherwise resolves its canvas from its aspect
   ratio, which puts a 336x192 proxy on the full 1344x768 canvas: 37296 reference rows where training

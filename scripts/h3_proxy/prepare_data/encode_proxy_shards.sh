@@ -19,7 +19,7 @@
 #       --root /data/binghe/datasets/ABot-sub-2000-clips \
 #       --output /data/binghe/h3_proxy/cache/abot_train \
 #       --model-path /data/models/MiniMax-H3 \
-#       --anchor-short-edge 768 --proxy-height 192 --proxy-width 336
+#       --anchor-short-edge 2048 --proxy-height 192 --proxy-width 336
 #
 # Environment:
 #   NUM_SHARDS   processes to start. Defaults to every visible GPU.

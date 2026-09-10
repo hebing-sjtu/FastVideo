@@ -25,7 +25,7 @@
 #       --manifest /data/binghe/h3_proxy/abot_train.jsonl \
 #       --root /data/binghe/datasets/ABot-sub-2000-clips \
 #       --output /data/binghe/h3_proxy/cache/abot_train --model-path /data/models/MiniMax-H3 \
-#       --num-frames 124 --height 768 --width 1344 --anchor-short-edge 768
+#       --num-frames 124 --height 768 --width 1344 --anchor-short-edge 2048
 #
 # Every path here is on the persistent `/data` disk rather than under `/workspace`, which does not
 # outlive the node: the cache is hours of H200 time, the checkpoints are the run itself, and the
@@ -39,24 +39,33 @@
 # 1.0, BF16, gradient checkpointing, global batch size 8, 100-step warmup then cosine decay from
 # 2e-5 to 1e-6.
 #
-# Two deliberate departures, both because this repo's H3 differs from CWM's:
-#   * Trainable parameter count lands at ~665M, not CWM's ~596M. Rank 128 on q/k/v/out (5376<->7168)
-#     plus the SwiGLU (5376<->28672 and 14336->5376) across 50 blocks is 665M here. The paper's
-#     figure does not reproduce under any clean subset of this module decomposition -- attention
-#     alone is 321M, attention plus the output projection 447M -- so this targets every projection
-#     in the block, which is the closest structural reading of "throughout all 50 transformer
-#     blocks". AdaLN is left out (it would add 224M); adapting the timestep modulation is not
-#     standard practice and the paper's number is below the figure that would include it.
-#   * FlashAttention-3 is not requested. The H3 plugin requires TORCH_SDPA, which is dense and
-#     numerically equivalent, just slower.
+# One deliberate departure: FlashAttention-3 is not requested. The H3 plugin requires TORCH_SDPA,
+# which is dense and numerically equivalent, just slower.
+#
+# The LoRA module set is not a departure any more. It used to include the SwiGLU on a reading of the
+# paper's ~596M parameter figure, but the release settles it: `EXPECTED_LORA_MODULES = 200` with
+# `strict_merge_lora` refusing anything else, and 200 is exactly 4 attention projections across 50
+# blocks. Attention-only lands at ~321M trainable.
 #
 # Step count is for CWM's corpus. Three epochs at global batch 8 over the 950-clip KOF train split
 # is 357 steps, not 3534 -- leaving 3534 here would be ~30 epochs on that data. Set
 # `max_train_steps` to `3 * ceil(num_clips / 8)` for the dataset actually in `data_path`, and note
 # that a 100-step warmup is then a quarter of the run; scale it down too.
 #
-# Sequence length at the settings below: 37296 target rows (37 latent frames x 24 x 42 after the
-# 2x2 patch) + 2442 proxy + 1008 anchor + 414 audio + text, so ~41.5k tokens.
+# Sequence length at the settings below, packed as [text | references | audio | video]:
+#
+#   37296  target video   37 latent frames x 24 x 42 after the 2x2 patch
+#    2442  proxy rows     336x192 -> 21x12 latents, padded to 22x12
+#    7168  anchor rows    2048 short edge -> 3584x2048 -> 224x128 latents
+#     414  audio rows
+#   ~8300  text           ~7168 anchor vision tokens + ~360 proxy blocks + system + caption
+#   ------
+#    ~56k
+#
+# The anchor is most of the growth over a 768-edge run (~43k), on both streams at once: it is 7x the
+# vision tokens *and* 7x the reference rows. Attention then costs ~1.7x. If that does not fit,
+# `--anchor-short-edge 1024` is the knob, and it has to move in the encoder and in
+# `callbacks.validation.anchor_short_edge` together.
 #
 # Smoke first anyway. Resolution is fixed when the cache is written, not here -- this plugin reads
 # the shape off the cached latent -- so smoke by encoding a handful of clips small and pointing
@@ -81,7 +90,11 @@ models:
       # Substring-matched against the full parameter path. The two text-refiner blocks, the timestep
       # MLP (also fc_in/fc_out after param_names_mapping) and the control trunk share these leaf
       # names and are held out by the arch config's exclude_lora_layers.
-      target_modules: [to_q, to_k, to_v, to_out, fc_in, fc_out]
+      #
+      # Attention only, which is 4 modules x 50 blocks = 200 -- the count CWM's loader hard-asserts
+      # (`EXPECTED_LORA_MODULES = 200` in constants.py, enforced by `strict_merge_lora`). Adding the
+      # SwiGLU would make it 300 and produce a differently-shaped adapter than the released one.
+      target_modules: [to_q, to_k, to_v, to_out]
 
     # No trajectory in the KOF data, so there is nothing for the control trunk to read. With the
     # branch off the DiT is the released model unchanged.
@@ -226,9 +239,8 @@ callbacks:
     # Required: this callback conditions through an ordered reference list, and image_path would
     # present the proxy a second time. The callback rejects true rather than silently doubling it.
     use_validation_media_conditioning: false
-    # Must equal the --anchor-short-edge used by encode_proxy_samples.py. The released default is
-    # 2048, which is ~7x the anchor vision tokens this run trains on.
-    anchor_short_edge: 768
+    # Must equal the --anchor-short-edge used by encode_proxy_samples.py, whose default is this.
+    anchor_short_edge: 2048
     # Must equal the encoder's --proxy-height/--proxy-width. Left unset, a video reference resolves
     # its canvas from its aspect ratio, which puts this 336x192 proxy on the full 1344x768 canvas:
     # 37296 reference rows where training used 2442, from LANCZOS-upsampled frames. On a DUV that

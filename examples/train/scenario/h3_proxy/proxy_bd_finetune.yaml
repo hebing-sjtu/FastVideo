@@ -5,16 +5,14 @@
 # 1.0, BF16, gradient checkpointing, global batch size 8, 100-step warmup then cosine decay from
 # 2e-5 to 1e-6.
 #
-# Two deliberate departures, both because this repo's H3 differs from CWM's:
-#   * Trainable parameter count lands at ~665M, not CWM's ~596M. Rank 128 on q/k/v/out (5376<->7168)
-#     plus the SwiGLU (5376<->28672 and 14336->5376) across 50 blocks is 665M here. The paper's
-#     figure does not reproduce under any clean subset of this module decomposition -- attention
-#     alone is 321M, attention plus the output projection 447M -- so this targets every projection
-#     in the block, which is the closest structural reading of "throughout all 50 transformer
-#     blocks". AdaLN is left out (it would add 224M); adapting the timestep modulation is not
-#     standard practice and the paper's number is below the figure that would include it.
-#   * FlashAttention-3 is not requested. The H3 plugin requires TORCH_SDPA, which is dense and
-#     numerically equivalent, just slower.
+# One deliberate departure: FlashAttention-3 is not requested. The H3 plugin requires TORCH_SDPA,
+# which is dense and numerically equivalent, just slower.
+#
+# The LoRA module set used to include the SwiGLU, reasoning backwards from the paper's ~596M
+# trainable-parameter figure, which no clean subset of this repo's module decomposition reproduces.
+# The release settles it without the arithmetic: `EXPECTED_LORA_MODULES = 200` in
+# `cwm_h3_inference/constants.py`, and `strict_merge_lora` refuses any other count. 200 is exactly
+# the 4 attention projections across 50 blocks, which lands at ~321M here.
 #
 # Step count is for CWM's corpus. Three epochs at global batch 8 over the 950-clip KOF train split
 # is 357 steps, not 3534 -- leaving 3534 here would be ~30 epochs on that data. Set
@@ -47,7 +45,9 @@ models:
       # Substring-matched against the full parameter path. The two text-refiner blocks, the timestep
       # MLP (also fc_in/fc_out after param_names_mapping) and the control trunk share these leaf
       # names and are held out by the arch config's exclude_lora_layers.
-      target_modules: [to_q, to_k, to_v, to_out, fc_in, fc_out]
+      #
+      # Attention only: 4 modules x 50 blocks = 200, the count CWM's loader hard-asserts.
+      target_modules: [to_q, to_k, to_v, to_out]
 
     # No trajectory in the KOF data, so there is nothing for the control trunk to read. With the
     # branch off the DiT is the released model unchanged.
@@ -165,9 +165,8 @@ callbacks:
     # Required: this callback conditions through an ordered reference list, and image_path would
     # present the proxy a second time. The callback rejects true rather than silently doubling it.
     use_validation_media_conditioning: false
-    # Must equal the --anchor-short-edge used by encode_proxy_samples.py. The released default is
-    # 2048, which is ~7x the anchor vision tokens this run trains on.
-    anchor_short_edge: 768
+    # Must equal the --anchor-short-edge used by encode_proxy_samples.py, whose default is this.
+    anchor_short_edge: 2048
     # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
     # edge and still shows whether the output tracks the proxy. Unset uses the full height.
     panel_height: 384

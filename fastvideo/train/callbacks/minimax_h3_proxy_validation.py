@@ -46,7 +46,7 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         panel_separator_px: int = 4,
         panel_height: int | None = None,
         include_target_panel: bool = True,
-        anchor_short_edge: int = 768,
+        anchor_short_edge: int = 2048,
         proxy_height: int = 192,
         proxy_width: int = 336,
         cwm_system_prompt: str = "w0",
@@ -63,10 +63,10 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         if self.panel_height is not None and self.panel_height <= 0:
             raise ValueError(f"panel_height must be positive, got {panel_height}.")
         self.include_target_panel = self._coerce_bool(include_target_panel)
-        # Must equal the encoder's --anchor-short-edge. The anchor's canvas decides how many vision
-        # tokens it occupies, and the pipeline otherwise applies the released 2048 default, which is
-        # ~7x the tokens a 768 run trained against: validation would then look worse than the
-        # checkpoint is, for a reason that has nothing to do with the checkpoint.
+        # Must equal the encoder's --anchor-short-edge, which defaults to the same released 2048.
+        # The anchor's canvas decides how many vision tokens it occupies, so a mismatch presents the
+        # model a token grid it never trained on and validation looks worse than the checkpoint is,
+        # for a reason that has nothing to do with the checkpoint.
         self.anchor_short_edge = int(anchor_short_edge)
         if self.anchor_short_edge <= 0:
             raise ValueError(f"anchor_short_edge must be positive, got {anchor_short_edge}.")
