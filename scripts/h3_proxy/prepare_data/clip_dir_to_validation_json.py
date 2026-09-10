@@ -36,7 +36,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from clip_dir_to_encode_manifest import (  # noqa: E402
-    CLIP_PATTERN, check_report, episode_of, evenly_spaced, read_prompt,
+    CLIP_PATTERN, check_report, episode_of, evenly_spaced, read_prompt, report_window_scope,
 )
 from seg_dir_to_encode_manifest import largest_valid_num_frames, probe_usable_frames  # noqa: E402
 
@@ -59,8 +59,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-width", type=int, default=1344)
     p.add_argument("--proxy-height", type=int, default=192)
     p.add_argument("--proxy-width", type=int, default=336)
-    p.add_argument("--prompt-fallback", default="", help="Prompt for clips with no prompt.txt and no caption.json.")
-    p.add_argument("--no-episode-caption", action="store_true", help="Ignore annotations/caption.json.")
+    p.add_argument("--prompt-fallback", default="", help="Prompt for clips with no prompt.txt.")
+    p.add_argument("--allow-episode-caption",
+                   action="store_true",
+                   help="Fall back to annotations/caption.json when a clip has no prompt.txt. Off by default: it "
+                   "describes the whole 60-second episode, so validating against it scores the model on events the "
+                   "clip never contains.")
+    p.add_argument("--no-episode-caption",
+                   action="store_true",
+                   help="Accepted and redundant; this is the default now. Use --allow-episode-caption to opt back in.")
     return p.parse_args()
 
 
@@ -101,7 +108,7 @@ def main() -> None:
         if check_report(report, args) is not None:
             rejected.append(clip.name)
             continue
-        prompt, _ = read_prompt(clip, use_episode_caption=not args.no_episode_caption)
+        prompt, _ = read_prompt(clip, use_episode_caption=args.allow_episode_caption)
         prompt = prompt or args.prompt_fallback.strip()
         if not prompt:
             rejected.append(clip.name)
@@ -139,6 +146,8 @@ def main() -> None:
     print(f"  split '{args.split}' covers {len(keep_episodes)} episode(s); {available} usable clips over "
           f"{len(available_episodes)} of them; kept {len(records)}")
     print(f"  episodes: {', '.join(sorted({episode_of(record['id']) for record in records}))}")
+    # `caption` is this file's prompt key; report_window_scope reads `prompt`.
+    report_window_scope([{"prompt": record["caption"]} for record in records])
     if rejected:
         print(f"  {len(rejected)} rejected: {', '.join(rejected[:10])}{' ...' if len(rejected) > 10 else ''}")
     print(f"  set callbacks.validation.proxy_height/proxy_width to {args.proxy_height}/{args.proxy_width}, matching "

@@ -59,6 +59,11 @@ from seg_dir_to_encode_manifest import (  # noqa: E402
 
 CLIP_PATTERN = re.compile(r"^clip_(\d+)_(\d+)$")
 
+# The window stamp CWM puts in front of a user caption, e.g. "[0.00s-5.17s] ". `render.py`'s
+# UPSTREAM_MARKER in the datapipe writes exactly this, and its presence is the one cheap signal that
+# a prompt was scoped to a window rather than lifted from a 60-second episode summary.
+WINDOW_MARKER_PATTERN = re.compile(r"^\[\d+\.\d{2}s-\d+\.\d{2}s\] ")
+
 # The (green, blue) pairs the delivery DUV uses for its 11-class taxonomy. Five classes share
 # (0, 0) and sky shares (255, 255) with road, so this is what the encoding can express, not what
 # the segmenter predicted; see the dataset's DATA_CLIPS.md.
@@ -86,11 +91,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--proxy-width", type=int, default=336)
     p.add_argument("--prompt-fallback",
                    default="",
-                   help="Prompt for clips with neither prompt.txt nor a usable caption.json. Empty means skip them.")
+                   help="Prompt for clips with no prompt.txt. Empty means skip them.")
+    p.add_argument("--allow-episode-caption",
+                   action="store_true",
+                   help="Fall back to annotations/caption.json when a clip has no prompt.txt. Off by default: that "
+                   "file describes the whole 60-second episode rather than this 5-second window, so it names things "
+                   "the clip never shows and teaches the model to cover a minute of story in five seconds.")
     p.add_argument("--no-episode-caption",
                    action="store_true",
-                   help="Ignore annotations/caption.json. It describes the whole 60-second episode rather than this "
-                   "5-second window, so a run that wants per-clip text only should not silently inherit it.")
+                   help="Accepted and redundant; this is the default now. Use --allow-episode-caption to opt back in.")
     p.add_argument("--preflight-limit",
                    type=int,
                    default=8,
@@ -146,6 +155,28 @@ def read_prompt(clip: Path, *, use_episode_caption: bool) -> tuple[str, str]:
         if text:
             return text, "caption.json"
     return "", "none"
+
+
+def report_window_scope(rows: list[dict]) -> None:
+    """Say how many prompts are scoped to one window, and complain if any are not.
+
+    A caption without the window stamp is not proof of contamination, but on this dataset it means
+    the text did not come from ``captions-export`` -- and the only other source is the episode
+    summary. Worth a loud line either way: text scope is invisible in every downstream shape check.
+    """
+    prompts = [str(row.get("prompt", "")) for row in rows]
+    windowed = [prompt for prompt in prompts if WINDOW_MARKER_PATTERN.match(prompt)]
+    print(f"  window-scoped prompts: {len(windowed)}/{len(prompts)}")
+    if len(windowed) == len(prompts):
+        return
+    offenders = [prompt for prompt in prompts if not WINDOW_MARKER_PATTERN.match(prompt)]
+    longest = max(offenders, key=len)
+    head = longest if len(longest) <= 140 else longest[:137] + "..."
+    print(f"    WARNING: {len(offenders)} prompt(s) carry no '[0.00s-5.17s] ' stamp, so nothing says they describe "
+          "only this window. Longest:")
+    print(f"      {head}")
+    print("    Run the datapipe's `captions-export --write-txt` to write per-clip prompt.txt, then rebuild "
+          "this manifest.")
 
 
 def extract_caption(payload: object) -> str:
@@ -304,12 +335,13 @@ def main() -> None:
             rejected.append(f"{clip.name}: {reason}")
             continue
 
-        prompt, source = read_prompt(clip, use_episode_caption=not args.no_episode_caption)
+        prompt, source = read_prompt(clip, use_episode_caption=args.allow_episode_caption)
         if not prompt:
             prompt = args.prompt_fallback.strip()
             source = "fallback" if prompt else "none"
         if not prompt:
-            rejected.append(f"{clip.name}: no prompt (no prompt.txt, no usable caption.json, no --prompt-fallback)")
+            rejected.append(f"{clip.name}: no prompt (no prompt.txt, no --allow-episode-caption, "
+                            "no --prompt-fallback)")
             continue
         prompt_sources[source] = prompt_sources.get(source, 0) + 1
 
@@ -375,6 +407,7 @@ def main() -> None:
             print(f"    ... and {len(rejected) - 10} more")
 
     print(f"  prompt sources: {', '.join(f'{key}={value}' for key, value in sorted(prompt_sources.items()))}")
+    report_window_scope(rows)
     if prompt_sources.get("caption.json"):
         print("    NOTE: caption.json is episode-level. It describes the whole 60-second episode, not the 5.17 "
               "seconds this clip covers, so it will name things the clip never shows.")

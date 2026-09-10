@@ -157,6 +157,15 @@ that catches a DUV arriving in the wrong channel order or through a lossy re-enc
 invisible downstream. The cache would be written, training would converge, and the proxy would be
 describing noise.
 
+**Prompts have to be scoped to the window.** Text comes from `<clip>/prompt.txt`, which should hold
+a CWM window sentence — `[0.00s-5.17s] ` followed by prose about those 5.17 seconds and nothing
+else. The datapipe's `captions-export --write-txt` writes them. A clip without one is now rejected;
+`annotations/caption.json` is episode-level and only used if you pass `--allow-episode-caption`,
+which describes the whole 60 seconds, names things the clip never shows, and teaches the model to
+cover a minute of story in five seconds. Both this script and the validation-JSON builder print a
+`window-scoped prompts: N/N` line and warn with an example when the count falls short — check it
+before spending an encode, because text scope is invisible in every downstream shape check.
+
 Trajectories are `.npz` files with `extrinsics` `[F, 4, 4]` world-to-camera, `intrinsics` `[F, 3, 3]`
 in pixel units, and optionally `pixel_size` naming the resolution the intrinsics were measured at.
 They are normalised at build time — rebased onto frame 0, recentred, rescaled — so the model never

@@ -15,7 +15,8 @@
 #   * There are no camera trajectories to use. The dataset ships COLMAP poses, but they are sparse
 #     (fewer than 124) and non-metric, so they cannot be mixed with the metric depth in the DUV.
 #     `proxy_camera_finetune.yaml` stays out of reach until that scale factor is solved.
-#   * There is no per-clip text. See the prompt note on `data_path` below.
+#   * Per-clip text comes from `<clip>/prompt.txt`, written by the datapipe's `captions-export`.
+#     Episode-level `annotations/caption.json` is no longer a fallback. See the note on `data_path`.
 #
 # Build the manifests and cache, holding out whole episodes:
 #   python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \
@@ -145,13 +146,15 @@ training:
     # text embeddings per clip across ~9.9k clips this is a ~150 GB artifact costing hours of H200
     # time, so it is worth keeping across nodes rather than re-deriving.
     #
-    # Prompts: this dataset ships no per-clip text. `annotations/caption.json` is episode-level, so
-    # it describes the whole 60 seconds rather than the 5.17 the clip covers, and the manifest
-    # builder inherits it only because having some text beats having none. It is a weaker signal
-    # than it looks like, but also less load-bearing than in a text-to-video run: the Qwen3-VL
-    # embedding is built over the anchor and the proxy as well as the words, so the caption is one
-    # of three conditioning sources rather than the only one. Writing per-clip `prompt.txt` files
-    # upgrades this without touching anything here -- the builder prefers them when present.
+    # Prompts must be per-clip. Each clip needs a `prompt.txt` holding a CWM window sentence --
+    # `[0.00s-5.17s] ` followed by prose about those 5.17 seconds and nothing else. The datapipe's
+    # `captions-export --write-txt` writes them; the manifest builder prefers them and now *rejects*
+    # a clip that has none rather than falling back.
+    #
+    # The fallback used to be `annotations/caption.json`, which is episode-level: it describes the
+    # whole 60 seconds, names things the clip never shows, and teaches the model to cover a minute
+    # of story in five seconds. `--allow-episode-caption` opts back in; do not, and check the
+    # builder's "window-scoped prompts: N/N" line before spending an encode.
     data_path: /data/binghe/h3_proxy/cache/abot_train
     # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
     preprocessed_data_type: t2va
