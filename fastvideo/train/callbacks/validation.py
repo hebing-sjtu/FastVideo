@@ -855,6 +855,22 @@ class ValidationCallback(Callback):
     ) -> list[Any]:
         return [values[i] for i in indices if i < len(values)]
 
+    @staticmethod
+    def _wait_for_validation_file(path: str, *, attempts: int = 8, delay_sec: float = 1.0) -> bool:
+        """True if ``path`` exists, waiting briefly for a shared filesystem to catch up.
+
+        Sequence-parallel group leaders write on their own rank; rank 0 only
+        receives the path string. On gcsfuse the object can take a second to
+        appear. A per-node ``/workspace`` path written on another machine never
+        will — callers skip that upload rather than abort the job.
+        """
+        for attempt in range(attempts):
+            if os.path.isfile(path):
+                return True
+            if attempt + 1 < attempts:
+                time.sleep(delay_sec)
+        return False
+
     def _log_validation_video_artifacts(
         self,
         video_filenames: list[str],
@@ -877,6 +893,14 @@ class ValidationCallback(Callback):
                 captions,
                 strict=True,
         ):
+            if not self._wait_for_validation_file(fname):
+                logger.warning(
+                    "Validation video %s is not visible on rank 0. On a multi-node job "
+                    "checkpoint.output_dir must be a shared filesystem (e.g. /data), not "
+                    "per-node /workspace; skipping the tracker upload.",
+                    fname,
+                )
+                continue
             try:
                 art = self.tracker.video(
                     fname,
