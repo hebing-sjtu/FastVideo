@@ -88,6 +88,32 @@ def test_wandb_video_uses_shared_default_fps(
     assert video_calls == [{"fps": 16, "format": "mp4"}]
 
 
+def test_wandb_video_stages_a_path_onto_local_disk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wandb = ModuleType("wandb")
+    seen: list[str] = []
+    wandb.init = lambda **_: object()
+
+    def video(data: Any, **kwargs: Any) -> dict[str, Any]:
+        seen.append(str(data))
+        return {"data": data, **kwargs}
+
+    wandb.Video = video
+    monkeypatch.setitem(sys.modules, "wandb", wandb)
+    tracker = WandbTracker("project", str(tmp_path))
+    source = tmp_path / "panel.mp4"
+    source.write_bytes(b"fake-mp4")
+
+    artifact = tracker.video(str(source), caption="clip", fps=24)
+
+    staged = Path(artifact["data"])
+    assert staged != source
+    assert staged.read_bytes() == b"fake-mp4"
+    assert seen == [str(staged)]
+
+
 def test_prepare_video_array_tiles_and_pads_batches() -> None:
     video = np.zeros((3, 1, 3, 1, 1), dtype=np.uint8)
     video[0] = 1

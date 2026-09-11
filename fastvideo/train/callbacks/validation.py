@@ -877,11 +877,17 @@ class ValidationCallback(Callback):
                 captions,
                 strict=True,
         ):
-            art = self.tracker.video(
-                fname,
-                caption=cap,
-                fps=fps,
-            )
+            try:
+                art = self.tracker.video(
+                    fname,
+                    caption=cap,
+                    fps=fps,
+                )
+            except OSError as error:
+                # A stale gcsfuse handle here used to abort the job after sampling.
+                # The mp4 is already on disk; skip the tracker artifact, keep training.
+                logger.warning("Could not upload validation video %s: %s", fname, error)
+                continue
             if art is not None:
                 video_logs.append(art)
 

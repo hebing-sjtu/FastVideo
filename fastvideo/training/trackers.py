@@ -10,9 +10,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 import contextlib
 import copy
+import errno
 import math
 import os
 import pathlib
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -28,6 +30,9 @@ logger = init_logger(__name__)
 
 _DEFAULT_VIDEO_FPS = 16
 _MISSING_ARTIFACT = object()
+# gcsfuse/NFS: wandb.Video hashes the file in place. A stale handle there used to
+# kill the whole job after validation had already rendered. Stage onto local disk first.
+_STALE_ERRNOS = {errno.ESTALE, 116}
 
 
 def _sanitize_wandb_config(value: Any) -> Any:
@@ -60,6 +65,31 @@ def _sanitize_wandb_config(value: Any) -> Any:
     if callable(value):
         return getattr(value, "__name__", repr(value))
     return repr(value)
+
+
+def _stage_video_for_tracker(path: str | os.PathLike[str]) -> str:
+    """Copy a video onto local disk so wandb can hash it without a remote handle.
+
+    Validation writes mp4s next to checkpoints, often on gcsfuse. ``wandb.Video``
+    then ``open`` + ``read`` that path; a stale NFS handle raises ``OSError 116``
+    and used to abort the run after sampling had already finished. The original
+    file stays where it was written.
+    """
+    source = pathlib.Path(path)
+    fd, destination = tempfile.mkstemp(prefix="fv_wandb_", suffix=source.suffix or ".mp4")
+    os.close(fd)
+    last_error: OSError | None = None
+    for attempt in range(2):
+        try:
+            shutil.copyfile(source, destination)
+            return destination
+        except OSError as error:
+            last_error = error
+            if error.errno not in _STALE_ERRNOS or attempt == 1:
+                pathlib.Path(destination).unlink(missing_ok=True)
+                raise
+            logger.warning("Stale handle reading %s; retrying a local copy.", source)
+    raise last_error  # pragma: no cover
 
 
 def _prepare_video_array(data: Any) -> np.ndarray:
@@ -369,7 +399,10 @@ class WandbTracker(BaseTracker):
             kwargs["format"] = format
         else:
             kwargs["format"] = "mp4"
-        return self._wandb.Video(data, **kwargs)
+        payload = data
+        if isinstance(data, str | os.PathLike):
+            payload = _stage_video_for_tracker(data)
+        return self._wandb.Video(payload, **kwargs)
 
 
 class SequentialTracker(BaseTracker):
