@@ -214,7 +214,12 @@ def extract_prompt_text(payload: object) -> str:
 
 
 def read_seg_prompt(seg: Path) -> tuple[str, str]:
-    """Training prompt. Root prompt.txt wins; minimax_h3/prompt.txt is never read."""
+    """Training prompt. Root files win; minimax_h3/prompt.txt is the last resort.
+
+    On gta_web_0902 that teacher file is the only text present. It is a Ref2VA
+    edit instruction, not a CWM window sentence — good enough to train, not a
+    substitute for a real caption export.
+    """
     root_txt = seg / "prompt.txt"
     if root_txt.is_file():
         text = root_txt.read_text(encoding="utf-8").strip()
@@ -228,6 +233,11 @@ def read_seg_prompt(seg: Path) -> tuple[str, str]:
             text = ""
         if text:
             return text, "prompt.json"
+    teacher = seg / "minimax_h3" / "prompt.txt"
+    if teacher.is_file():
+        text = teacher.read_text(encoding="utf-8").strip()
+        if text:
+            return text, "minimax_h3/prompt.txt"
     return "", "none"
 
 
@@ -285,7 +295,7 @@ def resolve_seg_media(seg: Path, *, proxy_stream: str = "auto") -> tuple[dict, s
         return None, "missing " + ", ".join(missing)
     prompt, source = read_seg_prompt(seg)
     if not prompt:
-        return None, "no prompt (no prompt.txt / prompt.json; minimax_h3/prompt.txt is ignored)"
+        return None, "no prompt (no prompt.txt / prompt.json / minimax_h3/prompt.txt)"
     return {
         "target": target,
         "proxy": proxy,
