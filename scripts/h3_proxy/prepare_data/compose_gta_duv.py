@@ -22,6 +22,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -145,7 +146,7 @@ def write_duv(path: Path, frames: list[np.ndarray], fps: float) -> None:
     temporary.unlink(missing_ok=True)
     container = av.open(str(temporary), mode="w", format="mp4")
     try:
-        stream = container.add_stream("libx264", rate=fps)
+        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
         stream.width = width
         stream.height = height
         stream.pix_fmt = "yuv444p"
