@@ -24,8 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -139,43 +137,30 @@ def semantic_ids(frame: np.ndarray) -> np.ndarray:
 
 
 def write_duv(path: Path, frames: list[np.ndarray], fps: float) -> None:
+    """Lossless RGB mp4 via PyAV. stdin-to-ffmpeg died with EPIPE on this node."""
+    import av
+
     height, width = frames[0].shape[:2]
     temporary = path.with_suffix(".mp4.tmp")
-    command = [
-        os.environ.get("FFMPEG", "ffmpeg"),
-        "-y",
-        "-f",
-        "rawvideo",
-        "-vcodec",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        str(fps),
-        "-i",
-        "-",
-        "-an",
-        "-c:v",
-        "libx264rgb",
-        "-pix_fmt",
-        "rgb24",
-        "-crf",
-        "0",
-        "-preset",
-        "fast",
-        str(temporary),
-    ]
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    assert process.stdin is not None
-    for frame in frames:
-        process.stdin.write(np.ascontiguousarray(frame).tobytes())
-    process.stdin.close()
-    if process.wait() != 0:
-        err = process.stderr.read().decode(errors="replace") if process.stderr else ""
+    temporary.unlink(missing_ok=True)
+    container = av.open(str(temporary), mode="w")
+    try:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv444p"
+        stream.options = {"crf": "0", "preset": "fast", "tune": "fastdecode"}
+        for array in frames:
+            video_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(array), format="rgb24")
+            for packet in stream.encode(video_frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    finally:
+        container.close()
+    if not temporary.is_file() or temporary.stat().st_size == 0:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError(f"ffmpeg failed writing {path}: {err[-400:]}")
+        raise RuntimeError(f"PyAV wrote no bytes to {temporary}")
     temporary.replace(path)
 
 
@@ -263,7 +248,8 @@ def main() -> None:
 
     if not args.probe_only:
         print(f"Done: {written} written, {skipped} skipped, {failed} failed")
-        write_split_manifests(root, [path.name for path in sorted(root.glob("seg_*")) if path.is_dir()])
+        if written:
+            write_split_manifests(root, [path.name for path in sorted(root.glob("seg_*")) if path.is_dir()])
 
 
 if __name__ == "__main__":
