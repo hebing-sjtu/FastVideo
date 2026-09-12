@@ -30,7 +30,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from seg_dir_to_encode_manifest import (  # noqa: E402
-    largest_valid_num_frames, probe_usable_frames, split_ids,
+    largest_valid_num_frames, probe_usable_frames, resolve_seg_media, split_ids,
 )
 
 
@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
                    type=int,
                    default=124,
                    help="The callback's num_frames, checked against each clip's 24-fps budget.")
+    p.add_argument("--proxy-stream",
+                   choices=("duv", "color", "auto"),
+                   default="auto",
+                   help="Must match the encode manifest. Nested GTA segs default to proxy/duv.mp4.")
     return p.parse_args()
 
 
@@ -77,26 +81,24 @@ def main() -> None:
     for seg in seg_dirs:
         if keep is not None and seg.name not in keep:
             continue
-        target, proxy, prompt_file = (seg / "video_target.mp4", seg / "video_src.mp4", seg / "prompt.txt")
-        missing = [path.name for path in (target, proxy, prompt_file) if not path.is_file()]
-        if missing:
-            incomplete.append(f"{seg.name}: missing {', '.join(missing)}")
+        media, reason = resolve_seg_media(seg, proxy_stream=args.proxy_stream)
+        if media is None:
+            incomplete.append(f"{seg.name}: {reason}")
             continue
-        prompt = prompt_file.read_text(encoding="utf-8").strip()
-        if not prompt:
-            incomplete.append(f"{seg.name}: prompt.txt is empty")
-            continue
-        records.append({
+        record = {
             "id": seg.name,
             # `caption` is the one key ValidationDataset requires; it aliases to the prompt.
-            "caption": prompt,
-            "proxy_path": str(proxy),
-            "target_path": str(target),
+            "caption": media["prompt"],
+            "proxy_path": str(media["proxy"]),
+            "target_path": str(media["target"]),
             # Read by the metrics evaluator when callbacks.validation.metrics is enabled. Deliberately
             # not `video_path`: the loader would decode that clip on every rank to condition an
             # image-to-video pipeline, which H3 Ref2VA does not use.
-            "ref_video": str(target),
-        })
+            "ref_video": str(media["target"]),
+        }
+        if media.get("anchor") is not None:
+            record["anchor_path"] = str(media["anchor"])
+        records.append(record)
 
     if not records:
         raise SystemExit(f"No complete seg directories survived (scanned {len(seg_dirs)}, "

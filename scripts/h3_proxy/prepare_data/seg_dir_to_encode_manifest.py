@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scan a flat ``seg_*/`` dataset into an ``encode_proxy_samples`` manifest.
 
-Layout consumed::
+Two layouts are accepted. The flat one::
 
     <root>/
       seg_0000/
@@ -11,9 +11,23 @@ Layout consumed::
         prompt.txt           the only text that enters training
         metadata.json        identity; read only for cross-checking the id
         .minimax_h3/         teacher provenance, ignored here
+
+And the nested GTA / native-proxy one (``gta_web_0902``)::
+
+    <root>/
+      seg_0000/
+        prompt.json          structured caption; compiled into the training prompt
+        prompt.txt           preferred when present
+        metadata.json        may name the target file
+        minimax_h3/output.mp4
+        minimax_h3/image_1.png
+        proxy/duv.mp4        native game DUV, passed through as proxy_duv_video
       manifests/
         <prefix>_train.jsonl
         <prefix>_val.jsonl
+
+A directory is treated as nested when the flat trio is absent and ``proxy/duv.mp4`` plus a
+target exist. ``minimax_h3/prompt.txt`` is the Ref2VA edit instruction and is never used.
 
 The seg directories are authoritative for *what exists*; the manifests are authoritative for
 *which split a clip belongs to*. So this scans the directories and, unless ``--split all``, keeps
@@ -61,6 +75,11 @@ def parse_args() -> argparse.Namespace:
     # `proxy` for encode_proxy_samples (H3), `source` for encode_v2v_depth_samples (Wan V2V). The
     # same video_src.mp4 either way; only the field name differs.
     p.add_argument("--source-key", choices=("proxy", "source"), default="proxy")
+    p.add_argument("--proxy-stream",
+                   choices=("duv", "color", "auto"),
+                   default="auto",
+                   help="Nested layout: 'duv' writes proxy_duv_video (native game DUV, no resample). "
+                   "'color' writes a regular RGB proxy. 'auto' uses duv.mp4 when present.")
     p.add_argument("--probe-limit",
                    type=int,
                    default=32,
@@ -151,11 +170,138 @@ def probe_usable_frames(path: Path) -> int | None:
         return None
 
 
+def _first_existing(*paths: Path) -> Path | None:
+    for path in paths:
+        if path.is_file():
+            return path
+    return None
+
+
+def _string_field(payload: object, *keys: str) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def extract_prompt_text(payload: object) -> str:
+    if isinstance(payload, str):
+        return payload.strip()
+    if not isinstance(payload, dict):
+        return ""
+    direct = _string_field(payload, "prompt", "caption", "text", "user")
+    if direct:
+        return direct
+    compiled = payload.get("compiled")
+    if isinstance(compiled, dict):
+        cwm = compiled.get("cwm")
+        if isinstance(cwm, dict):
+            user = _string_field(cwm, "user")
+            if user:
+                return user
+        lean = compiled.get("lean")
+        if isinstance(lean, dict):
+            prose = _string_field(lean, "global")
+            if prose:
+                return prose
+        prose = _string_field(compiled, "global")
+        if prose:
+            return prose
+    return ""
+
+
+def read_seg_prompt(seg: Path) -> tuple[str, str]:
+    """Training prompt. Root prompt.txt wins; minimax_h3/prompt.txt is never read."""
+    root_txt = seg / "prompt.txt"
+    if root_txt.is_file():
+        text = root_txt.read_text(encoding="utf-8").strip()
+        if text:
+            return text, "prompt.txt"
+    prompt_json = seg / "prompt.json"
+    if prompt_json.is_file():
+        try:
+            text = extract_prompt_text(json.loads(prompt_json.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            text = ""
+        if text:
+            return text, "prompt.json"
+    return "", "none"
+
+
+def read_nested_target(seg: Path) -> Path | None:
+    named: list[Path] = []
+    meta_file = seg / "metadata.json"
+    if meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        raw = _string_field(meta, "output", "target", "video", "target_video", "output_video")
+        if not raw and isinstance(meta.get("files"), dict):
+            raw = _string_field(meta["files"], "output", "target", "video")
+        if raw:
+            named.append(seg / raw if not Path(raw).is_absolute() else Path(raw))
+    return _first_existing(*named, seg / "minimax_h3" / "output.mp4", seg / "video_target.mp4")
+
+
+def resolve_seg_media(seg: Path, *, proxy_stream: str = "auto") -> tuple[dict, str] | tuple[None, str]:
+    """Return a relative-path row fragment, or (None, reason)."""
+    flat_target = seg / "video_target.mp4"
+    flat_proxy = seg / "video_src.mp4"
+    if flat_target.is_file() and flat_proxy.is_file():
+        prompt, source = read_seg_prompt(seg)
+        if not prompt:
+            return None, "no prompt (no prompt.txt / prompt.json)"
+        return {
+            "target": flat_target,
+            "proxy": flat_proxy,
+            "anchor": _first_existing(seg / "minimax_h3" / "image_1.png", seg / "anchor.png"),
+            "prompt": prompt,
+            "prompt_source": source,
+            "layout": "flat",
+        }, ""
+
+    target = read_nested_target(seg)
+    duv = seg / "proxy" / "duv.mp4"
+    color = seg / "proxy" / "color.mp4"
+    if proxy_stream == "duv":
+        proxy, proxy_kind = (duv, "duv")
+    elif proxy_stream == "color":
+        proxy, proxy_kind = (color, "color")
+    elif duv.is_file():
+        proxy, proxy_kind = (duv, "duv")
+    else:
+        proxy, proxy_kind = (color, "color")
+
+    missing = []
+    if target is None:
+        missing.append("minimax_h3/output.mp4")
+    if not proxy.is_file():
+        missing.append(f"proxy/{proxy.name}")
+    if missing:
+        return None, "missing " + ", ".join(missing)
+    prompt, source = read_seg_prompt(seg)
+    if not prompt:
+        return None, "no prompt (no prompt.txt / prompt.json; minimax_h3/prompt.txt is ignored)"
+    return {
+        "target": target,
+        "proxy": proxy,
+        "anchor": _first_existing(seg / "minimax_h3" / "image_1.png"),
+        "prompt": prompt,
+        "prompt_source": source,
+        "layout": "nested",
+        "proxy_kind": proxy_kind,
+    }, ""
+
+
 def report_frame_budget(rows: list[dict], root: Path, limit: int) -> None:
     sample = rows if limit <= 0 else rows[::max(1, len(rows) // limit)][:limit]
     budgets: list[tuple[str, int]] = []
     for row in sample:
-        for key in ("target", "proxy", "source"):
+        for key in ("target", "proxy", "source", "proxy_duv_video"):
             relative = row.get(key)
             if not relative:
                 continue
@@ -189,26 +335,32 @@ def main() -> None:
     rows: list[dict] = []
     skipped_split = 0
     incomplete: list[str] = []
+    layouts: dict[str, int] = {}
+    prompt_sources: dict[str, int] = {}
     for seg in seg_dirs:
         if keep is not None and seg.name not in keep:
             skipped_split += 1
             continue
-        target, source, prompt_file = (seg / "video_target.mp4", seg / "video_src.mp4", seg / "prompt.txt")
-        missing = [path.name for path in (target, source, prompt_file) if not path.is_file()]
-        if missing:
-            incomplete.append(f"{seg.name}: missing {', '.join(missing)}")
+        media, reason = resolve_seg_media(seg, proxy_stream=args.proxy_stream)
+        if media is None:
+            incomplete.append(f"{seg.name}: {reason}")
             continue
-        prompt = prompt_file.read_text(encoding="utf-8").strip()
-        if not prompt:
-            incomplete.append(f"{seg.name}: prompt.txt is empty")
-            continue
-        rows.append({
+        layouts[str(media["layout"])] = layouts.get(str(media["layout"]), 0) + 1
+        prompt_sources[str(media["prompt_source"])] = prompt_sources.get(str(media["prompt_source"]), 0) + 1
+        row = {
             "name": seg.name,
-            "target": str(target.relative_to(root)),
-            args.source_key: str(source.relative_to(root)),
-            "prompt": prompt,
+            "target": str(Path(media["target"]).relative_to(root)),
+            "prompt": media["prompt"],
             "id": seg.name,
-        })
+        }
+        if media.get("proxy_kind") == "duv" or (
+                media["layout"] == "nested" and Path(media["proxy"]).name == "duv.mp4"):
+            row["proxy_duv_video"] = str(Path(media["proxy"]).relative_to(root))
+        else:
+            row[args.source_key] = str(Path(media["proxy"]).relative_to(root))
+        if media.get("anchor") is not None:
+            row["anchor"] = str(Path(media["anchor"]).relative_to(root))
+        rows.append(row)
 
     if not rows:
         raise SystemExit(f"No complete seg directories survived (scanned {len(seg_dirs)}, "
@@ -226,6 +378,10 @@ def main() -> None:
     # State the total explicitly: without it the reader has to add the lines below to notice that
     # the split files reference more clips than the directory tree holds.
     print(f"  {len(seg_dirs)} seg directories on disk, {len(rows)} of them usable in split '{args.split}'")
+    if layouts:
+        print(f"  layouts: {', '.join(f'{key}={value}' for key, value in sorted(layouts.items()))}")
+    if prompt_sources:
+        print(f"  prompt sources: {', '.join(f'{key}={value}' for key, value in sorted(prompt_sources.items()))}")
     if skipped_split:
         print(f"  {skipped_split} seg directories are not in split '{args.split}'")
     if incomplete:
