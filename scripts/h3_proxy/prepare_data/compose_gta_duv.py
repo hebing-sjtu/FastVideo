@@ -141,9 +141,9 @@ def write_duv(path: Path, frames: list[np.ndarray], fps: float) -> None:
     import av
 
     height, width = frames[0].shape[:2]
-    temporary = path.with_suffix(".mp4.tmp")
+    temporary = path.with_name(path.stem + ".tmp.mp4")
     temporary.unlink(missing_ok=True)
-    container = av.open(str(temporary), mode="w")
+    container = av.open(str(temporary), mode="w", format="mp4")
     try:
         stream = container.add_stream("libx264", rate=fps)
         stream.width = width
