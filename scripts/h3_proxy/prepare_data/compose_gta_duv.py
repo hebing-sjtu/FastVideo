@@ -59,6 +59,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--probe-only", action="store_true", help="Print first-frame stats, write nothing.")
+    p.add_argument(
+        "--height",
+        type=int,
+        default=704,
+        help="Crop the native 720p height to a multiple of 32 (default 704). 720 yields a 45-row "
+        "VAE latent, which the 2x2 patch cannot tile.",
+    )
     return p.parse_args()
 
 
@@ -239,6 +246,13 @@ def main() -> None:
                 compose_frame(decode_depth_grey(depth), semantic_ids(semantic))
                 for depth, semantic in zip(depth_frames, semantic_frames, strict=True)
             ]
+            if args.height and composed[0].shape[0] != args.height:
+                if args.height > composed[0].shape[0]:
+                    raise ValueError(f"--height {args.height} is taller than {composed[0].shape[0]}")
+                trim = composed[0].shape[0] - args.height
+                top = trim // 2
+                bottom = composed[0].shape[0] - (trim - top)
+                composed = [frame[top:bottom] for frame in composed]
             write_duv(duv_path, composed, probe_video_fps(depth_path))
             written += 1
             if written % 20 == 0:
