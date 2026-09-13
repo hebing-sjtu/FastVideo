@@ -36,7 +36,9 @@ PROXY_FAR = 8000.0
 PROXY_MAX = 254
 PROXY_SKY = 255
 
-# DATA_F.md / standard11 G,B. sky and road share (255,255); R==255 is sky.
+# DATA_F.md / standard11 G,B. Not injective: the eleven labels collapse onto six codes, because
+# sky and road share (255,255) and building, ground, terrain, water, and prop all share (0,0).
+# Kept as the default only because an existing cache was encoded with it.
 PROXY_GB = {
     0: (255, 255),  # sky
     1: (0, 255),  # player
@@ -50,6 +52,13 @@ PROXY_GB = {
     9: (0, 0),  # water
     10: (0, 0),  # prop
 }
+
+# CWM's semantic grid: cwm_h3_inference.constants SEMANTIC_U x SEMANTIC_V, twelve well-separated
+# (G,B) pairs. Eleven GTA classes fit, so every label gets its own code and the model can tell road
+# from sky without falling back on R==255 -- which also means "depth invalid" and so cannot
+# disambiguate anything.
+CWM_SEMANTIC_U = (32, 96, 160, 224)
+CWM_SEMANTIC_V = (43, 128, 213)
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +74,38 @@ def parse_args() -> argparse.Namespace:
         help="Crop the native 720p height to a multiple of 32 (default 704). 720 yields a 45-row "
         "VAE latent, which the 2x2 patch cannot tile.",
     )
+    p.add_argument(
+        "--semantic-palette",
+        choices=("standard11", "cwm12"),
+        default="standard11",
+        help="'cwm12' gives every class its own (G,B) from CWM's 4x3 semantic grid, which "
+        "'standard11' collapses eight classes out of. Changing this changes the proxy pixels, so "
+        "a cache encoded under one palette cannot be compared against a run under the other.",
+    )
     return p.parse_args()
+
+
+def build_palette(kind: str, class_ids: list[int]) -> dict[int, tuple[int, int]]:
+    """Class id -> (G, B). ``cwm12`` is injective; ``standard11`` is the legacy table."""
+    if kind == "standard11":
+        return dict(PROXY_GB)
+    slots = [(u, v) for u in CWM_SEMANTIC_U for v in CWM_SEMANTIC_V]
+    if len(class_ids) > len(slots):
+        raise SystemExit(f"cwm12 has {len(slots)} codes but the semantic map declares {len(class_ids)} classes.")
+    return {class_id: slots[index] for index, class_id in enumerate(sorted(class_ids))}
+
+
+def read_class_ids(seg: Path) -> list[int]:
+    """Class ids the seg's ``proxy/semantic.json`` declares, or the legacy 0..10."""
+    path = seg / "proxy" / "semantic.json"
+    if path.is_file():
+        try:
+            classes = json.loads(path.read_text(encoding="utf-8")).get("classes")
+        except (OSError, json.JSONDecodeError):
+            classes = None
+        if isinstance(classes, dict) and classes:
+            return sorted(int(key) for key in classes)
+    return sorted(PROXY_GB)
 
 
 def decode_depth_grey(grey: np.ndarray) -> np.ndarray:
@@ -81,13 +121,13 @@ def log_code_forward(metres: np.ndarray) -> np.ndarray:
     return np.rint(fraction * PROXY_MAX).astype(np.uint8)
 
 
-def compose_frame(metres: np.ndarray, ids: np.ndarray) -> np.ndarray:
+def compose_frame(metres: np.ndarray, ids: np.ndarray, palette: dict[int, tuple[int, int]]) -> np.ndarray:
     red = log_code_forward(metres)
     sky = (metres <= 1.0e-3) | (ids == 0)
     red[sky] = PROXY_SKY
     green = np.zeros_like(red)
     blue = np.zeros_like(red)
-    for class_id, (g, b) in PROXY_GB.items():
+    for class_id, (g, b) in palette.items():
         mask = ids == class_id
         green[mask] = g
         blue[mask] = b
@@ -217,9 +257,13 @@ def main() -> None:
             semantic_frames = read_rgb_video(semantic_path)
             if len(depth_frames) != len(semantic_frames):
                 raise ValueError(f"depth {len(depth_frames)} frames vs semantic {len(semantic_frames)}")
+            palette = build_palette(args.semantic_palette, read_class_ids(seg))
             ids0 = semantic_ids(semantic_frames[0])
             metres0 = decode_depth_grey(depth_frames[0])
             if index == 0 or args.probe_only:
+                distinct = len(set(palette.values()))
+                print(f"  palette {args.semantic_palette}: {len(palette)} classes -> {distinct} distinct (G,B)"
+                      f"{'' if distinct == len(palette) else '  [classes collapse; the model cannot separate them]'}")
                 valid = metres0 > 1.0e-3
                 print(f"{seg.name}: {depth_frames[0].shape[1]}x{depth_frames[0].shape[0]} "
                       f"{len(depth_frames)} frames, depth grey "
@@ -229,7 +273,7 @@ def main() -> None:
             if args.probe_only:
                 continue
             composed = [
-                compose_frame(decode_depth_grey(depth), semantic_ids(semantic))
+                compose_frame(decode_depth_grey(depth), semantic_ids(semantic), palette)
                 for depth, semantic in zip(depth_frames, semantic_frames, strict=True)
             ]
             if args.height and composed[0].shape[0] != args.height:

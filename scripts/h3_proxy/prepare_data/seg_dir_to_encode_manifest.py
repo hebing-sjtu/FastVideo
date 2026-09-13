@@ -27,7 +27,15 @@ And the nested GTA / native-proxy one (``gta_web_0902``)::
         <prefix>_val.jsonl
 
 A directory is treated as nested when the flat trio is absent and ``proxy/duv.mp4`` plus a
-target exist. ``minimax_h3/prompt.txt`` is the Ref2VA edit instruction and is never used.
+target exist. ``minimax_h3/prompt.txt`` is the Ref2VA edit instruction and needs
+``--allow-teacher-prompt``; a structured ``prompt.json`` compiles to a window-stamped caption.
+
+Corpus gate
+-----------
+When the root holds a ``vlm_filter.json``, only clips whose judge scores all clear
+``--min-vlm-score`` are emitted. A clip that follows its prompt but not its proxy teaches the model
+that the proxy is ignorable, so the scores gate the corpus rather than annotate it. Pass
+``--vlm-filter none`` to keep everything.
 
 The seg directories are authoritative for *what exists*; the manifests are authoritative for
 *which split a clip belongs to*. So this scans the directories and, unless ``--split all``, keeps
@@ -58,6 +66,11 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from vlm_filter import add_filter_arguments, load_vlm_filter  # noqa: E402
 
 # The H3 causal VAE consumes frames in groups of 17 after a 5-frame head.
 FRAME_MULTIPLE = 17
@@ -65,6 +78,16 @@ FRAME_OFFSET = 5
 MINIMAX_H3_FPS = 24
 
 SEG_PATTERN = re.compile(r"seg_\d+")
+
+# The window stamp CWM puts in front of a caption, e.g. "[0.00s-5.17s] ". A prompt carrying it is
+# known to describe one window; one without it could be an episode summary, so the builders audit
+# for it and the contract compiler adds it.
+WINDOW_MARKER_PATTERN = re.compile(r"^\[\d+\.\d{2}s-\d+\.\d{2}s\] ")
+
+# Prose variants a `contract`/`version 3` prompt.json compiles. `rich` is the CWM-shaped one:
+# medium, environment, lighting, then subject appearance and motion. `lean` drops the scene detail
+# down to a few words, which is not what the reference captions look like.
+CONTRACT_PROSE_STYLES = ("rich", "lean")
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,10 +103,20 @@ def parse_args() -> argparse.Namespace:
                    default="auto",
                    help="Nested layout: 'duv' writes proxy_duv_video (native game DUV, no resample). "
                    "'color' writes a regular RGB proxy. 'auto' uses duv.mp4 when present.")
+    p.add_argument("--contract-prose",
+                   choices=CONTRACT_PROSE_STYLES,
+                   default="rich",
+                   help="Which compiled prose to take from a structured prompt.json (default rich).")
+    p.add_argument("--allow-teacher-prompt",
+                   action="store_true",
+                   help="Fall back to minimax_h3/prompt.txt when no other text exists. Off by default: "
+                   "that file is a Ref2VA edit instruction describing a keyframe task this pipeline "
+                   "does not pack, so training on it teaches the wrong contract.")
     p.add_argument("--probe-limit",
                    type=int,
                    default=32,
                    help="Clips to probe for the frame budget; 0 probes all, which is slower on FUSE mounts.")
+    add_filter_arguments(p)
     return p.parse_args()
 
 
@@ -187,38 +220,63 @@ def _string_field(payload: object, *keys: str) -> str:
     return ""
 
 
-def extract_prompt_text(payload: object) -> str:
+def window_marker(duration: object) -> str:
+    """The ``[0.00s-5.17s] `` stamp for a window of ``duration`` seconds, or "" if unknown."""
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
+        return ""
+    return f"[0.00s-{float(duration):.2f}s] "
+
+
+def extract_prompt_text(payload: object, *, prose_style: str = "rich") -> str:
+    """The one sentence that enters training, window-stamped when the payload dates it.
+
+    A structured ``prompt.json`` carries both a ``rich`` and a ``lean`` compilation plus the
+    window's ``duration``. Stamping the chosen prose keeps these prompts indistinguishable from a
+    ``captions-export`` one, which is what the manifest audit downstream checks for.
+    """
     if isinstance(payload, str):
         return payload.strip()
     if not isinstance(payload, dict):
         return ""
+    text = _compiled_prose(payload, prose_style=prose_style)
+    if not text:
+        return ""
+    if WINDOW_MARKER_PATTERN.match(text):
+        return text
+    return window_marker(payload.get("duration")) + text
+
+
+def _compiled_prose(payload: dict, *, prose_style: str) -> str:
     direct = _string_field(payload, "prompt", "caption", "text", "user")
     if direct:
         return direct
     compiled = payload.get("compiled")
-    if isinstance(compiled, dict):
-        cwm = compiled.get("cwm")
-        if isinstance(cwm, dict):
-            user = _string_field(cwm, "user")
-            if user:
-                return user
-        lean = compiled.get("lean")
-        if isinstance(lean, dict):
-            prose = _string_field(lean, "global")
+    if not isinstance(compiled, dict):
+        return ""
+    cwm = compiled.get("cwm")
+    if isinstance(cwm, dict):
+        user = _string_field(cwm, "user")
+        if user:
+            return user
+    # Requested style first, then the other one: a contract that compiled only one of them still
+    # yields text rather than falling through to the teacher instruction.
+    ordered = (prose_style, ) + tuple(style for style in CONTRACT_PROSE_STYLES if style != prose_style)
+    for style in ordered:
+        variant = compiled.get(style)
+        if isinstance(variant, dict):
+            prose = _string_field(variant, "global")
             if prose:
                 return prose
-        prose = _string_field(compiled, "global")
-        if prose:
-            return prose
-    return ""
+    return _string_field(compiled, "global")
 
 
-def read_seg_prompt(seg: Path) -> tuple[str, str]:
-    """Training prompt. Root files win; minimax_h3/prompt.txt is the last resort.
+def read_seg_prompt(seg: Path, *, prose_style: str = "rich", allow_teacher: bool = False) -> tuple[str, str]:
+    """Training prompt. A root ``prompt.txt`` wins, then the structured ``prompt.json``.
 
-    On gta_web_0902 that teacher file is the only text present. It is a Ref2VA
-    edit instruction, not a CWM window sentence — good enough to train, not a
-    substitute for a real caption export.
+    ``minimax_h3/prompt.txt`` is a Ref2VA edit instruction that describes a source video and a
+    keyframe-completion task, neither of which this pipeline packs. It is only consulted when
+    ``allow_teacher`` says to, so a dataset that lost its captions fails loudly instead of
+    training on the wrong contract.
     """
     root_txt = seg / "prompt.txt"
     if root_txt.is_file():
@@ -228,16 +286,17 @@ def read_seg_prompt(seg: Path) -> tuple[str, str]:
     prompt_json = seg / "prompt.json"
     if prompt_json.is_file():
         try:
-            text = extract_prompt_text(json.loads(prompt_json.read_text(encoding="utf-8")))
+            text = extract_prompt_text(json.loads(prompt_json.read_text(encoding="utf-8")), prose_style=prose_style)
         except (OSError, json.JSONDecodeError):
             text = ""
         if text:
             return text, "prompt.json"
-    teacher = seg / "minimax_h3" / "prompt.txt"
-    if teacher.is_file():
-        text = teacher.read_text(encoding="utf-8").strip()
-        if text:
-            return text, "minimax_h3/prompt.txt"
+    if allow_teacher:
+        teacher = seg / "minimax_h3" / "prompt.txt"
+        if teacher.is_file():
+            text = teacher.read_text(encoding="utf-8").strip()
+            if text:
+                return text, "minimax_h3/prompt.txt"
     return "", "none"
 
 
@@ -257,12 +316,19 @@ def read_nested_target(seg: Path) -> Path | None:
     return _first_existing(*named, seg / "minimax_h3" / "output.mp4", seg / "video_target.mp4")
 
 
-def resolve_seg_media(seg: Path, *, proxy_stream: str = "auto") -> tuple[dict, str] | tuple[None, str]:
+def resolve_seg_media(
+    seg: Path,
+    *,
+    proxy_stream: str = "auto",
+    prose_style: str = "rich",
+    allow_teacher: bool = False,
+) -> tuple[dict, str] | tuple[None, str]:
     """Return a relative-path row fragment, or (None, reason)."""
+    read = lambda: read_seg_prompt(seg, prose_style=prose_style, allow_teacher=allow_teacher)  # noqa: E731
     flat_target = seg / "video_target.mp4"
     flat_proxy = seg / "video_src.mp4"
     if flat_target.is_file() and flat_proxy.is_file():
-        prompt, source = read_seg_prompt(seg)
+        prompt, source = read()
         if not prompt:
             return None, "no prompt (no prompt.txt / prompt.json)"
         return {
@@ -293,9 +359,10 @@ def resolve_seg_media(seg: Path, *, proxy_stream: str = "auto") -> tuple[dict, s
         missing.append(f"proxy/{proxy.name}")
     if missing:
         return None, "missing " + ", ".join(missing)
-    prompt, source = read_seg_prompt(seg)
+    prompt, source = read()
     if not prompt:
-        return None, "no prompt (no prompt.txt / prompt.json / minimax_h3/prompt.txt)"
+        return None, ("no prompt (no prompt.txt / prompt.json"
+                      f"{'' if allow_teacher else '; minimax_h3/prompt.txt needs --allow-teacher-prompt'})")
     return {
         "target": target,
         "proxy": proxy,
@@ -331,6 +398,21 @@ def report_frame_budget(rows: list[dict], root: Path, limit: int) -> None:
         print(f"  No valid --num-frames fits {worst} frames; the shortest clip is unusable.")
 
 
+def report_window_scope(rows: list[dict]) -> None:
+    """Say how many prompts are scoped to one window, and complain if any are not."""
+    prompts = [str(row.get("prompt", "")) for row in rows]
+    windowed = [prompt for prompt in prompts if WINDOW_MARKER_PATTERN.match(prompt)]
+    print(f"  window-scoped prompts: {len(windowed)}/{len(prompts)}")
+    if len(windowed) == len(prompts):
+        return
+    offenders = [prompt for prompt in prompts if not WINDOW_MARKER_PATTERN.match(prompt)]
+    longest = max(offenders, key=len)
+    head = longest if len(longest) <= 140 else longest[:137] + "..."
+    print(f"    WARNING: {len(offenders)} prompt(s) carry no '[0.00s-5.17s] ' stamp, so nothing says they "
+          "describe only this window. Longest:")
+    print(f"      {head}")
+
+
 def main() -> None:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
@@ -342,8 +424,13 @@ def main() -> None:
     if not seg_dirs:
         raise SystemExit(f"No 'seg_*' directories under {root}")
 
+    vlm = load_vlm_filter(root, args)
+    if vlm is not None:
+        vlm.report(on_disk={path.name for path in seg_dirs})
+
     rows: list[dict] = []
     skipped_split = 0
+    rejected_vlm: list[str] = []
     incomplete: list[str] = []
     layouts: dict[str, int] = {}
     prompt_sources: dict[str, int] = {}
@@ -351,7 +438,17 @@ def main() -> None:
         if keep is not None and seg.name not in keep:
             skipped_split += 1
             continue
-        media, reason = resolve_seg_media(seg, proxy_stream=args.proxy_stream)
+        if vlm is not None:
+            accepted, why = vlm.verdict(seg.name)
+            if not accepted:
+                rejected_vlm.append(f"{seg.name}: {why}")
+                continue
+        media, reason = resolve_seg_media(
+            seg,
+            proxy_stream=args.proxy_stream,
+            prose_style=args.contract_prose,
+            allow_teacher=args.allow_teacher_prompt,
+        )
         if media is None:
             incomplete.append(f"{seg.name}: {reason}")
             continue
@@ -374,7 +471,8 @@ def main() -> None:
 
     if not rows:
         raise SystemExit(f"No complete seg directories survived (scanned {len(seg_dirs)}, "
-                         f"{len(incomplete)} incomplete, {skipped_split} out of split).")
+                         f"{len(incomplete)} incomplete, {len(rejected_vlm)} below the VLM threshold, "
+                         f"{skipped_split} out of split).")
 
     missing_from_disk = sorted(keep - {row["name"] for row in rows}) if keep is not None else []
 
@@ -392,6 +490,13 @@ def main() -> None:
         print(f"  layouts: {', '.join(f'{key}={value}' for key, value in sorted(layouts.items()))}")
     if prompt_sources:
         print(f"  prompt sources: {', '.join(f'{key}={value}' for key, value in sorted(prompt_sources.items()))}")
+    report_window_scope(rows)
+    if rejected_vlm:
+        print(f"  {len(rejected_vlm)} rejected by the VLM filter:")
+        for line in rejected_vlm[:10]:
+            print(f"    {line}")
+        if len(rejected_vlm) > 10:
+            print(f"    ... and {len(rejected_vlm) - 10} more")
     if skipped_split:
         print(f"  {skipped_split} seg directories are not in split '{args.split}'")
     if incomplete:

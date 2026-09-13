@@ -30,8 +30,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from seg_dir_to_encode_manifest import (  # noqa: E402
-    largest_valid_num_frames, probe_usable_frames, resolve_seg_media, split_ids,
+    CONTRACT_PROSE_STYLES, largest_valid_num_frames, probe_usable_frames, resolve_seg_media, split_ids,
 )
+from vlm_filter import add_filter_arguments, load_vlm_filter  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +52,12 @@ def parse_args() -> argparse.Namespace:
                    choices=("duv", "color", "auto"),
                    default="auto",
                    help="Must match the encode manifest. Nested GTA segs default to proxy/duv.mp4.")
+    p.add_argument("--contract-prose",
+                   choices=CONTRACT_PROSE_STYLES,
+                   default="rich",
+                   help="Must match the encode manifest, or validation prompts differ from training ones.")
+    p.add_argument("--allow-teacher-prompt", action="store_true", help="Must match the encode manifest.")
+    add_filter_arguments(p)
     return p.parse_args()
 
 
@@ -76,12 +83,28 @@ def main() -> None:
     if not seg_dirs:
         raise SystemExit(f"No 'seg_*' directories under {root}")
 
+    # The same filter the encode manifest applies. Both sides intersect it with their own split
+    # file, so train and val stay disjoint and no split has to be rewritten -- val simply loses the
+    # clips the judge rejected.
+    vlm = load_vlm_filter(root, args)
+    if vlm is not None:
+        vlm.report()
+
     records: list[dict] = []
+    rejected_vlm = 0
     incomplete: list[str] = []
     for seg in seg_dirs:
         if keep is not None and seg.name not in keep:
             continue
-        media, reason = resolve_seg_media(seg, proxy_stream=args.proxy_stream)
+        if vlm is not None and not vlm.verdict(seg.name)[0]:
+            rejected_vlm += 1
+            continue
+        media, reason = resolve_seg_media(
+            seg,
+            proxy_stream=args.proxy_stream,
+            prose_style=args.contract_prose,
+            allow_teacher=args.allow_teacher_prompt,
+        )
         if media is None:
             incomplete.append(f"{seg.name}: {reason}")
             continue
@@ -114,6 +137,8 @@ def main() -> None:
 
     print(f"Wrote {len(records)} validation records -> {out}")
     print(f"  {available} usable clips in split '{args.split}'; kept {len(records)}")
+    if rejected_vlm:
+        print(f"  {rejected_vlm} clips in this split were rejected by the VLM filter")
     if incomplete:
         print(f"  {len(incomplete)} incomplete, skipped: {', '.join(line.split(':')[0] for line in incomplete[:10])}"
               f"{' ...' if len(incomplete) > 10 else ''}")
