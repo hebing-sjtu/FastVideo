@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
                    default="rich",
                    help="Must match the encode manifest, or validation prompts differ from training ones.")
     p.add_argument("--allow-teacher-prompt", action="store_true", help="Must match the encode manifest.")
+    p.add_argument("--anchor-source",
+                   choices=("target", "image1"),
+                   default="target",
+                   help="Must match the encode manifest. 'target' omits anchor_path so the callback "
+                   "decodes the target's first frame, which is what the first-frame lock writes.")
     add_filter_arguments(p)
     return p.parse_args()
 
@@ -104,6 +109,7 @@ def main() -> None:
             proxy_stream=args.proxy_stream,
             prose_style=args.contract_prose,
             allow_teacher=args.allow_teacher_prompt,
+            anchor_source=args.anchor_source,
         )
         if media is None:
             incomplete.append(f"{seg.name}: {reason}")

@@ -107,6 +107,14 @@ def parse_args() -> argparse.Namespace:
                    choices=CONTRACT_PROSE_STYLES,
                    default="rich",
                    help="Which compiled prose to take from a structured prompt.json (default rich).")
+    p.add_argument("--anchor-source",
+                   choices=("target", "image1"),
+                   default="target",
+                   help="'target' emits no anchor key, so the encoder and the validation callback both "
+                   "take the target's first frame. 'image1' uses minimax_h3/image_1.png, which on "
+                   "gta_web_0902_v2 is a style reference rather than a frame of the target -- its mean "
+                   "absolute difference from frame 0 runs 16-49 -- so locking it would pin the wrong "
+                   "appearance.")
     p.add_argument("--allow-teacher-prompt",
                    action="store_true",
                    help="Fall back to minimax_h3/prompt.txt when no other text exists. Off by default: "
@@ -322,9 +330,17 @@ def resolve_seg_media(
     proxy_stream: str = "auto",
     prose_style: str = "rich",
     allow_teacher: bool = False,
+    anchor_source: str = "target",
 ) -> tuple[dict, str] | tuple[None, str]:
-    """Return a relative-path row fragment, or (None, reason)."""
+    """Return a relative-path row fragment, or (None, reason).
+
+    ``anchor`` is left out under ``anchor_source="target"`` so both the encoder and the validation
+    callback fall back to the target's own first frame, which is the only image the first-frame lock
+    can write without changing what the clip looks like.
+    """
     read = lambda: read_seg_prompt(seg, prose_style=prose_style, allow_teacher=allow_teacher)  # noqa: E731
+    style_image = (_first_existing(seg / "minimax_h3" / "image_1.png", seg / "anchor.png")
+                   if anchor_source == "image1" else None)
     flat_target = seg / "video_target.mp4"
     flat_proxy = seg / "video_src.mp4"
     if flat_target.is_file() and flat_proxy.is_file():
@@ -334,7 +350,7 @@ def resolve_seg_media(
         return {
             "target": flat_target,
             "proxy": flat_proxy,
-            "anchor": _first_existing(seg / "minimax_h3" / "image_1.png", seg / "anchor.png"),
+            "anchor": style_image,
             "prompt": prompt,
             "prompt_source": source,
             "layout": "flat",
@@ -366,7 +382,7 @@ def resolve_seg_media(
     return {
         "target": target,
         "proxy": proxy,
-        "anchor": _first_existing(seg / "minimax_h3" / "image_1.png"),
+        "anchor": style_image,
         "prompt": prompt,
         "prompt_source": source,
         "layout": "nested",
@@ -448,6 +464,7 @@ def main() -> None:
             proxy_stream=args.proxy_stream,
             prose_style=args.contract_prose,
             allow_teacher=args.allow_teacher_prompt,
+            anchor_source=args.anchor_source,
         )
         if media is None:
             incomplete.append(f"{seg.name}: {reason}")

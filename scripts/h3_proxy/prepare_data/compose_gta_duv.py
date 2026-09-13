@@ -75,6 +75,15 @@ def parse_args() -> argparse.Namespace:
         "VAE latent, which the 2x2 patch cannot tile.",
     )
     p.add_argument(
+        "--out-width",
+        type=int,
+        default=0,
+        help="Resample the streams to this width before composing, with --out-height. The encoder "
+        "refuses to resize a DUV video, so the grid has to be decided here; 336x192 is the released "
+        "CWM proxy geometry. Zero keeps the native width and only applies --height's crop.",
+    )
+    p.add_argument("--out-height", type=int, default=0, help="See --out-width.")
+    p.add_argument(
         "--semantic-palette",
         choices=("standard11", "cwm12"),
         default="standard11",
@@ -93,6 +102,21 @@ def build_palette(kind: str, class_ids: list[int]) -> dict[int, tuple[int, int]]
     if len(class_ids) > len(slots):
         raise SystemExit(f"cwm12 has {len(slots)} codes but the semantic map declares {len(class_ids)} classes.")
     return {class_id: slots[index] for index, class_id in enumerate(sorted(class_ids))}
+
+
+def resample_nearest(plane: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Index-preserving resize.
+
+    Both planes here are code books, not images: the semantic plane holds class ids and the depth
+    plane holds a quantised log-z. Any interpolating filter would average two codes into a third
+    that means something else -- a road/sky boundary would grow a rim of "vehicle". Nearest is the
+    only filter that keeps every output pixel a value that was actually observed.
+    """
+    if plane.shape[1] == width and plane.shape[0] == height:
+        return plane
+    rows = (np.arange(height) * plane.shape[0] // height).clip(0, plane.shape[0] - 1)
+    cols = (np.arange(width) * plane.shape[1] // width).clip(0, plane.shape[1] - 1)
+    return plane[rows[:, None], cols[None, :]]
 
 
 def read_class_ids(seg: Path) -> list[int]:
@@ -272,11 +296,16 @@ def main() -> None:
                       f"semantic ids {sorted(int(x) for x in np.unique(ids0)[:16])}")
             if args.probe_only:
                 continue
-            composed = [
-                compose_frame(decode_depth_grey(depth), semantic_ids(semantic), palette)
-                for depth, semantic in zip(depth_frames, semantic_frames, strict=True)
-            ]
-            if args.height and composed[0].shape[0] != args.height:
+            resize = bool(args.out_width and args.out_height)
+            composed = []
+            for depth, semantic in zip(depth_frames, semantic_frames, strict=True):
+                grey, ids = depth, semantic_ids(semantic)
+                if resize:
+                    grey = resample_nearest(grey, args.out_width, args.out_height)
+                    ids = resample_nearest(ids, args.out_width, args.out_height)
+                composed.append(compose_frame(decode_depth_grey(grey), ids, palette))
+            # --out-* already chose a tileable grid, so the 720 -> 704 crop only applies otherwise.
+            if not resize and args.height and composed[0].shape[0] != args.height:
                 if args.height > composed[0].shape[0]:
                     raise ValueError(f"--height {args.height} is taller than {composed[0].shape[0]}")
                 trim = composed[0].shape[0] - args.height
