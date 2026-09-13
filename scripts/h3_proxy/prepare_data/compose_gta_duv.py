@@ -26,8 +26,13 @@ from fractions import Fraction
 import json
 import math
 from pathlib import Path
+import sys
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from vlm_filter import add_filter_arguments, load_vlm_filter  # noqa: E402
 
 DEPTH_NEAR = 0.1
 DEPTH_FAR = 256.0
@@ -91,6 +96,7 @@ def parse_args() -> argparse.Namespace:
         "'standard11' collapses eight classes out of. Changing this changes the proxy pixels, so "
         "a cache encoded under one palette cannot be compared against a run under the other.",
     )
+    add_filter_arguments(p)
     return p.parse_args()
 
 
@@ -239,11 +245,24 @@ def probe_video_fps(path: Path) -> float:
 
 
 def write_split_manifests(root: Path, names: list[str], *, val_count: int = 24) -> None:
-    """Train/val jsonl so the existing --split train/val path works."""
+    """Train/val jsonl so the existing --split train/val path works.
+
+    ``names`` is the composed set, not everything on disk, so the split is drawn over the clips that
+    actually survived the corpus gate. A split written over the full corpus would hand the manifest
+    builders val ids they then filter away, shrinking the held-out set for no stated reason.
+    """
     directory = root / "manifests"
     directory.mkdir(exist_ok=True)
-    if list(directory.glob("*_train.jsonl")) or list(directory.glob("*_val.jsonl")):
+    existing = list(directory.glob("*_train.jsonl")) + list(directory.glob("*_val.jsonl"))
+    if existing:
+        print(f"Keeping the split already in {directory}: {', '.join(path.name for path in sorted(existing))}. "
+              "Delete them to redraw it over this run's clips.")
         return
+    if len(names) < 2:
+        raise SystemExit(f"A split needs at least two clips; {len(names)} survived.")
+    # Capped at half the corpus. Without this a set smaller than val_count lands entirely in val
+    # and train comes out empty, which reads as a successful run right up until training starts.
+    val_count = max(1, min(val_count, len(names) // 2))
     step = max(1, len(names) // val_count)
     val = {names[i] for i in list(range(0, len(names), step))[:val_count]}
     train = [name for name in names if name not in val]
@@ -260,16 +279,30 @@ def main() -> None:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
     segs = sorted(path for path in root.glob("seg_*") if path.is_dir())
-    if args.limit:
-        segs = segs[: args.limit]
     if not segs:
         raise SystemExit(f"No seg_* under {root}")
 
+    # Filter before composing, not after: a rejected clip's DUV is a few seconds of lossless
+    # encoding that nothing will ever read.
+    vlm = load_vlm_filter(root, args)
+    if vlm is not None:
+        vlm.report(on_disk={path.name for path in segs})
+        rejected = [path.name for path in segs if not vlm.verdict(path.name)[0]]
+        segs = [path for path in segs if vlm.verdict(path.name)[0]]
+        print(f"  composing {len(segs)}, skipping {len(rejected)} the judge rejected")
+        if not segs:
+            raise SystemExit("Every clip was rejected. Lower --min-vlm-score or pass --vlm-filter none.")
+    if args.limit:
+        segs = segs[: args.limit]
+
+    composed_names: list[str] = []
     written = skipped = failed = 0
     for index, seg in enumerate(segs):
         depth_path, semantic_path, duv_path = (seg / "proxy" / "depth.mp4", seg / "proxy" / "semantic.mp4",
                                                seg / "proxy" / "duv.mp4")
         if duv_path.is_file() and not args.overwrite and not args.probe_only:
+            # Already composed on an earlier run, so still part of the corpus for the split.
+            composed_names.append(seg.name)
             skipped += 1
             continue
         if not depth_path.is_file() or not semantic_path.is_file():
@@ -313,6 +346,7 @@ def main() -> None:
                 bottom = composed[0].shape[0] - (trim - top)
                 composed = [frame[top:bottom] for frame in composed]
             write_duv(duv_path, composed, probe_video_fps(depth_path))
+            composed_names.append(seg.name)
             written += 1
             if written % 20 == 0:
                 print(f"[{index + 1}/{len(segs)}] wrote {written}")
@@ -322,8 +356,10 @@ def main() -> None:
 
     if not args.probe_only:
         print(f"Done: {written} written, {skipped} skipped, {failed} failed")
-        if written:
-            write_split_manifests(root, [path.name for path in sorted(root.glob("seg_*")) if path.is_dir()])
+        if composed_names and not args.limit:
+            write_split_manifests(root, sorted(composed_names))
+        elif args.limit:
+            print(f"  --limit {args.limit} was set, so no split was written; rerun without it.")
 
 
 if __name__ == "__main__":
