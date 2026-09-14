@@ -37,6 +37,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import sys
@@ -61,7 +62,85 @@ def parse_args() -> argparse.Namespace:
                         "sets the expectation for the norm ratio.")
     parser.add_argument("--max-steps", type=int, default=0, help="training.loop.max_train_steps.")
     parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="training.optimizer.min_lr_ratio.")
+    parser.add_argument("--base-snapshot",
+                        default="",
+                        help="MiniMax-H3 snapshot, e.g. /data/models/MiniMax-H3. Reports ||B@A|| against the "
+                        "norm of the base weight it is added to, which is what decides whether a converged "
+                        "adapter is even large enough to change the output. Only matched tensors are read.")
     return parser.parse_args()
+
+
+def base_weight_index(snapshot: Path) -> dict[str, Path]:
+    """Base parameter name -> the file holding it, for the Ref2VA partition.
+
+    ``transformer_ref/`` is the partition this stage trains. ``transformer/`` is T2VA/FL2VA and
+    would quietly supply the wrong denominator.
+    """
+    directory = snapshot / "transformer_ref"
+    if not directory.is_dir():
+        raise SystemExit(f"{directory} does not exist. --base-snapshot wants the snapshot root, the "
+                         "directory holding transformer_ref/.")
+    for index_name in ("diffusion_pytorch_model.safetensors.index.json", "model.safetensors.index.json"):
+        index = directory / index_name
+        if index.is_file():
+            weight_map = json.loads(index.read_text(encoding="utf-8")).get("weight_map") or {}
+            if weight_map:
+                return {name: directory / shard for name, shard in weight_map.items()}
+    shards = sorted(directory.glob("*.safetensors"))
+    if not shards:
+        raise SystemExit(f"No safetensors and no index under {directory}.")
+    from safetensors import safe_open
+
+    mapping: dict[str, Path] = {}
+    for shard in shards:
+        with safe_open(str(shard), framework="pt") as handle:
+            for name in handle.keys():
+                mapping[name] = shard
+    return mapping
+
+
+def base_key_for(module: str, index: dict[str, Path]) -> str | None:
+    """The base weight a LoRA module adapts, or None when the names do not line up.
+
+    A training FQN carries wrappers the snapshot has no idea about -- a ``roles.student.transformer.``
+    prefix and a ``.checkpointed`` segment from the gradient-checkpointing wrapper -- so the longest
+    matching suffix is what identifies the parameter.
+    """
+    parts = [part for part in module.split(".") if part != "checkpointed"]
+    for start in range(len(parts)):
+        candidate = ".".join(parts[start:]) + ".weight"
+        if candidate in index:
+            return candidate
+    tail = ".".join(parts[-3:]) + ".weight"
+    matches = [name for name in index if name.endswith(tail)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def base_norms(modules: list[str], snapshot: Path) -> tuple[dict[str, float], list[str]]:
+    """Frobenius norm of each module's base weight, and the modules that did not match."""
+    from safetensors import safe_open
+
+    index = base_weight_index(snapshot)
+    print(f"base snapshot: {len(index)} tensors under {snapshot / 'transformer_ref'}")
+    wanted: dict[str, str] = {}
+    unmatched: list[str] = []
+    for module in modules:
+        key = base_key_for(module, index)
+        if key is None:
+            unmatched.append(module)
+        else:
+            wanted[module] = key
+
+    # Grouped by shard so each file is opened once rather than once per tensor.
+    by_shard: dict[Path, set[str]] = {}
+    for key in wanted.values():
+        by_shard.setdefault(index[key], set()).add(key)
+    cache: dict[str, float] = {}
+    for shard, keys in by_shard.items():
+        with safe_open(str(shard), framework="pt") as handle:
+            for key in sorted(keys):
+                cache[key] = handle.get_tensor(key).detach().float().norm().item()
+    return {module: cache[key] for module, key in wanted.items()}, unmatched
 
 
 def module_name(key: str) -> str:
@@ -130,6 +209,39 @@ def lr_integral(step: int, warmup: int, max_steps: int, min_ratio: float) -> flo
         progress = min(1.0, (index - warmup) / span)
         total += min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
     return total
+
+
+def report_base_relative(rows: list[tuple[str, float, float, float]], snapshot: Path, *, top: int) -> None:
+    """How far each checkpoint moved its base weight, in units of that weight.
+
+    ``||B@A||`` on its own says nothing: 0.7 is large next to a weight of norm 2 and invisible next
+    to one of norm 200. The ratio is what says whether a converged adapter had the room to change
+    the output at all, which is the difference between "the data does not ask for this" and "the
+    adapter is too small to express it".
+    """
+    norms, unmatched = base_norms([row[0] for row in rows], snapshot)
+    if unmatched:
+        print(f"  {len(unmatched)} modules had no matching base weight, e.g. {unmatched[0]}")
+    if not norms:
+        print("  No module matched a base weight, so no ratio can be reported.")
+        return
+
+    matched = [row for row in rows if row[0] in norms]
+    base_total = math.sqrt(sum(norms[row[0]]**2 for row in matched))
+    early_total = math.sqrt(sum(row[1]**2 for row in matched))
+    late_total = math.sqrt(sum(row[2]**2 for row in matched))
+    print(f"\nbase-relative offset over {len(matched)} matched modules:")
+    print(f"  ||W_base|| {base_total:.6g}")
+    print(f"  ||B@A|| / ||W_base||: early {early_total / base_total:.3e}, late {late_total / base_total:.3e}")
+
+    ratios = sorted(
+        ((row[2] / norms[row[0]] if norms[row[0]] > 1e-12 else float("inf"), row[0], row[2], norms[row[0]])
+         for row in matched),
+        reverse=True)
+    print(f"  largest {top} per-module ratios:")
+    for ratio, name, delta, base in ratios[:top]:
+        print(f"    {ratio:.3e}  {name}  (||B@A|| {delta:.4g} / ||W|| {base:.4g})")
+    print(f"  smallest ratio: {ratios[-1][0]:.3e} at {ratios[-1][1]}")
 
 
 def main() -> None:
@@ -207,6 +319,9 @@ def main() -> None:
         print(f"VERDICT: the two deltas are nearly unrelated (cos {cosine:.3f}). The updates are churning "
               "rather than accumulating, which more steps will not fix. Suspect the learning rate, the "
               "batch, or a conditioning signal the loss cannot attribute.")
+
+    if args.base_snapshot:
+        report_base_relative(rows, Path(args.base_snapshot).expanduser(), top=args.top)
 
     rows.sort(key=lambda row: row[2], reverse=True)
     print(f"\ntop {args.top} modules by late ||B@A||:")
