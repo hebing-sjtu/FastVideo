@@ -465,9 +465,39 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
     return sample
 
 
+MEDIA_KEYS = ("target", *PROXY_KEYS, "anchor")
+
+
+def preflight_media(entries: list[dict[str, Any]], root: Path) -> None:
+    """Stop on a wrong ``--root`` before the VAE and the text encoder load.
+
+    Every path a seg manifest writes is relative and ``--root`` defaults to the launch directory, so
+    pointing it at the checkout instead of the dataset is the easy mistake -- and it currently costs
+    minutes of model loading followed by one identical ENOENT per clip, which reads like a corrupt
+    corpus rather than a mistyped flag.
+
+    A few entries are sampled rather than one. A single clip that lost a file is a real failure that
+    belongs in the per-clip log; every sampled clip missing everything is the flag.
+    """
+    sample = entries[:3]
+    reports = []
+    for entry in sample:
+        present = [str(entry[key]) for key in MEDIA_KEYS if entry.get(key)]
+        missing = [value for value in present if not (root / value).exists()]
+        if len(missing) != len(present) or not present:
+            return
+        reports.append(missing[0])
+    resolved = root.resolve()
+    raise SystemExit(
+        f"None of the media in the first {len(sample)} manifest entries exists under --root.\n"
+        f"  --root resolves to {resolved}\n"
+        f"  tried e.g. {resolved / reports[0]}\n"
+        "  Manifest paths are relative, so --root has to be the dataset directory that holds the "
+        "seg_*/ subdirectories, not the checkout.")
+
+
 def main() -> None:
     args = parse_args()
-    init_single_process_distributed()
     root = Path(args.root).expanduser()
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -477,7 +507,9 @@ def main() -> None:
     entries = entries[args.shard_index::args.num_shards]
     if not entries:
         raise SystemExit(f"Manifest shard {args.shard_index}/{args.num_shards} is empty")
+    preflight_media(entries, root)
 
+    init_single_process_distributed()
     encoders = Encoders(
         Path(args.model_path).expanduser().resolve(),
         device=args.device,
