@@ -318,6 +318,20 @@ def main() -> None:
     print(f"  ||late - early|| / ||early||: {moved / total_early:.3f}")
     print(f"  cos(new motion, accumulated): {advance:.3f}")
 
+    # The increment split along and across the delta it is added to. Independent noise increments are
+    # perpendicular in high dimensions, so the parallel part is what a consistent gradient leaves
+    # behind and the perpendicular part is what cancels out over a longer run. The null model is
+    # sharp: a pure random walk has <D_early, D_late> = ||D_early||^2 exactly, hence a cosine of
+    # ||D_early|| / ||D_late|| and nothing along the accumulated direction.
+    along = advance * moved if moved > 1e-12 else 0.0
+    across = math.sqrt(max(0.0, moved**2 - along**2))
+    split = f"  increment {moved:.4g} = {along:.4g} along + {across:.4g} across"
+    if along > 1e-12:
+        split += f"  (1 : {across / along:.0f})"
+    print(split)
+    print(f"  random-walk null: cos(early, late) would be {1 / growth:.4f} if every increment were "
+          f"independent noise; observed {cosine:.4f}")
+
     if args.warmup_steps and args.max_steps:
         early_step, late_step = (int(path.name.rsplit("-", 1)[-1]) for path in (early_path, late_path))
         integral_early = lr_integral(early_step, args.warmup_steps, args.max_steps, args.min_lr_ratio)
@@ -325,6 +339,15 @@ def main() -> None:
         print(f"\nschedule: warmup {args.warmup_steps}, max {args.max_steps}, min ratio {args.min_lr_ratio}")
         print(f"  peak-rate-equivalent steps: step {early_step} -> {integral_early:.1f}, "
               f"step {late_step} -> {integral_late:.1f}  (ratio {integral_late / max(integral_early, 1e-9):.2f})")
+        # Only the aligned part of the increment survives averaging, so extrapolating it is what says
+        # whether finishing the schedule can reach a useful magnitude or whether the run is already done.
+        spent = integral_late - integral_early
+        remaining = lr_integral(args.max_steps, args.warmup_steps, args.max_steps, args.min_lr_ratio) - integral_late
+        if spent > 1e-9 and remaining > 0 and along > 0:
+            projected = total_late + along * remaining / spent
+            print(f"  at this interval's drift rate ({along:.3g} of aligned motion per {spent:.0f} "
+                  f"equivalent steps), the {remaining:.0f} left in the schedule add "
+                  f"{along * remaining / spent:.3g}, taking ||B@A|| {total_late:.3g} -> {projected:.3g}.")
         if early_step < args.warmup_steps:
             print(f"  NOTE: step {early_step} is mid-warmup, so its learning rate was "
                   f"{early_step / args.warmup_steps:.0%} of peak and its integral is small. Two checkpoints "
