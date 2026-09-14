@@ -104,6 +104,13 @@ EVERY=$(( STEP > 0 ? STEP : 1 ))
 
 GEOM="$(python scripts/h3_proxy/describe_cache.py "$CACHE" --emit-flags)"
 
+# A resume whose key names disagree with this config loads nothing and says nothing, so settle that
+# from the checkpoint's own saved config before the GPUs are touched.
+if [[ -n "$CKPT" ]]; then
+    python scripts/h3_proxy/probe_resume.py "$CKPT" --config "$CONFIG"
+    echo
+fi
+
 echo "eval-only:"
 echo "  step            $STEP"
 echo "  checkpoint      ${CKPT:-<none: base model, LoRA is zero>}"
