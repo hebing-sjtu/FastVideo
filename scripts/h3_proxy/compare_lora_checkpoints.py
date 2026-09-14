@@ -11,9 +11,12 @@ without generating anything:
 * it moved, and the two deltas point in unrelated directions, so the updates are churning and more
   steps will not accumulate into anything.
 
-The discriminator is the angle, not the magnitude. A norm that grew while the direction held means
-one consistent descent direction is being integrated; a norm that grew while the direction turned
-over means each batch is pulling somewhere else.
+The discriminator is the angle between the *increment* and the accumulated delta. ``cos(early, late)``
+is not it: whenever the norm barely grew, that cosine is pinned near 1 by construction and cannot
+separate "kept pushing the same way" from "stopped moving". ``cos(late - early, early)`` can.
+
+Magnitude still decides whether any of it matters, which is what ``--base-snapshot`` is for. A delta
+of norm 3 against a backbone of norm 10000 changes nothing observable no matter how well aimed it is.
 
 What is measured is the effective weight delta ``B @ A``. ``MergedLoRALinear.forward`` computes
 ``x @ A.T @ B.T`` and scales by ``alpha / rank``, which the H3 recipe pins to 128/128 = 1, so the
@@ -105,15 +108,23 @@ def base_key_for(module: str, index: dict[str, Path]) -> str | None:
     A training FQN carries wrappers the snapshot has no idea about -- a ``roles.student.transformer.``
     prefix and a ``.checkpointed`` segment from the gradient-checkpointing wrapper -- so the longest
     matching suffix is what identifies the parameter.
+
+    ``.0.weight`` is tried alongside ``.weight`` because ``attn.to_out`` is an ``nn.ModuleList``
+    whose Linear is ``to_out.0``, while LoRA wraps it under the list's own name. Without this, 50 of
+    the 200 modules -- every ``to_out`` -- silently drop out of the ratio.
     """
     parts = [part for part in module.split(".") if part != "checkpointed"]
     for start in range(len(parts)):
-        candidate = ".".join(parts[start:]) + ".weight"
-        if candidate in index:
-            return candidate
-    tail = ".".join(parts[-3:]) + ".weight"
-    matches = [name for name in index if name.endswith(tail)]
-    return matches[0] if len(matches) == 1 else None
+        stem = ".".join(parts[start:])
+        for candidate in (stem + ".weight", stem + ".0.weight"):
+            if candidate in index:
+                return candidate
+    tail = ".".join(parts[-3:])
+    for suffix in (tail + ".weight", tail + ".0.weight"):
+        matches = [name for name in index if name.endswith(suffix)]
+        if len(matches) == 1:
+            return matches[0]
+    return None
 
 
 def base_norms(modules: list[str], snapshot: Path) -> tuple[dict[str, float], list[str]]:
@@ -242,6 +253,12 @@ def report_base_relative(rows: list[tuple[str, float, float, float]], snapshot: 
     for ratio, name, delta, base in ratios[:top]:
         print(f"    {ratio:.3e}  {name}  (||B@A|| {delta:.4g} / ||W|| {base:.4g})")
     print(f"  smallest ratio: {ratios[-1][0]:.3e} at {ratios[-1][1]}")
+    if ratios[-1][0] == 0.0:
+        print("    A ratio of exactly zero is the float32 floor, not a dead parameter: the trace the norm "
+              "comes from went slightly negative and was clamped. Read it as 'below what float32 resolves'.")
+    print(f"\n  For scale: a LoRA that visibly changes a diffusion model's behaviour sits at 1e-2..1e-1 here.\n"
+          f"  Reaching 1e-2 from {late_total / base_total:.1e} needs {1e-2 * base_total / max(late_total, 1e-12):.0f}x "
+          "the current delta.")
 
 
 def main() -> None:
@@ -290,9 +307,16 @@ def main() -> None:
     cosine = total_inner / (total_early * total_late)
     # ||D_late - D_early||, from the same three quantities.
     moved = math.sqrt(max(0.0, total_late**2 - 2 * total_inner + total_early**2))
+    # <D_early, D_late - D_early> / (||D_early|| ||D_late - D_early||), from the same three scalars.
+    # cos(early, late) is pinned near 1 whenever the norm barely grew -- at growth 1.01 it cannot
+    # tell "kept pushing the same way" from "stopped moving" -- so the angle that carries the
+    # information is between the *new* motion and what had already accumulated.
+    advance = ((total_inner - total_early**2) / (total_early * moved)) if moved > 1e-12 else float("nan")
     print(f"  growth ||late||/||early||: {growth:.3f}")
-    print(f"  direction cos(early, late): {cosine:.4f}")
+    print(f"  direction cos(early, late): {cosine:.4f}"
+          f"{'   <- uninformative at this growth; read the next line' if growth < 1.05 else ''}")
     print(f"  ||late - early|| / ||early||: {moved / total_early:.3f}")
+    print(f"  cos(new motion, accumulated): {advance:.3f}")
 
     if args.warmup_steps and args.max_steps:
         early_step, late_step = (int(path.name.rsplit("-", 1)[-1]) for path in (early_path, late_path))
@@ -307,18 +331,23 @@ def main() -> None:
                   "inside or straddling warmup are much closer in training than their step numbers suggest.")
 
     print()
-    if cosine > 0.9:
-        print("VERDICT: the later delta is a larger step in the same direction "
-              f"(cos {cosine:.3f}). The updates are accumulating, so identical-looking samples mean the "
-              "magnitude has not yet reached the point of changing the output -- a question of steps and "
-              "learning rate, not of a broken signal.")
-    elif cosine > 0.5:
-        print(f"VERDICT: the direction is holding but drifting (cos {cosine:.3f}). Learning is directed; "
-              "expect slower accumulation than the norm growth alone suggests.")
+    if moved / total_early < 0.02:
+        print(f"VERDICT: the delta is standing still -- it moved {moved / total_early:.1%} of its own norm "
+              "across this interval. Neither coherent descent nor a random walk is that slow, so the step "
+              "size is the binding constraint, not the number of steps. cos(early, late) near 1 here says "
+              "nothing about direction; it is what any near-stationary pair produces.")
+    elif advance > 0.5:
+        print(f"VERDICT: the new motion extends the accumulated delta (cos {advance:.3f}). The updates are "
+              "accumulating, so identical-looking samples mean the magnitude has not yet reached the point "
+              "of changing the output -- a question of steps and learning rate, not of a broken signal.")
+    elif advance > 0.1:
+        print(f"VERDICT: the new motion is mostly sideways to what had accumulated (cos {advance:.3f}). Some "
+              "of each step lengthens the delta and most of it rotates it, so the norm will grow far more "
+              "slowly than the step count suggests.")
     else:
-        print(f"VERDICT: the two deltas are nearly unrelated (cos {cosine:.3f}). The updates are churning "
-              "rather than accumulating, which more steps will not fix. Suspect the learning rate, the "
-              "batch, or a conditioning signal the loss cannot attribute.")
+        print(f"VERDICT: the new motion is orthogonal to the accumulated delta (cos {advance:.3f}). The "
+              "updates are churning rather than accumulating, which more steps will not fix. Suspect the "
+              "learning rate, the batch, or a conditioning signal the loss cannot attribute.")
 
     if args.base_snapshot:
         report_base_relative(rows, Path(args.base_snapshot).expanduser(), top=args.top)
