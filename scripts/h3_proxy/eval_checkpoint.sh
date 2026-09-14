@@ -33,6 +33,8 @@
 set -euo pipefail
 
 CONFIG=examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml
+CONFIG_GIVEN=""
+CONFIG_SOURCE="$CONFIG"
 NPROC=8
 STEP=""
 RUN=""
@@ -49,15 +51,13 @@ while [[ $# -gt 0 ]]; do
         --val-json) VAL_JSON="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --tag) TAG="$2"; shift 2 ;;
-        --config) CONFIG="$2"; shift 2 ;;
+        --config) CONFIG="$2"; CONFIG_GIVEN=1; CONFIG_SOURCE="$2"; shift 2 ;;
         --nproc) NPROC="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 [[ -n "$STEP" ]] || { echo "--step is required." >&2; exit 2; }
-[[ -n "$CACHE" ]] || { echo "--cache is required." >&2; exit 2; }
-[[ -n "$VAL_JSON" ]] || { echo "--val-json is required." >&2; exit 2; }
 if [[ ! "$STEP" =~ ^[0-9]+$ ]]; then
     echo "--step must be a non-negative integer, got '$STEP'." >&2
     exit 2
@@ -66,9 +66,10 @@ if [[ "$STEP" -gt 0 && -z "$RUN" ]]; then
     echo "--run is required for --step $STEP; only --step 0 has no checkpoint to resume." >&2
     exit 2
 fi
-if [[ ! -f "$VAL_JSON" ]]; then
-    echo "--val-json not found: $VAL_JSON" >&2
-    exit 2
+# Step 0 has no checkpoint to read the run's own settings back out of, so it must be told them.
+if [[ "$STEP" -eq 0 ]]; then
+    [[ -n "$CACHE" ]] || { echo "--cache is required for --step 0, which has no checkpoint to read it from." >&2; exit 2; }
+    [[ -n "$VAL_JSON" ]] || { echo "--val-json is required for --step 0." >&2; exit 2; }
 fi
 
 # Refuse before loading a 134 GB snapshot, rather than after.
@@ -91,6 +92,28 @@ if [[ "$STEP" -gt 0 ]]; then
     fi
 fi
 
+# The checkpoint stores the whole training config, so what the run trained on is a fact on disk
+# rather than something to remember. Evaluating against that config makes every setting that shapes
+# a state-dict key agree by construction, which is the failure probe_resume.py otherwise only warns
+# about, and picks up the cache and validation set the run actually used.
+if [[ -n "$CKPT" ]]; then
+    if [[ -z "$CONFIG_GIVEN" ]]; then
+        # GNU mktemp wants the X's last, so name the file inside a temp dir rather than templating
+        # a suffix onto it.
+        CONFIG_DIR="$(mktemp -d)"
+        trap 'rm -rf "$CONFIG_DIR"' EXIT
+        CONFIG="$CONFIG_DIR/from_checkpoint_$STEP.yaml"
+        python scripts/h3_proxy/probe_resume.py "$CKPT" --dump-config "$CONFIG" >/dev/null
+        CONFIG_SOURCE="the config saved in checkpoint-$STEP"
+    fi
+    [[ -n "$CACHE" ]] || CACHE="$(python scripts/h3_proxy/probe_resume.py "$CKPT" --emit training.data.data_path)"
+    [[ -n "$VAL_JSON" ]] || VAL_JSON="$(python scripts/h3_proxy/probe_resume.py "$CKPT" \
+        --emit callbacks.validation.dataset_file)"
+fi
+
+[[ -d "$CACHE" ]] || { echo "cache directory not found: $CACHE" >&2; exit 2; }
+[[ -f "$VAL_JSON" ]] || { echo "validation set not found: $VAL_JSON" >&2; exit 2; }
+
 # A live training directory prunes by highest step, so writing a final checkpoint into it would
 # delete the early ones this eval exists to inspect.
 [[ -n "$OUT" ]] || OUT="/data/binghe/h3_proxy/runs/eval_$(basename "$CACHE")_step${STEP}${TAG:+_$TAG}/checkpoints"
@@ -105,7 +128,8 @@ EVERY=$(( STEP > 0 ? STEP : 1 ))
 GEOM="$(python scripts/h3_proxy/describe_cache.py "$CACHE" --emit-flags)"
 
 # A resume whose key names disagree with this config loads nothing and says nothing, so settle that
-# from the checkpoint's own saved config before the GPUs are touched.
+# before the GPUs are touched. When the config came from the checkpoint this can only agree, and
+# saying so is still worth the two seconds: it also reports how many LoRA weights are in the save.
 if [[ -n "$CKPT" ]]; then
     python scripts/h3_proxy/probe_resume.py "$CKPT" --config "$CONFIG"
     echo
@@ -114,11 +138,16 @@ fi
 echo "eval-only:"
 echo "  step            $STEP"
 echo "  checkpoint      ${CKPT:-<none: base model, LoRA is zero>}"
+echo "  config          $CONFIG_SOURCE"
 echo "  cache           $CACHE"
 echo "  geometry        $GEOM"
 echo "  validation set  $VAL_JSON"
 echo "  output          $OUT"
 echo "  every_steps     $EVERY   (must divide $STEP)"
+echo
+echo "  Watch for 'lora_B norm 0 -> <nonzero>' from the resume; that line is the proof the"
+echo "  checkpoint's weights reached the model that samples. It raises rather than logs if the"
+echo "  norm is still zero."
 echo
 
 RESUME=()

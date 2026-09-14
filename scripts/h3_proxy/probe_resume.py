@@ -52,6 +52,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("checkpoint", help="A checkpoint-<step> directory.")
     parser.add_argument("--config", help="The YAML the eval would run with. Omit to only describe the checkpoint.")
     parser.add_argument("--list-keys", type=int, default=4, help="How many sample LoRA key names to print.")
+    parser.add_argument("--emit",
+                        help="Print one dotted key from the checkpoint's saved training config and exit, e.g. "
+                        "training.data.data_path. For callers that must not restate what the run trained on.")
+    parser.add_argument("--dump-config",
+                        help="Write the checkpoint's saved training config to this path as YAML and exit. Running "
+                        "the eval against it makes every key-shaping setting agree by construction, instead of "
+                        "agreeing because someone picked the same file.")
     return parser.parse_args()
 
 
@@ -63,7 +70,7 @@ def dig(tree: Any, path: tuple[str, ...]) -> Any:
     return tree
 
 
-def load_training_config(checkpoint: Path) -> dict[str, Any]:
+def load_training_config(checkpoint: Path, *, quiet: bool = False) -> dict[str, Any]:
     meta_path = checkpoint / "metadata.json"
     if not meta_path.is_file():
         raise SystemExit(f"No metadata.json in {checkpoint}, so the training config it was saved with is unknown.")
@@ -72,7 +79,8 @@ def load_training_config(checkpoint: Path) -> dict[str, Any]:
     config = metadata.get("config")
     if not isinstance(config, dict):
         raise SystemExit(f"{meta_path} holds no 'config', so there is nothing to compare against.")
-    print(f"checkpoint step {metadata.get('step')!r} from {checkpoint}")
+    if not quiet:
+        print(f"checkpoint step {metadata.get('step')!r} from {checkpoint}")
     return config
 
 
@@ -132,6 +140,20 @@ def compare(training: dict[str, Any], eval_config: dict[str, Any], where: str) -
 def main() -> None:
     args = parse_args()
     checkpoint = Path(args.checkpoint).expanduser()
+
+    if args.emit:
+        value = dig(load_training_config(checkpoint, quiet=True), tuple(args.emit.split(".")))
+        if value is None:
+            raise SystemExit(f"{args.emit} is not in the config saved with {checkpoint}.")
+        print(value)
+        return
+
+    if args.dump_config:
+        with open(args.dump_config, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(load_training_config(checkpoint, quiet=True), handle, sort_keys=False)
+        print(args.dump_config)
+        return
+
     training = load_training_config(checkpoint)
     describe_saved_tensors(checkpoint, args.list_keys)
 

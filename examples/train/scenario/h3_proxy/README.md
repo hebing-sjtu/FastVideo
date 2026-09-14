@@ -332,11 +332,25 @@ To sample a checkpoint and stop, use the wrapper rather than assembling the over
 
 ```bash
 scripts/h3_proxy/eval_checkpoint.sh \
-    --step 150 \
-    --run /data/binghe/h3_proxy/runs/gta_v2_cwm/checkpoints \
-    --cache /data/binghe/h3_proxy/cache/gta_v2_cwm \
-    --val-json /data/binghe/h3_proxy/gta_v2_validation_val6.json
+    --step 150 --run /data/binghe/h3_proxy/runs/gta_v2_cwm/checkpoints
 ```
+
+`CheckpointManager._write_metadata` stores the whole training config in the checkpoint's
+`metadata.json`, so the config, the cache and the validation set are read back from the checkpoint
+instead of being named again. That is not just brevity: evaluating against the run's own config
+makes every setting that shapes a state-dict key agree *by construction* rather than because
+someone picked the same file. `--config`, `--cache` and `--val-json` still override it, and
+`--step 0` requires the last two, being the one case with no checkpoint to read them from.
+
+The proof that the weights arrived is the resume's own log line, before any sampling is paid for:
+
+```
+Loaded 400/400 requested model tensors (400 supplied, 0 unmatched); lora_B norm 0 -> 0.597282
+```
+
+`lora_B` is zero-initialised, so that norm leaving zero is the single fact that distinguishes "this
+checkpoint's weights are in the model" from "this is the base model". A nonzero count of `lora_B`
+tensors whose norm is still exactly zero after a load raises instead of sampling.
 
 Four settings have to agree for that to mean what it says, and each one fails quietly on its own:
 
@@ -354,6 +368,12 @@ Four settings have to agree for that to mean what it says, and each one fails qu
 - **the geometry** must match the cache, per the three settings above. The wrapper reads it from the
   cache with `describe_cache.py --emit-flags`, which refuses to print a partial or mixed answer, so
   it cannot drift from what was encoded.
+- **the LoRA rank, `target_modules` and `enable_gradient_checkpointing_type`** must match the run
+  that wrote the checkpoint, because all three rename or reshape every saved key and DCP matches by
+  name under `strict=False`. The last one is the easiest to miss: it wraps each block in a module
+  that inserts a `.checkpointed.` segment, so enabling it on one side only matches nothing at all.
+  `probe_resume.py` diffs these against the checkpoint's saved config with no GPU and no model
+  build, and the wrapper runs it as a preflight.
 
 `--step 0` is the base-model baseline and is the one case that legitimately has no checkpoint. The
 wrapper also writes to a fresh `output_dir` by default, since a training directory prunes by highest
