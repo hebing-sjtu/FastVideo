@@ -75,10 +75,30 @@ def module_name(key: str) -> str:
     return ".".join(parts[:cut])
 
 
+def require_loadable(checkpoint: Path) -> None:
+    """Fail before torch does, naming the checkpoints that can actually be read.
+
+    An interrupted save leaves ``dcp/`` in place without ``.metadata``, which ``resolve`` accepts
+    and DCP then reports as a bare ``FileNotFoundError`` on a path nobody asked for. Since the usual
+    reason to be here is that a run was interrupted, the inventory is the useful part.
+    """
+    if (checkpoint / "dcp" / ".metadata").is_file():
+        return
+    siblings = sorted(
+        (path for path in checkpoint.parent.glob("checkpoint-*") if path.is_dir()),
+        key=lambda path: int(path.name.rsplit("-", 1)[-1]) if path.name.rsplit("-", 1)[-1].isdigit() else -1,
+    )
+    complete = [path.name for path in siblings if (path / "dcp" / ".metadata").is_file()]
+    print(f"{checkpoint.name} has a dcp/ directory but no dcp/.metadata, so its save did not finish.")
+    print(f"  loadable checkpoints in {checkpoint.parent}: {', '.join(complete) if complete else '(none)'}")
+    raise SystemExit(2)
+
+
 def read_pairs(checkpoint: Path) -> dict[str, tuple]:
     """``{module: (A, B)}`` for every role LoRA projection in one checkpoint."""
     import torch.distributed.checkpoint as dcp
 
+    require_loadable(checkpoint)
     reader = dcp.FileSystemReader(str(checkpoint / "dcp"))
     keys = [key for key in sorted(reader.read_metadata().state_dict_metadata) if is_role_lora_weight(key)]
     if not keys:
@@ -118,6 +138,10 @@ def main() -> None:
 
     early_path, late_path = resolve(Path(args.early)), resolve(Path(args.late))
     print(f"early: {early_path.name}\nlate:  {late_path.name}")
+    # Both before either read, so an unfinished save is reported with the inventory rather than
+    # after minutes of loading the other checkpoint's 200 tensors.
+    require_loadable(early_path)
+    require_loadable(late_path)
     early, late = read_pairs(early_path), read_pairs(late_path)
 
     shared = sorted(set(early) & set(late))
