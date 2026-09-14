@@ -59,6 +59,10 @@ artifacts.
 
 ## Data
 
+[CACHE_GEOMETRY.md](CACHE_GEOMETRY.md) records the `.pt` payload, the three geometries frozen at
+encode time and the consumer flags that must match them, plus the encode failures that report
+success. `scripts/h3_proxy/describe_cache.py` reads all of it back off an existing cache.
+
 One `.pt` per clip, written by the encoder:
 
 ```bash
