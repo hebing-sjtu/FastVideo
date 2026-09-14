@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
                         "sets the expectation for the norm ratio.")
     parser.add_argument("--max-steps", type=int, default=0, help="training.loop.max_train_steps.")
     parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="training.optimizer.min_lr_ratio.")
+    parser.add_argument("--global-batch",
+                        type=int,
+                        default=0,
+                        help="(num_gpus / sp_size) * train_batch_size * gradient_accumulation_steps. Required to "
+                        "compare two runs whose batch differs: the per-step drift-to-noise carries a factor of "
+                        "sqrt(batch), so without this a run gets credit for its batch size alone.")
     parser.add_argument("--base-snapshot",
                         default="",
                         help="MiniMax-H3 snapshot, e.g. /data/models/MiniMax-H3. Reports ||B@A|| against the "
@@ -354,8 +360,19 @@ def main() -> None:
         # intervals and schedules differ -- which is what makes it usable for ablating the
         # conditioning signal rather than just describing one run.
         if spent > 1e-9 and across > 1e-12:
-            print(f"  per-step drift-to-noise, (along/across)/sqrt(equivalent steps): "
-                  f"{(along / across) / math.sqrt(spent):.5f}  (comparable across runs)")
+            per_step = (along / across) / math.sqrt(spent)
+            print(f"  per-step drift-to-noise, (along/across)/sqrt(equivalent steps): {per_step:.5f}")
+            # Gradient noise falls as 1/sqrt(batch) while the true gradient does not, so the per-step
+            # figure carries a factor of sqrt(batch). Two runs at different batch sizes cannot be read
+            # against each other until that is divided out, and the run with the larger batch would
+            # otherwise be credited for its batch alone -- which is exactly the confound in an
+            # ablation that changes the conditioning signal and the batch at the same time.
+            if args.global_batch > 0:
+                print(f"  per-sample drift-to-noise, /sqrt(equivalent steps * batch {args.global_batch}): "
+                      f"{per_step / math.sqrt(args.global_batch):.5f}  <- compare runs on this")
+            else:
+                print("  pass --global-batch to also print the batch-free figure, which is the one two "
+                      "runs at different batch sizes can be compared on.")
         if early_step < args.warmup_steps:
             print(f"  NOTE: step {early_step} is mid-warmup, so its learning rate was "
                   f"{early_step / args.warmup_steps:.0%} of peak and its integral is small. Two checkpoints "
