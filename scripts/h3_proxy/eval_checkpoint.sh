@@ -200,6 +200,36 @@ if [[ -n "$CKPT" ]]; then
     RESUME=(--training.checkpoint.resume_from_checkpoint "$CKPT")
 fi
 
+# Two eval runs are only comparable if everything except the checkpoint was the same, and an mp4
+# does not record what produced it. Without this, "the videos differ" cannot be told apart from
+# "the runs sampled different clips at a different geometry", which is the mistake that made the
+# step-0/step-138 comparison meaningless in the first place.
+mkdir -p "$OUT"
+# Values travel as argv rather than interpolated into the source, so a path holding a quote writes
+# a manifest instead of a syntax error.
+python - "$OUT/eval_manifest.json" \
+    "$STEP" "$CKPT" "$CONFIG_SOURCE" "$CACHE" "$GEOM" "$VAL_JSON" "$EVERY" "$NPROC" <<'PY'
+import json, sys
+
+out, step, ckpt, config_source, cache, geometry, val_json, every, nproc = sys.argv[1:10]
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "step": int(step),
+            "checkpoint": ckpt,
+            "config_source": config_source,
+            "cache": cache,
+            "geometry": geometry,
+            "val_json": val_json,
+            "every_steps": int(every),
+            "nproc": int(nproc),
+        },
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+PY
+
 set -x
 torchrun --standalone --nproc_per_node "$NPROC" \
     -m fastvideo.train.entrypoint.train \
