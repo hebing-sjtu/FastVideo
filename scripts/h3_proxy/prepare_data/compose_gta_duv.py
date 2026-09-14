@@ -7,26 +7,32 @@ so this composes one. Decoding is always DATA_F.md's ``depth.mp4`` convention --
 inverted log-z over ``[near, far]``, near bright, ``gray == 0`` invalid -- with
 the range taken from the seg's ``metadata.json`` when it declares one.
 
-The output convention is a choice, and ``cwm`` is the default because that is
-what the checkpoint being finetuned was pretrained on. ``cwm_h3_inference.duv``
-defines it:
+The output convention is a choice. ``cwm`` is the default, matching
+``cwm_h3_inference.duv``:
 
 * R is ``(ln(far) - ln(d)) / (ln(far) - ln(near))`` over **0.3-256 m**,
-  quantised to uint16 then divided by 257 for the 8-bit plane. **Near is bright**
-  and **invalid is 0**, which also means the far plane and the sky share code 0;
-  CWM does not separate them.
-* G/B are ``(SEMANTIC_U[id % 4], SEMANTIC_V[id // 4])`` -- u varies fastest, so
-  the grid is read row-major over ``SEMANTIC_V``. Twelve classes, all distinct.
+  quantised to uint16 then divided by 257 for the 8-bit plane. Near is bright and
+  invalid is 0, so the far plane and the sky share code 0.
+* G/B are ``(SEMANTIC_U[id % 4], SEMANTIC_V[id // 4])`` -- u varies fastest.
+  Twelve mid-tone codes, all distinct, touching neither 0 nor 255.
 
-``abot`` reproduces what the first cache was built with: forward log-z over
-0.1-8000 m with sky pinned to 255, and DATA_F's semantic *colours*, which are
-not injective. Both differences are silent, so a cache built under one
-convention cannot be compared against a run under the other.
+The adapter is trained from scratch on base Ref2VA, which has never seen a DUV
+frame, so none of this is chosen to match a pretrained association -- there is
+none to match. It is chosen on information content:
 
-GTA's eleven labels are mapped onto CWM's twelve by meaning rather than by
-number, so ``road`` lands on ``road_paved`` and not on ``vegetation``, and all
-eleven get distinct codes. ``player`` and ``ped`` take the two slots nothing else
-wants; ``--player-slot`` decides which of them keeps ``human``.
+* 0.3-256 m is the range the source actually reports. ABot's 0.1-8000 m spends
+  30% of its codes on distances that never occur, leaving 4.55% per code against
+  2.68% here.
+* Sky sharing code 0 with the far plane costs nothing *because* the semantic
+  channel is injective -- sky has its own (G, B). Under the collapsing palette it
+  did not, which is why ABot needed R's 255 as a sky sentinel and then could not
+  tell sky from depth-invalid.
+* The codes have to survive the video VAE, which reconstructs the extremes
+  worst. DATA_F's colours lean on 0 and 255; this grid avoids both.
+
+``abot`` reproduces what the first cache was built with, for comparing against
+that run. Every difference is silent, so a cache built under one convention
+cannot be compared against a run under the other.
 
 Usage::
 
@@ -89,18 +95,35 @@ ABOT_GB = {
     10: (0, 0),  # prop
 }
 
-# GTA label (DATA_F.md) -> CWM label (INFERENCE.md), by meaning. Mapping by number instead would
-# put road on vegetation and vehicle on terrain, which are codes the model has seen and associated
-# with something else -- worse than an unseen code.
+# GTA label (DATA_F.md) -> CWM label (INFERENCE.md).
 #
 #   GTA  0 sky 1 player 2 ped 3 vehicle 4 building 5 road 6 ground 7 vegetation 8 terrain 9 water 10 prop
 #   CWM  0 void_unknown 1 sky 2 water 3 terrain 4 road_paved 5 vegetation
 #        6 building_structure 7 infrastructure 8 human 9 animal 10 vehicle 11 prop
 #
-# `ground` is DATA_F's paved-but-not-asphalt surface -- pavement, kerb, markings -- which CWM has no
-# class for; `infrastructure` is the nearest, and it is at least not `road_paved`.
+# Which slot a label lands in does not matter, and it is worth being explicit about why, because the
+# names invite an argument that has no stake in it. The adapter here is trained from scratch on base
+# MiniMax-H3 Ref2VA, which has never seen a DUV frame -- the association between these (G, B) pairs
+# and what they denote lives in CWM's LoRA, which is not loaded. To this model `(96, 128)` is two
+# bytes, so the assignment is a relabelling and any injective one trains the same.
+#
+# Three properties do matter:
+#
+#   injective -- the collapsed table it replaces made road and sky the same symbol, and no amount of
+#     training separates a symbol from itself;
+#   well separated after the VAE -- the proxy reaches the DiT through the video VAE, so codes have to
+#     survive a lossy round trip. CWM's 4x3 grid is mid-tone with 64 and 85 apart on the two axes and
+#     touches neither 0 nor 255, which is where reconstruction is worst. DATA_F's colours lean on
+#     both extremes;
+#   stable across the corpus -- the one property a cache silently violates when the palette changes
+#     under it.
+#
+# Following CWM's meanings anyway costs nothing and keeps the option of checking a clip against the
+# released LoRA, which needs the codes to line up.
 GTA_TO_CWM = {
     0: 1,   # sky            -> sky
+    1: 8,   # player         -> human
+    2: 9,   # ped            -> animal        (see above: an arbitrary free slot, not a claim)
     3: 10,  # vehicle        -> vehicle
     4: 6,   # building       -> building_structure
     5: 4,   # road           -> road_paved
@@ -109,29 +132,6 @@ GTA_TO_CWM = {
     8: 3,   # terrain        -> terrain
     9: 2,   # water          -> water
     10: 11,  # prop          -> prop
-}
-
-# The nine above leave two CWM slots unused, 0 void_unknown and 9 animal, and the two human labels
-# need both -- ego and NPC have to stay separable, since telling "the thing the camera is bolted to"
-# from "a thing that walks past" is exactly what a camera-control proxy is for.
-#
-# Which label keeps `human` is a real choice, not a formality:
-#
-#   void_unknown (default): ped keeps `human`. NPCs are what `human` means in any pretraining
-#     distribution -- they walk through the scene and their pixels move with the world. The player
-#     is the odd one out: a camera-locked avatar pinned to a fixed screen anchor, whose pixels show
-#     no world parallax at all and which is not a world object from a world model's point of view.
-#     void_unknown is the taxonomy's slot for precisely that, and it carries the weakest appearance
-#     prior -- which matters most here, because whatever prior the player's code carries is stamped
-#     on the same screen region in every frame, and a constant is something the loss can latch onto
-#     instead of the proxy's geometry.
-#
-#   human: player keeps `human` and ped falls to `animal`. Reads more naturally and costs more --
-#     `animal` has a strong and wrong appearance prior, and it lands on the objects that actually
-#     do move with the world.
-PLAYER_SLOTS = {
-    "void_unknown": {1: 0, 2: 8},
-    "human": {1: 8, 2: 9},
 }
 
 
@@ -167,15 +167,6 @@ def parse_args() -> argparse.Namespace:
         "colours). Both differences are silent, so caches under the two cannot be compared.",
     )
     p.add_argument(
-        "--player-slot",
-        choices=sorted(PLAYER_SLOTS),
-        default="void_unknown",
-        help="Which CWM class the player takes, given that ego and NPC need separate codes and only "
-        "'void_unknown' and 'animal' are free. Default gives ped 'human' and the player "
-        "'void_unknown', the weakest prior, because the player is a camera-locked avatar rather "
-        "than a world object. 'human' gives the player 'human' and pushes ped onto 'animal'.",
-    )
-    p.add_argument(
         "--source-near",
         type=float,
         default=SOURCE_NEAR,
@@ -198,18 +189,15 @@ def cwm_code(label: int) -> tuple[int, int]:
     return CWM_SEMANTIC_U[label % 4], CWM_SEMANTIC_V[label // 4]
 
 
-def build_palette(kind: str, class_ids: list[int], *, player_slot: str = "void_unknown") -> dict[int, tuple[int, int]]:
+def build_palette(kind: str, class_ids: list[int]) -> dict[int, tuple[int, int]]:
     """GTA class id -> (G, B). All eleven labels get distinct codes."""
     if kind == "abot":
         return dict(ABOT_GB)
-    if player_slot not in PLAYER_SLOTS:
-        raise SystemExit(f"player_slot must be one of {sorted(PLAYER_SLOTS)}: {player_slot}")
-    mapping = GTA_TO_CWM | PLAYER_SLOTS[player_slot]
-    unknown = [class_id for class_id in class_ids if class_id not in mapping]
+    unknown = [class_id for class_id in class_ids if class_id not in GTA_TO_CWM]
     if unknown:
         raise SystemExit(f"semantic.json declares classes {unknown} that GTA_TO_CWM has no entry for. "
                          "Add them rather than letting them fall through to a neighbouring code.")
-    return {class_id: cwm_code(mapping[class_id]) for class_id in class_ids}
+    return {class_id: cwm_code(GTA_TO_CWM[class_id]) for class_id in class_ids}
 
 
 def read_source_depth_range(seg: Path, near: float, far: float) -> tuple[float, float, str]:
@@ -479,7 +467,7 @@ def main() -> None:
             semantic_frames = read_rgb_video(semantic_path)
             if len(depth_frames) != len(semantic_frames):
                 raise ValueError(f"depth {len(depth_frames)} frames vs semantic {len(semantic_frames)}")
-            palette = build_palette(args.convention, read_class_ids(seg), player_slot=args.player_slot)
+            palette = build_palette(args.convention, read_class_ids(seg))
             near, far, origin = read_source_depth_range(seg, args.source_near, args.source_far)
             ids0 = semantic_ids(semantic_frames[0])
             metres0 = decode_depth_grey(depth_frames[0], near, far)
