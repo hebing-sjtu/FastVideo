@@ -39,7 +39,9 @@ NPROC=8
 STEP=""
 RUN=""
 CACHE=""
+CACHE_FROM=""
 VAL_JSON=""
+VAL_JSON_FROM=""
 OUT=""
 TAG=""
 
@@ -106,13 +108,37 @@ if [[ -n "$CKPT" ]]; then
         python scripts/h3_proxy/probe_resume.py "$CKPT" --dump-config "$CONFIG" >/dev/null
         CONFIG_SOURCE="the config saved in checkpoint-$STEP"
     fi
-    [[ -n "$CACHE" ]] || CACHE="$(python scripts/h3_proxy/probe_resume.py "$CKPT" --emit training.data.data_path)"
-    [[ -n "$VAL_JSON" ]] || VAL_JSON="$(python scripts/h3_proxy/probe_resume.py "$CKPT" \
-        --emit callbacks.validation.dataset_file)"
+    if [[ -z "$CACHE" ]]; then
+        CACHE="$(python scripts/h3_proxy/probe_resume.py "$CKPT" --emit training.data.data_path)"
+        CACHE_FROM="checkpoint-$STEP"
+    fi
+    if [[ -z "$VAL_JSON" ]]; then
+        VAL_JSON="$(python scripts/h3_proxy/probe_resume.py "$CKPT" --emit callbacks.validation.dataset_file)"
+        VAL_JSON_FROM="checkpoint-$STEP"
+    fi
 fi
 
-[[ -d "$CACHE" ]] || { echo "cache directory not found: $CACHE" >&2; exit 2; }
-[[ -f "$VAL_JSON" ]] || { echo "validation set not found: $VAL_JSON" >&2; exit 2; }
+if [[ ! -d "$CACHE" ]]; then
+    echo "cache directory not found: $CACHE${CACHE_FROM:+  (from $CACHE_FROM)}" >&2
+    echo "Pass --cache. Caches on disk:" >&2
+    ls -d /data/binghe/h3_proxy/cache/*/ 2>/dev/null | sed 's/^/  /' >&2 || echo "  none" >&2
+    exit 2
+fi
+if [[ ! -f "$VAL_JSON" ]]; then
+    echo "validation set not found: $VAL_JSON${VAL_JSON_FROM:+  (from $VAL_JSON_FROM)}" >&2
+    if [[ -n "$VAL_JSON_FROM" ]]; then
+        # A run that kept validation off never read this field, so its saved value can be a default
+        # that was never true. Everything else in the config was exercised by training; this one
+        # alone can be fiction.
+        echo "That is what the run configured, but a run with validation off never reads it, so the" >&2
+        echo "value can be an untouched default. Pass --val-json. Validation sets on disk:" >&2
+    else
+        echo "Pass an existing --val-json. Validation sets on disk:" >&2
+    fi
+    ls /data/binghe/h3_proxy/*validation*.json 2>/dev/null | sed 's/^/  /' >&2 || echo "  none" >&2
+    echo "  (build one with scripts/h3_proxy/prepare_data/seg_dir_to_validation_json.py)" >&2
+    exit 2
+fi
 
 # A live training directory prunes by highest step, so writing a final checkpoint into it would
 # delete the early ones this eval exists to inspect.
