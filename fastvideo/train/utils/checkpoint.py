@@ -315,6 +315,57 @@ def dcp_model_has_key_substring(
         full_name.startswith(full_prefix) and substring in full_name for full_name in metadata.state_dict_metadata)
 
 
+def _assert_lora_left_zero(states: dict[str, Any], resolved: Path) -> None:
+    """Fail a resume that restored no LoRA, rather than sampling the base model believing otherwise.
+
+    Runs after ``dcp.load`` and its barrier, so the one all-reduce here cannot interleave with DCP's
+    own collectives. The reduce matters for more than accuracy: every rank holds a shard, so a
+    per-rank verdict could differ between them and half the job would raise while the other half
+    waited on the next collective.
+    """
+    from fastvideo.training.checkpointing_utils import ModelWrapper
+
+    wrappers = {key: value for key, value in states.items() if isinstance(value, ModelWrapper)}
+    local_sq = 0.0
+    local_elements = 0
+    reports: list[str] = []
+    for key, wrapper in wrappers.items():
+        report = wrapper.load_report
+        if report is None:
+            continue
+        local_sq += float(report["lora_b_sq_after"])
+        local_elements += int(report["lora_b_elements"])
+        reports.append(f"{key}: {report['applied']}/{report['requested']} applied, "
+                       f"{report['supplied']} supplied")
+    if not local_elements:
+        # No LoRA in this model, so there is nothing this check can speak to.
+        return
+
+    totals = torch.tensor([local_sq, float(local_elements)], dtype=torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        totals = totals.cuda() if torch.cuda.is_available() else totals
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    total_sq, total_elements = float(totals[0]), float(totals[1])
+
+    if total_sq > 0:
+        logger.info(
+            "Resume restored a live LoRA: global lora_B norm %.6g over %.0f elements. %s",
+            total_sq**0.5,
+            total_elements,
+            "; ".join(reports),
+        )
+        return
+
+    raise RuntimeError(
+        f"Resumed {resolved} into a model with {total_elements:.0f} lora_B elements whose global norm is still "
+        f"exactly 0. lora_B is zero-initialised, so the adapter is the identity and this job would sample the "
+        f"base model while reporting a resumed step. Per role: {'; '.join(reports) or 'no model state was loaded'}. "
+        f"Either the checkpoint holds no LoRA weights, or its key names disagree with this model -- compare "
+        f"lora.rank, lora.target_modules and enable_gradient_checkpointing_type against the config the run "
+        f"trained under, since the last inserts a '.checkpointed.' segment into every key. "
+        f"scripts/h3_proxy/probe_resume.py diffs them from the checkpoint's own metadata.json.")
+
+
 class _RoleModuleContainer(torch.nn.Module):
     """Ephemeral container to expose multiple role modules as a single
     ``nn.Module``.
@@ -570,6 +621,7 @@ class CheckpointManager:
         logger.info("Loading Phase 2 checkpoint from %s", resolved)
         dcp.load(states, checkpoint_id=str(resolved / "dcp"))
         _barrier()
+        _assert_lora_left_zero(states, resolved)
         logger.info("Checkpoint loaded; resuming from step=%s", step)
         return step
 

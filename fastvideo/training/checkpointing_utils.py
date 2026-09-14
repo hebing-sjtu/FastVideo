@@ -13,36 +13,56 @@ from fastvideo.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _lora_b_norm(model: torch.nn.Module) -> tuple[float, int]:
-    """Total ``lora_B`` norm and count. Zero norm with a nonzero count means an inert adapter.
+def _local_shard(param: torch.Tensor) -> torch.Tensor:
+    """This rank's slice of a possibly-sharded parameter, as a plain tensor.
+
+    Anything that touches a DTensor's full value is a collective. These numbers are gathered from
+    inside ``dcp.load``, where issuing one would interleave with DCP's own collectives and desync
+    the ranks, so the shard is all that may be read.
+    """
+    to_local = getattr(param, "to_local", None)
+    return to_local() if callable(to_local) else param
+
+
+def lora_b_local_stats(model: torch.nn.Module) -> tuple[float, int]:
+    """Sum of squares and element count of this rank's ``lora_B`` shards. No collectives.
 
     ``lora_B`` is zero-initialised so the adapter starts as the identity. That makes its norm the
-    one number that separates "a checkpoint's weights are in this model" from "this model is the
-    base model", which no key count can establish: a load that matches nothing and a load that was
-    never asked for anything both leave it at exactly zero.
+    one number separating "a checkpoint's weights are in this model" from "this model is the base
+    model", which no key count can establish: a load that matched nothing and a load that was never
+    asked for anything both leave it at exactly zero.
     """
-    total, count = 0.0, 0
+    total, elements = 0.0, 0
     for name, param in model.named_parameters():
-        if "lora_B" in name:
-            total += float(param.detach().float().pow(2).sum())
-            count += 1
-    return total**0.5, count
+        if "lora_B" not in name:
+            continue
+        shard = _local_shard(param.detach())
+        if shard.numel():
+            total += float(shard.float().pow(2).sum())
+            elements += int(shard.numel())
+    return total, elements
 
 
 class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
 
     def __init__(self, model: torch.nn.Module) -> None:
         self.model = model
+        # Read by `CheckpointManager.maybe_resume` after the load, where collectives are safe.
+        self.load_report: dict[str, Any] | None = None
 
-    def state_dict(self) -> dict[str, Any]:
-        state_dict = get_model_state_dict(self.model)
-
-        param_requires_grad = {
+    def _requested_keys(self) -> set[str]:
+        """The keys `state_dict` would return, computed without the all-gather it needs to return
+        their values. `named_parameters` is local metadata; `get_model_state_dict` is a collective.
+        """
+        return {
             k.replace("._checkpoint_wrapped_module.", ".")
             for k, v in self.model.named_parameters() if v.requires_grad
         }
 
-        filtered_state_dict = {k: v for k, v in state_dict.items() if k in param_requires_grad}
+    def state_dict(self) -> dict[str, Any]:
+        state_dict = get_model_state_dict(self.model)
+
+        filtered_state_dict = {k: v for k, v in state_dict.items() if k in self._requested_keys()}
 
         return filtered_state_dict
 
@@ -57,44 +77,47 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         # A renamed module, activation checkpointing enabled on one side only (it inserts a
         # `.checkpointed.` segment), or a different LoRA rank all land here as a quiet no-op.
         #
-        # So report what was actually asked for and applied, and measure the adapter rather than
-        # trusting the key bookkeeping.
-        before, lora_params = _lora_b_norm(self.model)
-        requested = set(self.state_dict())
+        # So record what was asked for and measure the adapter rather than trusting key bookkeeping.
+        # DCP calls this from inside `dcp.load`, between its own collectives, so everything gathered
+        # here is rank-local and the verdict is left to `maybe_resume` once the load has joined.
+        before, elements = lora_b_local_stats(self.model)
+        requested = self._requested_keys()
         supplied = set(state_dict)
         set_model_state_dict(
             self.model,
             model_state_dict=state_dict,
             options=StateDictOptions(strict=False),
         )
-        after, _ = _lora_b_norm(self.model)
+        after, _ = lora_b_local_stats(self.model)
 
-        missing = requested - supplied
+        missing = sorted(requested - supplied)
+        self.load_report = {
+            "requested": len(requested),
+            "supplied": len(supplied),
+            "applied": len(requested & supplied),
+            "missing": missing,
+            "lora_b_sq_before": before,
+            "lora_b_sq_after": after,
+            "lora_b_elements": elements,
+        }
         logger.info(
-            "Loaded %d/%d requested model tensors (%d supplied, %d unmatched); lora_B norm %.6g -> %.6g",
+            "Loaded %d/%d requested model tensors (%d supplied, %d unmatched); "
+            "local lora_B norm %.6g -> %.6g over %d elements",
             len(requested & supplied),
             len(requested),
             len(supplied),
             len(missing),
-            before,
-            after,
+            before**0.5,
+            after**0.5,
+            elements,
         )
         if missing:
             logger.warning(
                 "%d requested tensors were absent from the checkpoint and keep their constructed value, "
                 "e.g. %s",
                 len(missing),
-                ", ".join(sorted(missing)[:4]),
+                ", ".join(missing[:4]),
             )
-        if lora_params and after == 0.0:
-            raise RuntimeError(
-                f"Resumed a checkpoint into a model with {lora_params} lora_B tensors, but their total norm is "
-                f"still exactly 0, so the adapter is the identity and this would sample the base model while "
-                f"reporting a resumed step. DCP was asked for {len(requested)} tensors and {len(supplied)} came "
-                f"back. Either the checkpoint holds no LoRA weights, or its key names disagree with this model -- "
-                f"compare the LoRA rank, target_modules and enable_gradient_checkpointing_type in the config used "
-                f"to evaluate against the one used to train, since the last inserts a '.checkpointed.' segment "
-                f"into every key.")
 
 
 class OptimizerWrapper(torch.distributed.checkpoint.stateful.Stateful):
