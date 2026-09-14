@@ -46,6 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample", type=int, default=8, help="How many .pt to open per cache.")
     parser.add_argument("--all", action="store_true", help="Open every .pt. Slow; reads the embeddings too.")
     parser.add_argument("--list-missing", type=int, default=20, help="How many missing names to print.")
+    parser.add_argument("--emit-flags",
+                        action="store_true",
+                        help="Print only the consume flags, on one line, and exit nonzero if the cache is mixed or "
+                        "the geometry cannot be read. For callers that must not restate the geometry by hand.")
     return parser.parse_args()
 
 
@@ -126,28 +130,48 @@ def reconcile(directory: Path, manifest: Path, present: set[str], show: int) -> 
               f"{' ...' if len(extra) > show else ''}")
 
 
-def describe(directory: Path, args: argparse.Namespace) -> dict[str, Any] | None:
+def describe(directory: Path, args: argparse.Namespace, *, quiet: bool = False) -> dict[str, Any] | None:
     paths = sorted(directory.glob("*.pt"))
-    print(f"\n{directory}")
+    if not quiet:
+        print(f"\n{directory}")
     if not paths:
-        print("  no .pt files")
+        if not quiet:
+            print("  no .pt files")
         return None
     chosen = pick(paths, args.sample, args.all)
-    print(f"  {len(paths)} clips, {len(chosen)} opened")
+    if not quiet:
+        print(f"  {len(paths)} clips, {len(chosen)} opened")
 
     collected: dict[str, Counter] = {}
     for path in chosen:
         for key, value in geometry(torch.load(path, map_location="cpu", weights_only=False)).items():
             collected.setdefault(key, Counter())[value] += 1
 
-    for key in ("num_frames", "latent_frames", "target", "proxy", "anchor_canvas", "anchor_short_edge",
-                "cwm_system", "camera"):
-        if key in collected:
-            print(render(key, collected[key]))
+    if not quiet:
+        for key in ("num_frames", "latent_frames", "target", "proxy", "anchor_canvas", "anchor_short_edge",
+                    "cwm_system", "camera"):
+            if key in collected:
+                print(render(key, collected[key]))
 
-    if args.manifest:
-        reconcile(directory, Path(args.manifest), {path.stem for path in paths}, args.list_missing)
+        if args.manifest:
+            reconcile(directory, Path(args.manifest), {path.stem for path in paths}, args.list_missing)
     return {key: values for key, values in collected.items()}
+
+
+def emit_flags(collected: dict[str, Any] | None, directory: Path) -> None:
+    """One line of overrides, or a nonzero exit. Never a partial line a caller might still use."""
+    target = (collected or {}).get("target")
+    anchor = (collected or {}).get("anchor_short_edge")
+    proxy = (collected or {}).get("proxy")
+    if not target or not anchor or not proxy:
+        raise SystemExit(f"{directory}: cannot read the geometry, so there are no flags to emit.")
+    if len(target) > 1 or len(anchor) > 1 or len(proxy) > 1:
+        raise SystemExit(f"{directory}: the cache is mixed, so no single set of flags consumes it.")
+    height, width = next(iter(target))
+    proxy_h, proxy_w = next(iter(proxy))
+    print(f"--training.data.num_height {height} --training.data.num_width {width} "
+          f"--callbacks.validation.anchor_short_edge {next(iter(anchor))} "
+          f"--callbacks.validation.proxy_height {proxy_h} --callbacks.validation.proxy_width {proxy_w}")
 
 
 def print_flags(collected: dict[str, Any]) -> None:
@@ -176,6 +200,12 @@ def print_flags(collected: dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.emit_flags:
+        if len(args.cache) != 1:
+            raise SystemExit("--emit-flags describes one cache, so pass exactly one directory.")
+        directory = Path(args.cache[0]).expanduser()
+        emit_flags(describe(directory, args, quiet=True), directory)
+        return
     for name in args.cache:
         collected = describe(Path(name).expanduser(), args)
         if collected is not None:

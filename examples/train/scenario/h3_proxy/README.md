@@ -326,6 +326,39 @@ record is a full sampling trajectory at ~41.5k tokens, alongside a second text e
 clips every 250 steps is a few percent of wall clock, `every_steps: 20` would dominate the run.
 `offload_training_state` and `unload_pipeline_after_validation` are both on for the same reason.
 
+### Evaluating one checkpoint, without training
+
+To sample a checkpoint and stop, use the wrapper rather than assembling the overrides:
+
+```bash
+scripts/h3_proxy/eval_checkpoint.sh \
+    --step 150 \
+    --run /data/binghe/h3_proxy/runs/gta_v2_cwm/checkpoints \
+    --cache /data/binghe/h3_proxy/cache/gta_v2_cwm \
+    --val-json /data/binghe/h3_proxy/gta_v2_validation_val6.json
+```
+
+Four settings have to agree for that to mean what it says, and each one fails quietly on its own:
+
+- **`resume_from_checkpoint`** is the dangerous one. Omit it and the job does not complain — it
+  starts at step 0, and because a LoRA is zero-initialised it samples the *base model*, writes the
+  videos, and exits successfully. Compare those against a real step-0 baseline and they are
+  identical, which reads as "training changed nothing" rather than "the checkpoint never loaded".
+  The only evidence is the step in the filename, which you read after paying for the sampling. An
+  explicit path that does not exist does raise, so this is specifically the risk of *leaving the
+  flag out* — which is exactly what happens when a step-0 command gets reused as a template.
+  `Trainer.run` now logs which of the two cases it is at the moment it decides.
+- **`max_train_steps`** must equal the resumed step, or the loop is not empty and the job trains on.
+- **`every_steps`** must divide the resumed step, or `on_validation_begin` returns early and the job
+  finishes having logged nothing at all.
+- **the geometry** must match the cache, per the three settings above. The wrapper reads it from the
+  cache with `describe_cache.py --emit-flags`, which refuses to print a partial or mixed answer, so
+  it cannot drift from what was encoded.
+
+`--step 0` is the base-model baseline and is the one case that legitimately has no checkpoint. The
+wrapper also writes to a fresh `output_dir` by default, since a training directory prunes by highest
+step and would delete the early checkpoints the eval exists to inspect.
+
 ## Sampling
 
 `MiniMaxH3ProxyCameraPipeline` is the Ref2VA pipeline plus one stage that turns a requested
