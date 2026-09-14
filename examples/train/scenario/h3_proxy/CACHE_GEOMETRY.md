@@ -72,20 +72,54 @@ existing `.pt` files without touching the latents or loading the VAE.
 
 Confirmed by reading the files; re-confirm with `describe_cache.py` rather than trusting this table.
 
-| Cache | Clips | Target | Proxy | Anchor | DUV convention |
+| Cache | Clips | Target | Proxy | Anchor | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `cache/abot_train` (v2 text) | 9545 | — | 192 x 336 | 2048 | predicted proxy, flickers |
-| `cache/gta_train` (v1) | 972 | — | 704 x 1280 | 704 | pre-CWM; **both off-spec** |
-| `cache/gta_v2_train` | 762 | 768 x 1344 | 192 x 336 | 2048 | pre-CWM depth range and palette |
+| `cache/abot_train` | 9865 | 768 x 1344 | 192 x 336 | **768** | v1 window-scoped prompts; anchor off-spec |
+| `cache/gta_train` | 972 | 768 x 1344 | **704 x 1280** | **704** | v1 GTA; proxy and anchor both off-spec |
+| `cache/gta_v2_train` | 762 / 771 | 768 x 1344 | 192 x 336 | 2048 | pre-CWM depth range and palette |
 | `cache/gta_v2_cwm` | 771 | 704 x 1280 | 192 x 336 | 2048 | CWM: 0.3–256 m, injective 11-class |
 
 `gta_v2_train` is what run `gta_v2_b32_sp1` trained on, so its eval jobs need `768 / 1344 / 2048`.
 It holds 762 clips against a 771-row manifest: nine clips were never encoded, and since the loader
 scans the directory rather than the manifest, that never surfaced as an error.
 
-The v1 GTA cache is the one that deviates on both the proxy grid and the anchor short edge. The
-encoder's own note records that the run which cut the anchor to 768 could not make the proxy steer
-the camera, so treat any cache below a 2048 anchor as a separate experiment rather than a baseline.
+`cache/abot_train` has no `cwm_system` in `info`, which dates it to before the encoder recorded that
+field. A missing key there is a useful staleness signal: it means the cache predates whatever the
+encoder has learned since.
+
+Both v1 caches sit below a 2048 anchor, and the encoder's own note records that the run which cut
+the anchor to 768 could not make the proxy steer the camera. Treat either as a separate experiment
+rather than a baseline, and see the mismatch below before reading anything into their validation.
+
+## The validation callback re-derives conditioning, so four values must agree
+
+Training reads the anchor and proxy latents straight out of the cache. Validation does not: it
+rebuilds both from the source media, using its own settings. Four of them therefore have to repeat
+what the encoder was told, and none of them is checked against the cache.
+
+| `callbacks.validation.*` | Must equal |
+| --- | --- |
+| `anchor_short_edge` | the encoder's `--anchor-short-edge` |
+| `proxy_height` / `proxy_width` | the encoder's `--proxy-height` / `--proxy-width` |
+| `cwm_system_prompt` | the encoder's `--cwm-system` |
+| `lock_first_frame` | `models.student.lock_first_frame` |
+
+The callback's defaults are the released values — 2048, 192 x 336, `w0`, locked — so a cache built at
+the defaults needs no overrides at all. The failure mode is the reverse: overriding one of these to
+chase a cache that was itself built off-spec, or leaving a default in place against a cache that was
+not.
+
+An anchor mismatch is the expensive one, because it looks like a bad checkpoint. The anchor's canvas
+decides how many vision tokens it occupies, so validating a LoRA trained on a 768 anchor against a
+2048 one presents a token grid the model never saw. That is the configuration `proxy_bd_finetune_abot.yaml`
+shipped with: `data_path` pointed at a cache encoded with a 768 anchor while the callback rendered
+2048. Any conclusion drawn from that run's validation — including "the proxy does not steer the
+camera" — is about the mismatch until it is re-run with the two in agreement.
+
+A proxy mismatch is worse in kind though easier to spot. Left unpinned, a video reference resolves
+its canvas from its aspect ratio, which puts a 336 x 192 proxy onto the full 1344 x 768 canvas:
+37296 reference rows where training used 2442, from LANCZOS-upsampled frames. On a DUV that
+upsampling also averages unrelated depth codes into values no backend ever predicted.
 
 ## Failures that do not announce themselves
 

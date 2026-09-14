@@ -155,6 +155,13 @@ training:
     # whole 60 seconds, names things the clip never shows, and teaches the model to cover a minute
     # of story in five seconds. `--allow-episode-caption` opts back in; do not, and check the
     # builder's "window-scoped prompts: N/N" line before spending an encode.
+    #
+    # WARNING: this cache was encoded with `--anchor-short-edge 768`, which does not match
+    # `callbacks.validation.anchor_short_edge: 2048` below, and it holds the v1 window-scoped
+    # prompts. Validation on it renders an anchor token grid the model never trained on, so it
+    # reads as a bad checkpoint. Re-point this at a 2048-anchor re-encode, or lower the callback
+    # to 768, before reading anything into a validation panel. `scripts/h3_proxy/describe_cache.py`
+    # prints what any cache was built at; see CACHE_GEOMETRY.md.
     data_path: /data/binghe/h3_proxy/cache/abot_train
     # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
     preprocessed_data_type: t2va
