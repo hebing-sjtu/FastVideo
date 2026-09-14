@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
                         help="(num_gpus / sp_size) * train_batch_size * gradient_accumulation_steps. Required to "
                         "compare two runs whose batch differs: the per-step drift-to-noise carries a factor of "
                         "sqrt(batch), so without this a run gets credit for its batch size alone.")
+    parser.add_argument("--peak-lr",
+                        type=float,
+                        default=0.0,
+                        help="training.optimizer.learning_rate. Reports how much of the travel the schedule's "
+                        "learning rate permits has been used, which is what separates 'the gradient disagrees "
+                        "with itself' from 'the learning rate is the ceiling'.")
     parser.add_argument("--base-snapshot",
                         default="",
                         help="MiniMax-H3 snapshot, e.g. /data/models/MiniMax-H3. Reports ||B@A|| against the "
@@ -203,6 +209,39 @@ def read_pairs(checkpoint: Path) -> dict[str, tuple]:
     if not pairs:
         raise SystemExit(f"{checkpoint} has LoRA tensors but no module with both halves.")
     return pairs
+
+
+def report_lr_ceiling(late: dict[str, tuple], integral: float, peak_lr: float) -> None:
+    """Which constraint is binding: the learning rate, or the gradient agreeing with itself.
+
+    AdamW's per-parameter step is ``lr * m/sqrt(v)``, and that ratio sits near 1 wherever the
+    gradient keeps its sign, so the learning rate integrated over the schedule is a ceiling on how
+    far any single weight can travel. LoRA-B starts at exactly zero, which makes its current value
+    the distance travelled and lets it be read against that ceiling directly.
+
+    A run near the ceiling cannot be helped by more steps at this learning rate -- only by a larger
+    integral. A run far below it is held back by increments that cancel, and more integral would buy
+    proportionally less.
+    """
+    import torch
+
+    ceiling = peak_lr * integral
+    if ceiling <= 0:
+        return
+    b_tensors = [pair[1].detach().float() for pair in late.values()]
+    absmax = max(float(tensor.abs().max()) for tensor in b_tensors)
+    elements = sum(tensor.numel() for tensor in b_tensors)
+    rms = math.sqrt(sum(float(tensor.pow(2).sum()) for tensor in b_tensors) / max(elements, 1))
+    print(f"\nAdamW travel ceiling: peak lr {peak_lr:.3g} over {integral:.1f} equivalent steps "
+          f"= {ceiling:.3g} per weight")
+    print(f"  lora_B max|w| {absmax:.3g}  ({absmax / ceiling:.0%} of ceiling)")
+    print(f"  lora_B rms    {rms:.3g}  ({rms / ceiling:.1%} of ceiling)")
+    if absmax / ceiling > 0.5:
+        print("  The most consistently driven weights are already learning-rate bound, so more steps at this "
+              "rate cannot grow the delta much. Raising the magnitude means raising lr * equivalent steps.")
+    else:
+        print("  No weight is near the ceiling, so the learning rate is not what limits the delta; the "
+              "increments are cancelling. Raising lr would buy less than proportionally.")
 
 
 def lr_integral(step: int, warmup: int, max_steps: int, min_ratio: float) -> float:
@@ -375,6 +414,8 @@ def main() -> None:
             print(f"  NOTE: step {early_step} is mid-warmup, so its learning rate was "
                   f"{early_step / args.warmup_steps:.0%} of peak and its integral is small. Two checkpoints "
                   "inside or straddling warmup are much closer in training than their step numbers suggest.")
+        if args.peak_lr > 0:
+            report_lr_ceiling(late, integral_late, args.peak_lr)
 
     print()
     if moved / total_early < 0.02:
