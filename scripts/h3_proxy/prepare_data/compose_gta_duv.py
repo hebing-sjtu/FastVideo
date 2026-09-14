@@ -24,9 +24,9 @@ not injective. Both differences are silent, so a cache built under one
 convention cannot be compared against a run under the other.
 
 GTA's eleven labels are mapped onto CWM's twelve by meaning rather than by
-number, so ``road`` lands on ``road_paved`` and not on ``vegetation``. Only
-``player`` and ``ped`` collapse, both onto ``human``; ``--distinct-player-ped``
-splits them at the cost of calling one of them ``animal``.
+number, so ``road`` lands on ``road_paved`` and not on ``vegetation``, and all
+eleven get distinct codes. ``player`` and ``ped`` take the two slots nothing else
+wants; ``--player-slot`` decides which of them keeps ``human``.
 
 Usage::
 
@@ -101,8 +101,6 @@ ABOT_GB = {
 # class for; `infrastructure` is the nearest, and it is at least not `road_paved`.
 GTA_TO_CWM = {
     0: 1,   # sky            -> sky
-    1: 8,   # player         -> human
-    2: 8,   # ped            -> human
     3: 10,  # vehicle        -> vehicle
     4: 6,   # building       -> building_structure
     5: 4,   # road           -> road_paved
@@ -112,9 +110,29 @@ GTA_TO_CWM = {
     9: 2,   # water          -> water
     10: 11,  # prop          -> prop
 }
-# ped -> animal, only to make all eleven labels distinct. A lie the model has an association for,
-# which is why it is opt-in.
-PED_AS_ANIMAL = 9
+
+# The nine above leave two CWM slots unused, 0 void_unknown and 9 animal, and the two human labels
+# need both -- ego and NPC have to stay separable, since telling "the thing the camera is bolted to"
+# from "a thing that walks past" is exactly what a camera-control proxy is for.
+#
+# Which label keeps `human` is a real choice, not a formality:
+#
+#   void_unknown (default): ped keeps `human`. NPCs are what `human` means in any pretraining
+#     distribution -- they walk through the scene and their pixels move with the world. The player
+#     is the odd one out: a camera-locked avatar pinned to a fixed screen anchor, whose pixels show
+#     no world parallax at all and which is not a world object from a world model's point of view.
+#     void_unknown is the taxonomy's slot for precisely that, and it carries the weakest appearance
+#     prior -- which matters most here, because whatever prior the player's code carries is stamped
+#     on the same screen region in every frame, and a constant is something the loss can latch onto
+#     instead of the proxy's geometry.
+#
+#   human: player keeps `human` and ped falls to `animal`. Reads more naturally and costs more --
+#     `animal` has a strong and wrong appearance prior, and it lands on the objects that actually
+#     do move with the world.
+PLAYER_SLOTS = {
+    "void_unknown": {1: 0, 2: 8},
+    "human": {1: 8, 2: 9},
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,10 +167,13 @@ def parse_args() -> argparse.Namespace:
         "colours). Both differences are silent, so caches under the two cannot be compared.",
     )
     p.add_argument(
-        "--distinct-player-ped",
-        action="store_true",
-        help="Map ped to CWM's 'animal' so all eleven GTA labels get distinct codes. Off by default "
-        "because player and ped are both humans and the split costs a wrong association.",
+        "--player-slot",
+        choices=sorted(PLAYER_SLOTS),
+        default="void_unknown",
+        help="Which CWM class the player takes, given that ego and NPC need separate codes and only "
+        "'void_unknown' and 'animal' are free. Default gives ped 'human' and the player "
+        "'void_unknown', the weakest prior, because the player is a camera-locked avatar rather "
+        "than a world object. 'human' gives the player 'human' and pushes ped onto 'animal'.",
     )
     p.add_argument(
         "--source-near",
@@ -177,13 +198,13 @@ def cwm_code(label: int) -> tuple[int, int]:
     return CWM_SEMANTIC_U[label % 4], CWM_SEMANTIC_V[label // 4]
 
 
-def build_palette(kind: str, class_ids: list[int], *, distinct_player_ped: bool = False) -> dict[int, tuple[int, int]]:
-    """GTA class id -> (G, B)."""
+def build_palette(kind: str, class_ids: list[int], *, player_slot: str = "void_unknown") -> dict[int, tuple[int, int]]:
+    """GTA class id -> (G, B). All eleven labels get distinct codes."""
     if kind == "abot":
         return dict(ABOT_GB)
-    mapping = dict(GTA_TO_CWM)
-    if distinct_player_ped:
-        mapping[2] = PED_AS_ANIMAL
+    if player_slot not in PLAYER_SLOTS:
+        raise SystemExit(f"player_slot must be one of {sorted(PLAYER_SLOTS)}: {player_slot}")
+    mapping = GTA_TO_CWM | PLAYER_SLOTS[player_slot]
     unknown = [class_id for class_id in class_ids if class_id not in mapping]
     if unknown:
         raise SystemExit(f"semantic.json declares classes {unknown} that GTA_TO_CWM has no entry for. "
@@ -458,8 +479,7 @@ def main() -> None:
             semantic_frames = read_rgb_video(semantic_path)
             if len(depth_frames) != len(semantic_frames):
                 raise ValueError(f"depth {len(depth_frames)} frames vs semantic {len(semantic_frames)}")
-            palette = build_palette(args.convention, read_class_ids(seg),
-                                    distinct_player_ped=args.distinct_player_ped)
+            palette = build_palette(args.convention, read_class_ids(seg), player_slot=args.player_slot)
             near, far, origin = read_source_depth_range(seg, args.source_near, args.source_far)
             ids0 = semantic_ids(semantic_frames[0])
             metres0 = decode_depth_grey(depth_frames[0], near, far)

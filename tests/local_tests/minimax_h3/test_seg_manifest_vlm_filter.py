@@ -144,7 +144,7 @@ def test_the_semantic_code_indexes_u_fastest_like_cwm_does() -> None:
     assert len({compose.cwm_code(label) for label in range(12)}) == 12
 
 
-def test_the_cwm_palette_maps_by_meaning_and_only_collapses_the_two_humans() -> None:
+def test_the_cwm_palette_maps_by_meaning_and_keeps_all_eleven_distinct() -> None:
     """Road has to land on ``road_paved``. Mapping by number would put it on ``vegetation``."""
     compose = _load("compose_gta_duv")
     class_ids = list(range(11))
@@ -159,13 +159,36 @@ def test_the_cwm_palette_maps_by_meaning_and_only_collapses_the_two_humans() -> 
     assert cwm[0] == compose.cwm_code(1), "GTA sky -> CWM sky"
     assert cwm[7] == compose.cwm_code(5), "GTA vegetation -> CWM vegetation"
     assert cwm[0] != cwm[5], "sky and road are now separable without leaning on R"
-    # player and ped are both human; everything else is distinct.
-    assert cwm[1] == cwm[2]
-    assert len(set(cwm.values())) == 10
+    assert len(set(cwm.values())) == 11, "every label distinct, including ego vs NPC"
 
-    split = compose.build_palette("cwm", class_ids, distinct_player_ped=True)
-    assert len(set(split.values())) == 11
-    assert split[2] == compose.cwm_code(compose.PED_AS_ANIMAL)
+
+def test_ego_and_npc_never_share_a_code_under_either_player_slot() -> None:
+    """Telling the camera's own avatar from a passer-by is the point of separating them.
+
+    Which one keeps ``human`` is a judgement call, so both settings are pinned: the default leaves
+    ``human`` on the NPCs and puts the camera-locked player on ``void_unknown``, the weakest prior
+    available, and the alternative swaps that at the cost of calling NPCs ``animal``.
+    """
+    compose = _load("compose_gta_duv")
+    class_ids = list(range(11))
+    human, void, animal = compose.cwm_code(8), compose.cwm_code(0), compose.cwm_code(9)
+
+    default = compose.build_palette("cwm", class_ids)
+    assert default[1] == void and default[2] == human
+
+    swapped = compose.build_palette("cwm", class_ids, player_slot="human")
+    assert swapped[1] == human and swapped[2] == animal
+
+    for palette in (default, swapped):
+        assert palette[1] != palette[2]
+        assert len(set(palette.values())) == 11
+
+    try:
+        compose.build_palette("cwm", class_ids, player_slot="ped")
+    except SystemExit as error:
+        assert "player_slot" in str(error)
+    else:
+        raise AssertionError("an unknown player_slot was accepted")
 
 
 def test_a_class_the_mapping_has_no_entry_for_is_an_error_not_a_neighbouring_code() -> None:
