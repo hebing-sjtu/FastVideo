@@ -127,15 +127,97 @@ def test_the_teacher_edit_instruction_needs_an_explicit_opt_in(tmp_path: Path) -
     assert text.startswith("<Video 1>")
 
 
-def test_the_cwm_palette_gives_every_gta_class_its_own_code() -> None:
-    """``standard11`` collapses eleven labels onto six codes; ``cwm12`` does not collapse at all."""
+def test_the_semantic_code_indexes_u_fastest_like_cwm_does() -> None:
+    """``(U[label % 4], V[label // 4])``, not the cartesian product in the other order.
+
+    Both orderings produce twelve distinct pairs, so an injectivity check passes either way. This
+    is the assertion that catches the wrong twelve, which is a silent mismatch against everything
+    the checkpoint saw in pretraining.
+    """
+    compose = _load("compose_gta_duv")
+    u, v = compose.CWM_SEMANTIC_U, compose.CWM_SEMANTIC_V
+
+    assert compose.cwm_code(0) == (u[0], v[0])
+    assert compose.cwm_code(1) == (u[1], v[0])  # u moves first
+    assert compose.cwm_code(4) == (u[0], v[1])  # v only after four labels
+    assert compose.cwm_code(11) == (u[3], v[2])
+    assert len({compose.cwm_code(label) for label in range(12)}) == 12
+
+
+def test_the_cwm_palette_maps_by_meaning_and_only_collapses_the_two_humans() -> None:
+    """Road has to land on ``road_paved``. Mapping by number would put it on ``vegetation``."""
     compose = _load("compose_gta_duv")
     class_ids = list(range(11))
 
-    legacy = compose.build_palette("standard11", class_ids)
-    injective = compose.build_palette("cwm12", class_ids)
+    legacy = compose.build_palette("abot", class_ids)
+    cwm = compose.build_palette("cwm", class_ids)
 
     assert len(set(legacy.values())) == 6
-    assert legacy[0] == legacy[5]  # sky and road are the same symbol
-    assert len(set(injective.values())) == len(class_ids)
-    assert set(injective.values()) <= {(u, v) for u in compose.CWM_SEMANTIC_U for v in compose.CWM_SEMANTIC_V}
+    assert legacy[0] == legacy[5], "the legacy table's sky and road really are the same symbol"
+
+    assert cwm[5] == compose.cwm_code(4), "GTA road -> CWM road_paved"
+    assert cwm[0] == compose.cwm_code(1), "GTA sky -> CWM sky"
+    assert cwm[7] == compose.cwm_code(5), "GTA vegetation -> CWM vegetation"
+    assert cwm[0] != cwm[5], "sky and road are now separable without leaning on R"
+    # player and ped are both human; everything else is distinct.
+    assert cwm[1] == cwm[2]
+    assert len(set(cwm.values())) == 10
+
+    split = compose.build_palette("cwm", class_ids, distinct_player_ped=True)
+    assert len(set(split.values())) == 11
+    assert split[2] == compose.cwm_code(compose.PED_AS_ANIMAL)
+
+
+def test_a_class_the_mapping_has_no_entry_for_is_an_error_not_a_neighbouring_code() -> None:
+    """A twelfth GTA label must stop the run. Falling through would silently relabel it."""
+    compose = _load("compose_gta_duv")
+    try:
+        compose.build_palette("cwm", [*range(11), 11])
+    except SystemExit as error:
+        assert "GTA_TO_CWM" in str(error)
+    else:
+        raise AssertionError("an unmapped class id was accepted")
+
+
+def test_the_depth_plane_is_bright_near_and_zero_where_there_is_no_hit() -> None:
+    """CWM's polarity and its sentinel, both opposite to ABot's.
+
+    Under ABot the sky was 255 and the near field was 0. Feeding that to a model pretrained on the
+    reverse is not a degradation, it is an inversion: every surface reads as sky and the sky reads
+    as touching the lens.
+    """
+    import numpy as np
+
+    compose = _load("compose_gta_duv")
+    metres = np.array([[0.0, compose.CWM_NEAR, 1.0, compose.CWM_FAR, 1000.0]], dtype=np.float32)
+    red = compose.encode_depth_cwm(metres)
+
+    assert red[0, 0] == 0, "no hit"
+    assert red[0, 1] == 255, "near plane is the bright end"
+    assert red[0, 3] == 0, "far plane shares the sentinel, as it does in cwm_h3_inference"
+    assert red[0, 4] == 0, "beyond far is clipped to far"
+    assert 0 < red[0, 2] < 255
+    # Monotone decreasing in distance, which is what makes it readable as a disparity field.
+    finite = compose.encode_depth_cwm(np.array([[0.3, 1.0, 10.0, 100.0, 256.0]], dtype=np.float32))
+    assert list(finite[0]) == sorted(finite[0], reverse=True)
+
+
+def test_the_decode_range_comes_from_metadata_when_the_seg_declares_one(tmp_path: Path) -> None:
+    """A wrong decode range is a monotone relabelling of a depth map, so it looks correct."""
+    compose = _load("compose_gta_duv")
+    seg = tmp_path / "seg_0000"
+    seg.mkdir()
+
+    near, far, origin = compose.read_source_depth_range(seg, 0.1, 256.0)
+    assert (near, far) == (0.1, 256.0)
+    assert "no metadata.json" in origin
+
+    (seg / "metadata.json").write_text(json.dumps({"proxy": {"depth_near_m": 0.25, "depth_far_m": 512.0}}))
+    near, far, origin = compose.read_source_depth_range(seg, 0.1, 256.0)
+    assert (near, far) == (0.25, 512.0)
+    assert origin == "metadata.json"
+
+    (seg / "metadata.json").write_text(json.dumps({"fps": 24, "frames": 124}))
+    near, far, origin = compose.read_source_depth_range(seg, 0.1, 256.0)
+    assert (near, far) == (0.1, 256.0)
+    assert "declares no depth near/far" in origin

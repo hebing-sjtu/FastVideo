@@ -2,21 +2,40 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compose ``proxy/duv.mp4`` from native GTA ``depth.mp4`` + ``semantic.mp4``.
 
-``gta_web_0902`` ships the three game streams separately and never wrote a DUV.
-This is the same deterministic pack ``proxy_extract.proxy.compose_proxy_frame``
-uses for ABot delivery: R = forward log-z (0.1–8000 m, sky=255), G/B = 11-class
-colours. Depth video is decoded as inverted log-z (near bright, 0 = invalid),
-which is DATA_F.md's ``depth.mp4`` convention. If this GTA depth is a different
-encoding, the first-frame probe will show it — do not encode the corpus until
-that printout looks like a depth map, not noise.
+``gta_web_0902`` ships the three game streams separately and never wrote a DUV,
+so this composes one. Decoding is always DATA_F.md's ``depth.mp4`` convention --
+inverted log-z over ``[near, far]``, near bright, ``gray == 0`` invalid -- with
+the range taken from the seg's ``metadata.json`` when it declares one.
+
+The output convention is a choice, and ``cwm`` is the default because that is
+what the checkpoint being finetuned was pretrained on. ``cwm_h3_inference.duv``
+defines it:
+
+* R is ``(ln(far) - ln(d)) / (ln(far) - ln(near))`` over **0.3-256 m**,
+  quantised to uint16 then divided by 257 for the 8-bit plane. **Near is bright**
+  and **invalid is 0**, which also means the far plane and the sky share code 0;
+  CWM does not separate them.
+* G/B are ``(SEMANTIC_U[id % 4], SEMANTIC_V[id // 4])`` -- u varies fastest, so
+  the grid is read row-major over ``SEMANTIC_V``. Twelve classes, all distinct.
+
+``abot`` reproduces what the first cache was built with: forward log-z over
+0.1-8000 m with sky pinned to 255, and DATA_F's semantic *colours*, which are
+not injective. Both differences are silent, so a cache built under one
+convention cannot be compared against a run under the other.
+
+GTA's eleven labels are mapped onto CWM's twelve by meaning rather than by
+number, so ``road`` lands on ``road_paved`` and not on ``vegetation``. Only
+``player`` and ``ped`` collapse, both onto ``human``; ``--distinct-player-ped``
+splits them at the cost of calling one of them ``animal``.
 
 Usage::
 
+    # Look before writing: prints the decoded range, the palette and the R stats.
     python scripts/h3_proxy/prepare_data/compose_gta_duv.py \\
-        --root /data/binghe/datasets/gta_web_0902 --limit 1
+        --root /data/binghe/datasets/gta_web_0902_v2/gta_web_0902 --probe-only --limit 1
 
     python scripts/h3_proxy/prepare_data/compose_gta_duv.py \\
-        --root /data/binghe/datasets/gta_web_0902
+        --root /data/binghe/datasets/gta_web_0902_v2/gta_web_0902 --overwrite
 """
 
 from __future__ import annotations
@@ -34,17 +53,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vlm_filter import add_filter_arguments, load_vlm_filter  # noqa: E402
 
-DEPTH_NEAR = 0.1
-DEPTH_FAR = 256.0
-PROXY_NEAR = 0.1
-PROXY_FAR = 8000.0
-PROXY_MAX = 254
-PROXY_SKY = 255
+# DATA_F.md's depth.mp4: inverted log-z over this range, near bright, gray == 0 invalid. Used for
+# decoding only, and overridden by metadata.json or --source-near/--source-far.
+SOURCE_NEAR = 0.1
+SOURCE_FAR = 256.0
 
-# DATA_F.md / standard11 G,B. Not injective: the eleven labels collapse onto six codes, because
-# sky and road share (255,255) and building, ground, terrain, water, and prop all share (0,0).
-# Kept as the default only because an existing cache was encoded with it.
-PROXY_GB = {
+# cwm_h3_inference.constants. The range the checkpoint was pretrained on.
+CWM_NEAR = 0.3
+CWM_FAR = 256.0
+CWM_SEMANTIC_U = (32, 96, 160, 224)
+CWM_SEMANTIC_V = (43, 128, 213)
+
+# ABot's DUV, for reproducing the first cache. R is forward log-z with 255 reserved for sky.
+ABOT_NEAR = 0.1
+ABOT_FAR = 8000.0
+ABOT_MAX = 254
+ABOT_SKY = 255
+
+GTA_SKY_ID = 0
+
+# DATA_F.md's semantic *colours*. Not injective: eleven labels collapse onto six codes, because sky
+# and road share (255,255) and building, ground, terrain, water and prop all share (0,0). Sky is
+# then separable only by R == 255, which also means "depth invalid" and so disambiguates nothing.
+ABOT_GB = {
     0: (255, 255),  # sky
     1: (0, 255),  # player
     2: (0, 128),  # ped
@@ -58,12 +89,32 @@ PROXY_GB = {
     10: (0, 0),  # prop
 }
 
-# CWM's semantic grid: cwm_h3_inference.constants SEMANTIC_U x SEMANTIC_V, twelve well-separated
-# (G,B) pairs. Eleven GTA classes fit, so every label gets its own code and the model can tell road
-# from sky without falling back on R==255 -- which also means "depth invalid" and so cannot
-# disambiguate anything.
-CWM_SEMANTIC_U = (32, 96, 160, 224)
-CWM_SEMANTIC_V = (43, 128, 213)
+# GTA label (DATA_F.md) -> CWM label (INFERENCE.md), by meaning. Mapping by number instead would
+# put road on vegetation and vehicle on terrain, which are codes the model has seen and associated
+# with something else -- worse than an unseen code.
+#
+#   GTA  0 sky 1 player 2 ped 3 vehicle 4 building 5 road 6 ground 7 vegetation 8 terrain 9 water 10 prop
+#   CWM  0 void_unknown 1 sky 2 water 3 terrain 4 road_paved 5 vegetation
+#        6 building_structure 7 infrastructure 8 human 9 animal 10 vehicle 11 prop
+#
+# `ground` is DATA_F's paved-but-not-asphalt surface -- pavement, kerb, markings -- which CWM has no
+# class for; `infrastructure` is the nearest, and it is at least not `road_paved`.
+GTA_TO_CWM = {
+    0: 1,   # sky            -> sky
+    1: 8,   # player         -> human
+    2: 8,   # ped            -> human
+    3: 10,  # vehicle        -> vehicle
+    4: 6,   # building       -> building_structure
+    5: 4,   # road           -> road_paved
+    6: 7,   # ground         -> infrastructure
+    7: 5,   # vegetation     -> vegetation
+    8: 3,   # terrain        -> terrain
+    9: 2,   # water          -> water
+    10: 11,  # prop          -> prop
+}
+# ped -> animal, only to make all eleven labels distinct. A lie the model has an association for,
+# which is why it is opt-in.
+PED_AS_ANIMAL = 9
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,25 +140,92 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out-height", type=int, default=0, help="See --out-width.")
     p.add_argument(
-        "--semantic-palette",
-        choices=("standard11", "cwm12"),
-        default="standard11",
-        help="'cwm12' gives every class its own (G,B) from CWM's 4x3 semantic grid, which "
-        "'standard11' collapses eight classes out of. Changing this changes the proxy pixels, so "
-        "a cache encoded under one palette cannot be compared against a run under the other.",
+        "--convention",
+        choices=("cwm", "abot"),
+        default="cwm",
+        help="Output DUV convention. 'cwm' is what the checkpoint was pretrained on: R is 0.3-256 m "
+        "inverted log-z with near bright and invalid 0, G/B are CWM's twelve injective semantic "
+        "codes. 'abot' reproduces the first cache (0.1-8000 m forward, sky 255, non-injective "
+        "colours). Both differences are silent, so caches under the two cannot be compared.",
     )
+    p.add_argument(
+        "--distinct-player-ped",
+        action="store_true",
+        help="Map ped to CWM's 'animal' so all eleven GTA labels get distinct codes. Off by default "
+        "because player and ped are both humans and the split costs a wrong association.",
+    )
+    p.add_argument(
+        "--source-near",
+        type=float,
+        default=SOURCE_NEAR,
+        help=f"depth.mp4's near plane in metres, used only when metadata.json declares none "
+        f"(default {SOURCE_NEAR}, DATA_F.md).",
+    )
+    p.add_argument("--source-far", type=float, default=SOURCE_FAR, help="See --source-near.")
     add_filter_arguments(p)
     return p.parse_args()
 
 
-def build_palette(kind: str, class_ids: list[int]) -> dict[int, tuple[int, int]]:
-    """Class id -> (G, B). ``cwm12`` is injective; ``standard11`` is the legacy table."""
-    if kind == "standard11":
-        return dict(PROXY_GB)
-    slots = [(u, v) for u in CWM_SEMANTIC_U for v in CWM_SEMANTIC_V]
-    if len(class_ids) > len(slots):
-        raise SystemExit(f"cwm12 has {len(slots)} codes but the semantic map declares {len(class_ids)} classes.")
-    return {class_id: slots[index] for index, class_id in enumerate(sorted(class_ids))}
+def cwm_code(label: int) -> tuple[int, int]:
+    """CWM label -> (G, B), matching ``cwm_h3_inference.duv.load_duv_frame``.
+
+    u indexes on ``label % 4`` and v on ``label // 4``, so u varies fastest. Building the grid as
+    a product in the other order gives twelve distinct pairs that are still the wrong twelve.
+    """
+    if not 0 <= label <= 11:
+        raise ValueError(f"CWM semantic label must be in [0, 11]: {label}")
+    return CWM_SEMANTIC_U[label % 4], CWM_SEMANTIC_V[label // 4]
+
+
+def build_palette(kind: str, class_ids: list[int], *, distinct_player_ped: bool = False) -> dict[int, tuple[int, int]]:
+    """GTA class id -> (G, B)."""
+    if kind == "abot":
+        return dict(ABOT_GB)
+    mapping = dict(GTA_TO_CWM)
+    if distinct_player_ped:
+        mapping[2] = PED_AS_ANIMAL
+    unknown = [class_id for class_id in class_ids if class_id not in mapping]
+    if unknown:
+        raise SystemExit(f"semantic.json declares classes {unknown} that GTA_TO_CWM has no entry for. "
+                         "Add them rather than letting them fall through to a neighbouring code.")
+    return {class_id: cwm_code(mapping[class_id]) for class_id in class_ids}
+
+
+def read_source_depth_range(seg: Path, near: float, far: float) -> tuple[float, float, str]:
+    """Decode range for ``depth.mp4``: whatever ``metadata.json`` declares, else the arguments.
+
+    Hardcoding DATA_F's 0.1-256 m was safe for the corpus it was written against and is a silent
+    error on any other. A wrong range is not a visible failure -- the depth map still looks like a
+    depth map, it is just a monotone relabelling of one, so every parallax cue the proxy is supposed
+    to carry is miscalibrated.
+    """
+    path = seg / "metadata.json"
+    if not path.is_file():
+        return near, far, "DATA_F default (no metadata.json)"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return near, far, f"DATA_F default (metadata.json unreadable: {error})"
+
+    found: dict[str, float] = {}
+
+    def walk(node: object, trail: str) -> None:
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            label = f"{trail}.{key}" if trail else str(key)
+            lowered = label.lower()
+            if isinstance(value, int | float) and not isinstance(value, bool) and "depth" in lowered:
+                if "near" in lowered and "near" not in found:
+                    found["near"] = float(value)
+                elif ("far" in lowered or "max" in lowered) and "far" not in found:
+                    found["far"] = float(value)
+            walk(value, label)
+
+    walk(payload, "")
+    if "near" in found and "far" in found and 0 < found["near"] < found["far"]:
+        return found["near"], found["far"], f"{path.name}"
+    return near, far, f"DATA_F default ({path.name} declares no depth near/far)"
 
 
 def resample_nearest(plane: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -135,26 +253,52 @@ def read_class_ids(seg: Path) -> list[int]:
             classes = None
         if isinstance(classes, dict) and classes:
             return sorted(int(key) for key in classes)
-    return sorted(PROXY_GB)
+    return sorted(ABOT_GB)
 
 
-def decode_depth_grey(grey: np.ndarray) -> np.ndarray:
-    span = math.log(DEPTH_FAR) - math.log(DEPTH_NEAR)
-    metres = np.exp(math.log(DEPTH_FAR) - (grey.astype(np.float64) / 255.0) * span)
+def decode_depth_grey(grey: np.ndarray, near: float, far: float) -> np.ndarray:
+    """``depth.mp4`` grey -> metres. Inverted log-z, near bright, 0 invalid (DATA_F.md)."""
+    span = math.log(far) - math.log(near)
+    metres = np.exp(math.log(far) - (grey.astype(np.float64) / 255.0) * span)
     return np.where(grey == 0, 0.0, metres).astype(np.float32)
 
 
-def log_code_forward(metres: np.ndarray) -> np.ndarray:
-    span = math.log(PROXY_FAR) - math.log(PROXY_NEAR)
-    clipped = np.clip(metres.astype(np.float64), PROXY_NEAR, PROXY_FAR)
-    fraction = 1.0 - (math.log(PROXY_FAR) - np.log(clipped)) / span
-    return np.rint(fraction * PROXY_MAX).astype(np.uint8)
+def encode_depth_cwm(metres: np.ndarray) -> np.ndarray:
+    """Metres -> CWM's R plane. Near bright, invalid 0.
+
+    Quantised to uint16 and divided by 257 exactly as ``load_duv_frame`` does for its Qwen plane,
+    so the bytes here are the bytes the checkpoint was pretrained on rather than a re-derivation
+    that agrees to within a rounding step.
+    """
+    valid = metres > 1.0e-3
+    codes = np.zeros(metres.shape, dtype=np.uint16)
+    if bool(np.any(valid)):
+        clipped = np.clip(metres[valid].astype(np.float64), CWM_NEAR, CWM_FAR)
+        normalized = (math.log(CWM_FAR) - np.log(clipped)) / (math.log(CWM_FAR) - math.log(CWM_NEAR))
+        codes[valid] = np.floor(np.clip(normalized, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+    return np.floor(codes.astype(np.float64) / 257.0 + 0.5).astype(np.uint8)
 
 
-def compose_frame(metres: np.ndarray, ids: np.ndarray, palette: dict[int, tuple[int, int]]) -> np.ndarray:
-    red = log_code_forward(metres)
-    sky = (metres <= 1.0e-3) | (ids == 0)
-    red[sky] = PROXY_SKY
+def encode_depth_abot(metres: np.ndarray) -> np.ndarray:
+    """Metres -> ABot's R plane. Forward log-z, 255 reserved for sky by the caller."""
+    span = math.log(ABOT_FAR) - math.log(ABOT_NEAR)
+    clipped = np.clip(metres.astype(np.float64), ABOT_NEAR, ABOT_FAR)
+    fraction = 1.0 - (math.log(ABOT_FAR) - np.log(clipped)) / span
+    return np.rint(fraction * ABOT_MAX).astype(np.uint8)
+
+
+def compose_frame(metres: np.ndarray, ids: np.ndarray, palette: dict[int, tuple[int, int]], *,
+                  convention: str) -> np.ndarray:
+    sky = (metres <= 1.0e-3) | (ids == GTA_SKY_ID)
+    if convention == "abot":
+        red = encode_depth_abot(metres)
+        red[sky] = ABOT_SKY
+    else:
+        red = encode_depth_cwm(metres)
+        # CWM stores zero for invalid depth, and the sky never returns a hit. Forced rather than
+        # left to the decode so a source that wrote a finite distance for sky cannot leak a
+        # foreground code into it.
+        red[sky] = 0
     green = np.zeros_like(red)
     blue = np.zeros_like(red)
     for class_id, (g, b) in palette.items():
@@ -314,19 +458,30 @@ def main() -> None:
             semantic_frames = read_rgb_video(semantic_path)
             if len(depth_frames) != len(semantic_frames):
                 raise ValueError(f"depth {len(depth_frames)} frames vs semantic {len(semantic_frames)}")
-            palette = build_palette(args.semantic_palette, read_class_ids(seg))
+            palette = build_palette(args.convention, read_class_ids(seg),
+                                    distinct_player_ped=args.distinct_player_ped)
+            near, far, origin = read_source_depth_range(seg, args.source_near, args.source_far)
             ids0 = semantic_ids(semantic_frames[0])
-            metres0 = decode_depth_grey(depth_frames[0])
+            metres0 = decode_depth_grey(depth_frames[0], near, far)
             if index == 0 or args.probe_only:
                 distinct = len(set(palette.values()))
-                print(f"  palette {args.semantic_palette}: {len(palette)} classes -> {distinct} distinct (G,B)"
-                      f"{'' if distinct == len(palette) else '  [classes collapse; the model cannot separate them]'}")
+                print(f"  convention {args.convention}: R = "
+                      f"{'0.3-256 m inverted, near bright, invalid 0' if args.convention == 'cwm' else
+                         '0.1-8000 m forward, sky 255'}")
+                print(f"  decode range {near}-{far} m, from {origin}")
+                print(f"  palette: {len(palette)} classes -> {distinct} distinct (G,B)"
+                      f"{'' if distinct == len(palette) else f'  [{len(palette) - distinct} collapsed]'}")
                 valid = metres0 > 1.0e-3
+                red0 = compose_frame(metres0, ids0, palette, convention=args.convention)[..., 0]
                 print(f"{seg.name}: {depth_frames[0].shape[1]}x{depth_frames[0].shape[0]} "
                       f"{len(depth_frames)} frames, depth grey "
                       f"min={int(depth_frames[0].min())} max={int(depth_frames[0].max())}, "
                       f"metres p50={float(np.median(metres0[valid])) if np.any(valid) else 0:.2f}, "
                       f"semantic ids {sorted(int(x) for x in np.unique(ids0)[:16])}")
+                # A healthy R plane spans most of 0..255. A narrow span means the decode range and
+                # the output range disagree, which no amount of training recovers.
+                print(f"  R plane: min={int(red0.min())} max={int(red0.max())} "
+                      f"p50={int(np.median(red0))} distinct={len(np.unique(red0))}/256")
             if args.probe_only:
                 continue
             resize = bool(args.out_width and args.out_height)
@@ -336,7 +491,9 @@ def main() -> None:
                 if resize:
                     grey = resample_nearest(grey, args.out_width, args.out_height)
                     ids = resample_nearest(ids, args.out_width, args.out_height)
-                composed.append(compose_frame(decode_depth_grey(grey), ids, palette))
+                composed.append(
+                    compose_frame(decode_depth_grey(grey, near, far), ids, palette,
+                                  convention=args.convention))
             # --out-* already chose a tileable grid, so the 720 -> 704 crop only applies otherwise.
             if not resize and args.height and composed[0].shape[0] != args.height:
                 if args.height > composed[0].shape[0]:
