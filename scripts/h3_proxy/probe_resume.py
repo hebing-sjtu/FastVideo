@@ -77,7 +77,14 @@ def load_training_config(checkpoint: Path) -> dict[str, Any]:
 
 
 def describe_saved_tensors(checkpoint: Path, list_keys: int) -> None:
-    """What is actually in the save, by name, straight from the DCP metadata."""
+    """What is actually in the save, by name, straight from the DCP metadata.
+
+    Only the ``roles.`` entries are model weights. ``optimizers.`` holds one Adam moment pair *and*
+    roughly fifteen ``param_groups`` scalars per parameter -- ``betas``, ``amsgrad``, ``capturable``
+    and friends -- whose names embed the parameter's, so a bare ``"lora_B" in name`` test counts
+    those too and inflates 200 real tensors into thousands. Only the ``roles.`` count decides
+    whether resuming restores an adapter.
+    """
     import torch.distributed.checkpoint as dcp
 
     dcp_dir = checkpoint / "dcp"
@@ -85,23 +92,26 @@ def describe_saved_tensors(checkpoint: Path, list_keys: int) -> None:
         raise SystemExit(f"No dcp/.metadata under {checkpoint}; this is an unfinished save and cannot be loaded.")
     names = list(dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata)
 
-    lora_a = sorted(name for name in names if "lora_A" in name)
-    lora_b = sorted(name for name in names if "lora_B" in name)
-    print(f"\nsaved tensors: {len(names)} total, {len(lora_a)} lora_A, {len(lora_b)} lora_B")
+    weights = sorted(name for name in names if name.startswith("roles."))
+    lora_a = [name for name in weights if "lora_A" in name]
+    lora_b = [name for name in weights if "lora_B" in name]
+    print(f"\nsaved entries: {len(names)} total, of which {len(weights)} are model weights under roles.")
+    print(f"model LoRA weights: {len(lora_a)} lora_A, {len(lora_b)} lora_B")
     if not lora_b:
-        print("  NO lora_B IN THE SAVE. Resuming this cannot produce anything but the base model.")
+        print("  NO lora_B MODEL WEIGHT IN THE SAVE, only optimizer state mentions it. Resuming this "
+              "cannot produce anything but the base model.")
     for name in lora_b[:list_keys]:
         print(f"  {name}")
 
     checkpointed = sum(1 for name in lora_b if ".checkpointed." in name)
     if lora_b:
         if checkpointed == len(lora_b):
-            print("  every LoRA key carries '.checkpointed.', so this was trained with "
+            print("  every LoRA weight key carries '.checkpointed.', so this was trained with "
                   "enable_gradient_checkpointing_type set, and the eval config must set it too.")
         elif checkpointed:
-            print(f"  MIXED: {checkpointed}/{len(lora_b)} keys carry '.checkpointed.'.")
+            print(f"  MIXED: {checkpointed}/{len(lora_b)} weight keys carry '.checkpointed.'.")
         else:
-            print("  no LoRA key carries '.checkpointed.', so this was trained without activation "
+            print("  no LoRA weight key carries '.checkpointed.', so this was trained without activation "
                   "checkpointing, and an eval config that enables it will match none of them.")
 
 
