@@ -11,6 +11,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastvideo.distributed import get_sp_group, get_world_group
+from fastvideo.logger import init_logger
 from fastvideo.train.callbacks.callback import CallbackDict
 from fastvideo.train.methods.base import LogScalar, TrainingMethod
 from fastvideo.train.utils.tracking import build_tracker
@@ -18,6 +19,8 @@ from fastvideo.train.utils.tracking import build_tracker
 if TYPE_CHECKING:
     from fastvideo.train.utils.training_config import (
         TrainingConfig, )
+
+logger = init_logger(__name__)
 
 
 def _coerce_log_scalar(
@@ -127,6 +130,23 @@ class Trainer:
             resumed_step = (checkpoint_manager.maybe_resume(resume_from_checkpoint=(resume_from_checkpoint)))
             if resumed_step is not None:
                 start_step = int(resumed_step)
+        # An eval-only job names the step it wants by resuming into it, and an empty
+        # resume_from_checkpoint is not an error -- it is how a fresh run starts. The two are then
+        # only distinguishable from the step baked into the validation filenames, which is read
+        # after the sampling has been paid for, so say which one this is before spending it.
+        if resume_from_checkpoint:
+            logger.info(
+                "resume_from_checkpoint=%r resolved to step %s; validation and training continue from there.",
+                resume_from_checkpoint,
+                start_step,
+            )
+        else:
+            logger.info(
+                "No resume_from_checkpoint, so this run starts at step %s with weights as initialized. "
+                "A LoRA adapter is zero here and samples identically to the base model -- if you meant to "
+                "evaluate a checkpoint, pass --training.checkpoint.resume_from_checkpoint.",
+                start_step,
+            )
         self.callbacks.on_validation_begin(
             method,
             iteration=start_step,
