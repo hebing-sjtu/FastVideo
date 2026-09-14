@@ -149,6 +149,25 @@ if [[ -n "$RUN" && "$(cd "$(dirname "$OUT")" 2>/dev/null && pwd || echo "$OUT")"
 fi
 
 # Any positive value divides 0, so step 0 needs no special case beyond avoiding a zero divisor.
+# gIB dlopens libibverbs.so.1, and the container image does not ship it. set_nccl_env.sh pins
+# NCCL_NET=gIB, and a forced network with no usable devices has no fallback, so this fails on one
+# node as readily as on two -- as `ncclCommInitRank: internal error` from init_world_group, which
+# names neither gIB nor libibverbs. The real cause prints at INFO, three lines above the first WARN,
+# so NCCL_DEBUG=WARN hides it. It has to be reinstalled after every container restart, which makes
+# it worth two seconds here. See NODE_ENVIRONMENT.md.
+if [[ -n "${NCCL_CONF_FILE:-}" ]] && grep -qs "NCCL_NET=gIB" "${NCCL_CONF_FILE:-/dev/null}"; then
+    if ! ldconfig -p 2>/dev/null | grep -q "libibverbs\.so\.1"; then
+        echo "NCCL_CONF_FILE forces NCCL_NET=gIB, but libibverbs.so.1 is not installed. gIB dlopens it" >&2
+        echo "at runtime and a forced network with no devices has no fallback, so every rank will die in" >&2
+        echo "ncclCommInitRank with 'internal error' and name neither. On BOTH nodes:" >&2
+        echo "  apt-get update && apt-get install -y libibverbs1 ibverbs-providers ibverbs-utils && ldconfig" >&2
+        echo "  ibv_devinfo | grep -E 'hca_id|state'    # expect mlx5_0..7, PORT_ACTIVE" >&2
+        echo "ibverbs-providers is not optional: without libmlx5 the library opens and enumerates zero" >&2
+        echo "devices, which fails identically." >&2
+        exit 2
+    fi
+fi
+
 EVERY=$(( STEP > 0 ? STEP : 1 ))
 
 GEOM="$(python scripts/h3_proxy/describe_cache.py "$CACHE" --emit-flags)"
