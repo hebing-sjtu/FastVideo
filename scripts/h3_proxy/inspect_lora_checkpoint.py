@@ -41,13 +41,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def checkpoint_inventory(directory: Path) -> str:
+    """One line naming the checkpoints in ``directory`` and whether each can be read.
+
+    The usual reason to be here is a step number that was guessed from the schedule rather than read
+    off the disk, so the answer wanted is "which ones exist", not "that one does not".
+    """
+    if not directory.is_dir():
+        return f"  {directory} does not exist either, so nothing has been written to this run."
+    found = sorted((path for path in directory.glob("checkpoint-*") if path.is_dir()),
+                   key=lambda path: int(path.name.rsplit("-", 1)[-1])
+                   if path.name.rsplit("-", 1)[-1].isdigit() else -1)
+    if not found:
+        return f"  {directory} holds no checkpoint-* directory yet."
+    loadable = [path.name for path in found if (path / "dcp" / ".metadata").is_file()]
+    partial = [path.name for path in found if path.name not in loadable]
+    lines = [f"  loadable in {directory}: {', '.join(loadable) if loadable else '(none)'}"]
+    if partial:
+        lines.append(f"  present but unfinished: {', '.join(partial)}")
+    return "\n".join(lines)
+
+
 def resolve(path: Path) -> Path:
     path = path.expanduser().resolve()
     if path.name == "dcp":
         path = path.parent
-    if not (path / "dcp").is_dir():
-        raise SystemExit(f"No dcp/ under {path}")
-    return path
+    if (path / "dcp").is_dir():
+        return path
+    reason = (f"{path} does not exist" if not path.is_dir() else f"{path} exists but has no dcp/ subdirectory")
+    raise SystemExit(f"{reason}.\n{checkpoint_inventory(path.parent)}")
 
 
 def lora_slot(key: str) -> str | None:

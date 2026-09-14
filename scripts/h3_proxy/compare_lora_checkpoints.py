@@ -48,7 +48,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from inspect_lora_checkpoint import (  # noqa: E402
-    is_role_lora_weight, load_role_lora_tensors, lora_slot, resolve,
+    checkpoint_inventory, is_role_lora_weight, load_role_lora_tensors, lora_slot, resolve,
 )
 
 
@@ -180,13 +180,8 @@ def require_loadable(checkpoint: Path) -> None:
     """
     if (checkpoint / "dcp" / ".metadata").is_file():
         return
-    siblings = sorted(
-        (path for path in checkpoint.parent.glob("checkpoint-*") if path.is_dir()),
-        key=lambda path: int(path.name.rsplit("-", 1)[-1]) if path.name.rsplit("-", 1)[-1].isdigit() else -1,
-    )
-    complete = [path.name for path in siblings if (path / "dcp" / ".metadata").is_file()]
     print(f"{checkpoint.name} has a dcp/ directory but no dcp/.metadata, so its save did not finish.")
-    print(f"  loadable checkpoints in {checkpoint.parent}: {', '.join(complete) if complete else '(none)'}")
+    print(checkpoint_inventory(checkpoint.parent))
     raise SystemExit(2)
 
 
@@ -269,14 +264,17 @@ def report_base_relative(rows: list[tuple[str, float, float, float]], snapshot: 
 
 def main() -> None:
     args = parse_args()
-    import torch
-
+    # Paths first: torch takes tens of seconds to import, and a step number guessed from the
+    # schedule rather than read off the disk is the common way to get here.
     early_path, late_path = resolve(Path(args.early)), resolve(Path(args.late))
     print(f"early: {early_path.name}\nlate:  {late_path.name}")
     # Both before either read, so an unfinished save is reported with the inventory rather than
     # after minutes of loading the other checkpoint's 200 tensors.
     require_loadable(early_path)
     require_loadable(late_path)
+
+    import torch
+
     early, late = read_pairs(early_path), read_pairs(late_path)
 
     shared = sorted(set(early) & set(late))
