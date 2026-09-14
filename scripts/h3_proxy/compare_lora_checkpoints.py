@@ -348,6 +348,14 @@ def main() -> None:
             print(f"  at this interval's drift rate ({along:.3g} of aligned motion per {spent:.0f} "
                   f"equivalent steps), the {remaining:.0f} left in the schedule add "
                   f"{along * remaining / spent:.3g}, taking ||B@A|| {total_late:.3g} -> {projected:.3g}.")
+        # along grows with the interval and across only with its square root, so the raw ratio is
+        # larger for a wider interval at identical gradient quality. Dividing the square root back
+        # out leaves a per-step drift-to-noise that two runs can be compared on even when their
+        # intervals and schedules differ -- which is what makes it usable for ablating the
+        # conditioning signal rather than just describing one run.
+        if spent > 1e-9 and across > 1e-12:
+            print(f"  per-step drift-to-noise, (along/across)/sqrt(equivalent steps): "
+                  f"{(along / across) / math.sqrt(spent):.5f}  (comparable across runs)")
         if early_step < args.warmup_steps:
             print(f"  NOTE: step {early_step} is mid-warmup, so its learning rate was "
                   f"{early_step / args.warmup_steps:.0%} of peak and its integral is small. Two checkpoints "
