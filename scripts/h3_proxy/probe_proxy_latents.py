@@ -106,11 +106,14 @@ def describe(directory: Path, sample: int, per_channel: int) -> None:
     print(f"  tail    mean {tail.mean():.4f}  max {tail.max():.4f}   (compare between caches, not to a constant)")
 
     if per_channel:
-        order = torch.argsort(shift, descending=True)[:per_channel]
-        print(f"  worst {per_channel} channels by shift:")
-        for index in order.tolist():
-            print(f"    channel {index:3d}  shift {shift[index]:.3f}  spread {spread[index]:.3f}  "
-                  f"tail {tail[index]:.4f}")
+        # Ranking by one metric hides the others' outliers. A channel can sit dead centre and still
+        # have half its values off the end of the range, which is the case worth seeing.
+        for label, metric in (("shift", shift), ("tail", tail), ("spread", (spread - 1.0).abs())):
+            order = torch.argsort(metric, descending=True)[:per_channel]
+            print(f"  worst {per_channel} channels by {label}:")
+            for index in order.tolist():
+                print(f"    channel {index:3d}  shift {shift[index]:.3f}  spread {spread[index]:.3f}  "
+                      f"tail {tail[index]:.4f}")
 
 
 def main() -> None:
