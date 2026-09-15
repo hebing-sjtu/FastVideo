@@ -142,6 +142,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--probe-only", action="store_true", help="Print first-frame stats, write nothing.")
     p.add_argument(
+        "--out-name",
+        default="duv.mp4",
+        help="Filename written under each seg's proxy/. The default overwrites the canonical "
+        "duv.mp4 in place, which is what a corpus wants. Point two runs at different names to hold "
+        "two conventions side by side, which is the only way to A/B an encoding on otherwise "
+        "identical clips -- composing in place makes every checkpoint trained on the old one "
+        "unevaluatable.",
+    )
+    p.add_argument(
         "--height",
         type=int,
         default=704,
@@ -452,7 +461,7 @@ def main() -> None:
     written = skipped = failed = 0
     for index, seg in enumerate(segs):
         depth_path, semantic_path, duv_path = (seg / "proxy" / "depth.mp4", seg / "proxy" / "semantic.mp4",
-                                               seg / "proxy" / "duv.mp4")
+                                               seg / "proxy" / args.out_name)
         if duv_path.is_file() and not args.overwrite and not args.probe_only:
             # Already composed on an earlier run, so still part of the corpus for the split.
             composed_names.append(seg.name)
@@ -473,12 +482,12 @@ def main() -> None:
             metres0 = decode_depth_grey(depth_frames[0], near, far)
             if index == 0 or args.probe_only:
                 distinct = len(set(palette.values()))
-                print(f"  convention {args.convention}: R = "
-                      f"{'0.3-256 m inverted, near bright, invalid 0' if args.convention == 'cwm' else
-                         '0.1-8000 m forward, sky 255'}")
+                red_scale = ("0.3-256 m inverted, near bright, invalid 0"
+                             if args.convention == "cwm" else "0.1-8000 m forward, sky 255")
+                collapsed = "" if distinct == len(palette) else f"  [{len(palette) - distinct} collapsed]"
+                print(f"  convention {args.convention}: R = {red_scale}")
                 print(f"  decode range {near}-{far} m, from {origin}")
-                print(f"  palette: {len(palette)} classes -> {distinct} distinct (G,B)"
-                      f"{'' if distinct == len(palette) else f'  [{len(palette) - distinct} collapsed]'}")
+                print(f"  palette: {len(palette)} classes -> {distinct} distinct (G,B){collapsed}")
                 valid = metres0 > 1.0e-3
                 red0 = compose_frame(metres0, ids0, palette, convention=args.convention)[..., 0]
                 print(f"{seg.name}: {depth_frames[0].shape[1]}x{depth_frames[0].shape[0]} "
