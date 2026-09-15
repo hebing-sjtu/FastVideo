@@ -109,7 +109,7 @@ def base_weight_index(snapshot: Path) -> dict[str, Path]:
     mapping: dict[str, Path] = {}
     for shard in shards:
         with safe_open(str(shard), framework="pt") as handle:
-            for name in handle.keys():
+            for name in handle:
                 mapping[name] = shard
     return mapping
 
@@ -223,8 +223,6 @@ def report_lr_ceiling(late: dict[str, tuple], integral: float, peak_lr: float) -
     integral. A run far below it is held back by increments that cancel, and more integral would buy
     proportionally less.
     """
-    import torch
-
     ceiling = peak_lr * integral
     if ceiling <= 0:
         return
@@ -240,8 +238,9 @@ def report_lr_ceiling(late: dict[str, tuple], integral: float, peak_lr: float) -
         print("  The most consistently driven weights are already learning-rate bound, so more steps at this "
               "rate cannot grow the delta much. Raising the magnitude means raising lr * equivalent steps.")
     else:
-        print("  No weight is near the ceiling, so the learning rate is not what limits the delta; the "
-              "increments are cancelling. Raising lr would buy less than proportionally.")
+        print("  No weight is near the ceiling, so the learning rate is not what limits the delta. Whether "
+              "raising it would help is the verdict's question, not this one's: a delta held down by "
+              "uncorrelated increments does not grow by taking larger uncorrelated steps.")
 
 
 def lr_integral(step: int, warmup: int, max_steps: int, min_ratio: float) -> float:
@@ -431,10 +430,23 @@ def main() -> None:
         print(f"VERDICT: the new motion is mostly sideways to what had accumulated (cos {advance:.3f}). Some "
               "of each step lengthens the delta and most of it rotates it, so the norm will grow far more "
               "slowly than the step count suggests.")
+    elif advance < -0.05:
+        # Below the null, not merely at it. A random walk leaves <D_early, D_late> = ||D_early||^2 and
+        # hence advance = 0 exactly, so a negative value is increments that undo what accumulated --
+        # overshoot around a basin, which is the one case where a smaller step is the fix.
+        print(f"VERDICT: the new motion points back against the accumulated delta (cos {advance:.3f}), which "
+              "is *below* the random-walk null of 0. Independent noise would leave the accumulated direction "
+              "untouched; actively eroding it means the steps are overshooting. Lower the learning rate. "
+              "More steps at this rate will keep undoing the previous ones.")
     else:
-        print(f"VERDICT: the new motion is orthogonal to the accumulated delta (cos {advance:.3f}). The "
-              "updates are churning rather than accumulating, which more steps will not fix. Suspect the "
-              "learning rate, the batch, or a conditioning signal the loss cannot attribute.")
+        print(f"VERDICT: the new motion is orthogonal to the accumulated delta (cos {advance:.3f}), which is "
+              "the random-walk null of 0 to within noise. The increments are not fighting each other, they "
+              "carry no shared direction at all, so the norm still inflates while nothing accumulates -- read "
+              "the growth above as a random walk, not as progress. This is the gradient's signal-to-noise "
+              "floor, and a larger learning rate only takes larger uncorrelated steps: the levers are the "
+              "batch, the conditioning the loss can attribute, and the adapter's capacity. Compare an earlier "
+              "interval of the same run; a floor reached partway through shows up as a drift-to-noise that "
+              "collapsed rather than one that was always low.")
 
     if args.base_snapshot:
         report_base_relative(rows, Path(args.base_snapshot).expanduser(), top=args.top)
