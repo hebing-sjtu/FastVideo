@@ -228,6 +228,12 @@ exclude = ["assets*", "docker*", "docs", "scripts*", "apps*"]
 markers = [
     "gpu: requires real GPU + model weights; skip in CI",
 ]
+# The working tree, ahead of anything installed into the environment. `pytest` -- unlike
+# `python -m pytest` -- does not put the invocation directory on sys.path, so on a machine that also
+# has fastvideo pip-installed, a bare `pytest` imports the *installed* copy. Tests then pass or fail
+# against code that is not the code under edit: a module added since the install is reported as
+# missing, and, worse, a module that merely changed is tested in its old form and reports green.
+pythonpath = ["."]
 
 
 [tool.mypy]
