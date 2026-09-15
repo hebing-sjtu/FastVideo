@@ -46,12 +46,42 @@ whole clip and cannot do that. So the trajectory becomes a dense Plücker ray fi
 latent grid and enters through a ControlNet that adds a residual at the exact token each ray belongs
 to.
 
+**The proxy can take the second route too**, and `proxy_controlnet_finetune.yaml` is that variant.
+The argument against the reference slot applies to the proxy as much as to a trajectory: H3 packs
+references *ahead* of the target, so the proxy sits a whole clip earlier in rotary time — 206.667
+units at 124 frames — and no proxy frame ever shares a temporal position with the target frame it is
+meant to steer. That is enough for layout and rough heading and not for rate, which is what the LoRA
+runs on that pathway showed: predictions that turn the right way at the wrong speed, with coherent
+drift down to the random-walk floor by step 150.
+
+So the trunk gets a second copy of the same pixels, on the target's own latent grid, through the
+`depth` modality — named for the depth video it was first built for, carrying whatever the proxy
+encodes. Either modality is a valid trunk on its own (`enable_control_camera: false` gives a proxy
+ControlNet, which is what footage without a captured trajectory gets).
+
+The reference slot keeps the proxy anyway. The cached text embedding was tokenized around `<Picture
+1>` then `<Video 1>`, and the CWM system prompt spends most of its length saying what `<Video 1>` is
+for; dropping it would invalidate every cached text embedding and contradict a prompt this repo
+otherwise reproduces byte-for-byte. The proxy is therefore presented twice — once as content the text
+can refer to, once as a constraint the trunk can enforce.
+
+Getting it onto the target grid is a resize, and that is the one liberty not taken. A DUV frame is
+three integer codes wearing an RGB costume, so interpolation averages unrelated depths and paints
+class boundaries a code no segmenter ever predicted — while producing a perfectly plausible-looking
+image. Each proxy pixel is replicated over an integer block instead, which introduces no code that
+was not already written; a canvas the proxy grid does not divide is an error rather than a
+nearest-neighbour approximation, in `encode_proxy_samples.py --proxy-control` and in the sampler
+both. The released geometries divide exactly (1344/336 == 768/192 == 4). 704x1280 does not, so this
+variant cannot inherit the canvas the earlier GTA caches were written at.
+
 Everything else follows from that split:
 
 - The control trunk is **zero-initialised at `proj_out`**, so an untrained branch is exactly a no-op
-  and step 0 reproduces the released model bit-for-bit.
+  and step 0 reproduces the released model bit-for-bit. This is what makes it readable against a
+  LoRA baseline: anything a panel shows after step 0 is the trunk's doing.
 - The **backbone is frozen** by default. Only `camera_controlnet.*` trains, which is also why a
-  checkpoint from this stage contains the branch alone.
+  checkpoint from this stage contains the branch alone. Training the trunk and a LoRA together is
+  possible (`freeze_backbone: false` plus a `lora` block) but gives up that attribution.
 - The trunk **mirrors the packed row layout** rather than living over the video rows alone, so the
   two streams shard identically under sequence parallelism and the residual add stays local. The
   residual is masked to the target video rows; references and audio rows are left alone.

@@ -111,6 +111,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         attention_backend: AttentionBackendEnum | str | None = AttentionBackendEnum.TORCH_SDPA,
         # --- camera control branch ---
         enable_camera_controlnet: bool = True,
+        enable_control_camera: bool = True,
         enable_control_depth: bool = False,
         controlnet_dim: int = 1024,
         controlnet_ffn_dim: int = 4096,
@@ -127,6 +128,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         lora: Any = None,
     ) -> None:
         self._enable_camera_controlnet = bool(enable_camera_controlnet)
+        self._enable_control_camera = bool(enable_control_camera)
         self._enable_control_depth = bool(enable_control_depth)
         self._controlnet_dim = int(controlnet_dim)
         self._controlnet_ffn_dim = int(controlnet_ffn_dim)
@@ -152,8 +154,12 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             raise ValueError("num_given_latent_frames>0 needs enable_anchor=true: sampling fills the first given "
                              "frame from the anchor, and has nothing else to put there.")
         if self._enable_control_depth and not self._enable_camera_controlnet:
-            raise ValueError("enable_control_depth=true requires enable_camera_controlnet=true; depth is a second "
-                             "modality on the camera trunk, not a branch of its own.")
+            raise ValueError("enable_control_depth=true requires enable_camera_controlnet=true; depth is a modality "
+                             "on the control trunk, and enable_camera_controlnet is what builds the trunk.")
+        if self._enable_camera_controlnet and not (self._enable_control_camera or self._enable_control_depth):
+            raise ValueError("enable_camera_controlnet=true builds a control trunk with nothing to read. Enable "
+                             "enable_control_camera (the Plücker ray field of a requested trajectory), "
+                             "enable_control_depth (the proxy on the target latent grid), or both.")
         if not 0.0 <= self._camera_dropout < 1.0:
             raise ValueError(f"camera_dropout must be in [0, 1), got {camera_dropout!r}")
         if self._camera_dropout and self._enable_control_depth:
@@ -229,6 +235,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             raise ValueError("training_config.pipeline_config.dit_config.arch_config is required to configure the "
                              "camera ControlNet")
         arch_config.camera_enable_controlnet = self._enable_camera_controlnet
+        arch_config.camera_enable_camera = self._enable_control_camera
         arch_config.camera_enable_depth = self._enable_control_depth
         arch_config.camera_freeze_backbone = self._freeze_backbone
         arch_config.camera_control_dim = self._controlnet_dim
@@ -257,7 +264,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             sp_world_size=sp_world_size,
             global_rank=world_group.rank,
             include_anchor=self._enable_anchor,
-            include_camera=self._enable_camera_controlnet,
+            include_camera=self._enable_camera_controlnet and self._enable_control_camera,
             include_depth=self._enable_control_depth,
         )
         self.start_step = 0
@@ -317,7 +324,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         device: torch.device,
         generator: torch.Generator,
     ) -> dict[str, torch.Tensor]:
-        """Build the ControlNet's patchified camera (and optional depth) rows."""
+        """Build the control trunk's patchified rows, for whichever modalities are enabled."""
         if not self._enable_camera_controlnet:
             return {}
         # Every rank in a sequence-parallel group has to reach the same verdict: the control blocks
@@ -331,24 +338,25 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         if drop:
             return {}
 
-        num_latent_frames, latent_height, latent_width = latent_shape
-        info = (raw_batch.get("info_list") or [{}])[0]
-        pixel_size = info.get("pixel_size")
-        if pixel_size is None:
-            data_config = self.training_config.data
-            pixel_size = (int(data_config.num_height), int(data_config.num_width))
+        control: dict[str, torch.Tensor] = {}
+        if self._enable_control_camera:
+            num_latent_frames, latent_height, latent_width = latent_shape
+            info = (raw_batch.get("info_list") or [{}])[0]
+            pixel_size = info.get("pixel_size")
+            if pixel_size is None:
+                data_config = self.training_config.data
+                pixel_size = (int(data_config.num_height), int(data_config.num_width))
 
-        camera_latent = build_camera_latent(
-            raw_batch["camera_extrinsics"][0].to(device=device, dtype=torch.float32),
-            raw_batch["camera_intrinsics"][0].to(device=device, dtype=torch.float32),
-            latent_height=latent_height,
-            latent_width=latent_width,
-            pixel_size=(int(pixel_size[0]), int(pixel_size[1])),
-            num_latent_frames=num_latent_frames,
-        )
-        control: dict[str, torch.Tensor] = {
-            "camera_latent": patchify_video_latents(camera_latent.to(dtype), self.transformer.patch_size)[None],
-        }
+            camera_latent = build_camera_latent(
+                raw_batch["camera_extrinsics"][0].to(device=device, dtype=torch.float32),
+                raw_batch["camera_intrinsics"][0].to(device=device, dtype=torch.float32),
+                latent_height=latent_height,
+                latent_width=latent_width,
+                pixel_size=(int(pixel_size[0]), int(pixel_size[1])),
+                num_latent_frames=num_latent_frames,
+            )
+            control["camera_latent"] = patchify_video_latents(camera_latent.to(dtype),
+                                                              self.transformer.patch_size)[None]
         if self._enable_control_depth:
             depth = raw_batch["depth_latent"].to(device=device, dtype=dtype)
             control["depth_latent"] = patchify_video_latents(depth, self.transformer.patch_size)[None]
@@ -529,12 +537,12 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         timestep_indices = timestep_indices.to(device)
         video_indices = layout.video_indices.to(device)
 
+        # An empty `control` is how a dropped or disabled trunk opts out: without the row indices the
+        # branch cannot place a residual, and the forward skips it.
         control_kwargs: dict[str, torch.Tensor] = {}
-        if "camera_latent" in control:
-            control_kwargs["camera_latent"] = control["camera_latent"]
+        if control:
+            control_kwargs.update(control)
             control_kwargs["camera_row_indices"] = video_indices[layout.num_condition_video_rows:]
-            if "depth_latent" in control:
-                control_kwargs["depth_latent"] = control["depth_latent"]
 
         with torch.autocast(device.type, dtype=dtype), set_forward_context(
                 current_timestep=unique_timesteps,

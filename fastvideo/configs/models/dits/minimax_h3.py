@@ -80,6 +80,11 @@ class MiniMaxH3ArchConfig(DiTArchConfig):
     # the model bit-identical to the release.
     camera_enable_controlnet: bool = False
     camera_freeze_backbone: bool = True
+    # The trunk's two modalities. `camera` is the Plücker ray field of a requested trajectory;
+    # `depth` is the proxy resampled onto the target latent grid. Either alone is a valid trunk:
+    # with only `depth` the branch is a proxy ControlNet, which is the way to bind a proxy to the
+    # token it constrains when no camera trajectory was captured alongside the clip.
+    camera_enable_camera: bool = True
     camera_enable_depth: bool = False
     camera_control_layer_stride: int = 2
     camera_control_dim: int = 1024

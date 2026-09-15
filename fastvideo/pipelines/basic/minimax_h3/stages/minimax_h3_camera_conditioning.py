@@ -24,7 +24,10 @@ from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
 from fastvideo.pipelines.basic.minimax_h3.camera import build_camera_latent
 from fastvideo.pipelines.basic.minimax_h3.packing import MiniMaxH3PackedLayout, patchify_video_latents
-from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import MINIMAX_H3_LAYOUT_KEY
+from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
+    MINIMAX_H3_CONTROL_DEPTH_KEY,
+    MINIMAX_H3_LAYOUT_KEY,
+)
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
 from fastvideo.pipelines.stages.validators import VerificationResult
@@ -93,50 +96,61 @@ class MiniMaxH3CameraConditioningStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> ForwardBatch:
         source = batch.extra.get(MINIMAX_H3_CAMERA_TRAJECTORY_KEY)
-        if source is None:
+        # Latent preparation puts the proxy on the target grid when the trunk reads it, and that
+        # copy needs the same row indices a trajectory would. Either signal alone is a valid trunk.
+        depth_rows = batch.extra.get(MINIMAX_H3_CONTROL_DEPTH_KEY)
+        if source is None and depth_rows is None:
             return batch
 
         controlnet = getattr(self.transformer, "camera_controlnet", None)
         if controlnet is None:
-            raise ValueError(f"A camera trajectory was requested but {type(self.transformer).__name__} has no camera "
-                             "ControlNet. Point the run at a checkpoint fine-tuned with "
-                             "MiniMaxH3ProxyModel, or drop the trajectory from the request.")
+            raise ValueError(f"Control conditioning was requested but {type(self.transformer).__name__} has no "
+                             "control trunk. Point the run at a checkpoint fine-tuned with MiniMaxH3ProxyModel, or "
+                             "drop the trajectory from the request.")
 
         layout = batch.extra.get(MINIMAX_H3_LAYOUT_KEY)
         if not isinstance(layout, MiniMaxH3PackedLayout):
             raise ValueError("Camera conditioning must run after MiniMax-H3 latent preparation.")
 
         device = get_local_torch_device()
-        extrinsics, intrinsics, pixel_size = load_camera_trajectory(source)
-        if pixel_size is None:
-            # `height`/`width` are per-request scalars here but typed as optional lists on the batch.
-            height, width = _first(batch.height), _first(batch.width)
-            if height is None or width is None:
-                raise ValueError("The trajectory carries no `pixel_size` and the request has no height/width to "
-                                 "fall back on; intrinsics cannot be rescaled to the latent grid.")
-            pixel_size = (height, width)
-
-        camera_latent = build_camera_latent(
-            extrinsics.to(device=device, dtype=torch.float32),
-            intrinsics.to(device=device, dtype=torch.float32),
-            latent_height=int(layout.latent_height),
-            latent_width=int(layout.latent_width),
-            pixel_size=pixel_size,
-            num_latent_frames=int(layout.num_video_latent_frames),
-        )
-        rows = patchify_video_latents(camera_latent.to(get_compute_dtype()), self.transformer.patch_size)
-
-        # The condition prefix belongs to the references; the ControlNet only drives what is being
+        # The condition prefix belongs to the references; the trunk only drives what is being
         # generated, so the trailing target rows are the ones it is given.
         target_rows = layout.video_indices[layout.num_condition_video_rows:].to(device)
-        if rows.shape[0] != target_rows.numel():
-            raise ValueError(f"The trajectory produced {rows.shape[0]} control rows for {target_rows.numel()} target "
-                             "video rows; the ray field and the target latent grid disagree.")
 
-        batch.extra[MINIMAX_H3_CAMERA_LATENT_KEY] = rows[None]
+        if source is not None:
+            extrinsics, intrinsics, pixel_size = load_camera_trajectory(source)
+            if pixel_size is None:
+                # `height`/`width` are per-request scalars here but typed as optional lists on the batch.
+                height, width = _first(batch.height), _first(batch.width)
+                if height is None or width is None:
+                    raise ValueError("The trajectory carries no `pixel_size` and the request has no height/width to "
+                                     "fall back on; intrinsics cannot be rescaled to the latent grid.")
+                pixel_size = (height, width)
+
+            camera_latent = build_camera_latent(
+                extrinsics.to(device=device, dtype=torch.float32),
+                intrinsics.to(device=device, dtype=torch.float32),
+                latent_height=int(layout.latent_height),
+                latent_width=int(layout.latent_width),
+                pixel_size=pixel_size,
+                num_latent_frames=int(layout.num_video_latent_frames),
+            )
+            rows = patchify_video_latents(camera_latent.to(get_compute_dtype()), self.transformer.patch_size)
+            if rows.shape[0] != target_rows.numel():
+                raise ValueError(f"The trajectory produced {rows.shape[0]} control rows for {target_rows.numel()} "
+                                 "target video rows; the ray field and the target latent grid disagree.")
+            batch.extra[MINIMAX_H3_CAMERA_LATENT_KEY] = rows[None]
+
+        if depth_rows is not None and int(depth_rows.shape[1]) != target_rows.numel():
+            raise ValueError(f"The proxy produced {int(depth_rows.shape[1])} control rows for "
+                             f"{target_rows.numel()} target video rows. Block replication lands the proxy on the "
+                             "target canvas exactly, so a mismatch here means the two clips disagree on frame count "
+                             "rather than on resolution.")
+
         batch.extra[MINIMAX_H3_CAMERA_ROWS_KEY] = target_rows
-        logger.info("MiniMax-H3 camera control: %d rows over a %dx%dx%d latent grid", rows.shape[0],
-                    layout.num_video_latent_frames, layout.latent_height, layout.latent_width)
+        logger.info("MiniMax-H3 control trunk (%s): %d rows over a %dx%dx%d latent grid",
+                    "+".join(controlnet.enabled_modalities), target_rows.numel(), layout.num_video_latent_frames,
+                    layout.latent_height, layout.latent_width)
         return batch
 
 

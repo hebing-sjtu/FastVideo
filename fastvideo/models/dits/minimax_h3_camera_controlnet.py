@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Camera ControlNet for MiniMax-H3.
 
-A parallel trunk of narrow transformer blocks reads a dense camera signal — the Plücker ray field of
-the requested trajectory, optionally alongside proxy depth — and adds a zero-initialised residual
-into the backbone's residual stream every ``layer_stride`` blocks. The backbone is normally frozen,
-so this trunk is the only route by which a trajectory reaches the sampler.
+A parallel trunk of narrow transformer blocks reads a dense per-token signal and adds a
+zero-initialised residual into the backbone's residual stream every ``layer_stride`` blocks. The
+backbone is normally frozen, so this trunk is the only route by which that signal reaches the
+sampler.
+
+Two modalities can drive it, together or alone. ``camera`` is the Plücker ray field of a requested
+trajectory. ``depth`` is the proxy resampled onto the target latent grid -- named for the depth
+video it was built for, though what it carries is whatever the proxy encodes, DUV included. Running
+``depth`` alone turns the branch into a proxy ControlNet, which is how a proxy binds to the tokens
+it constrains for footage that arrived without a camera trajectory.
 
 Why a ControlNet and not another Ref2VA reference. A reference is *content*: the model reads it,
 decides how much of it to believe, and the decision is made once for the whole clip. Camera motion
@@ -360,13 +366,18 @@ class MiniMaxH3CameraTransformer3DModel(MiniMaxH3Transformer3DModel):
         self.enable_camera_controlnet = bool(getattr(arch, "camera_enable_controlnet", False))
         self.freeze_backbone_for_camera = bool(getattr(arch, "camera_freeze_backbone", True))
 
-        enabled = ["camera"]
-        if bool(getattr(arch, "camera_enable_depth", False)):
-            enabled.append("depth")
+        enabled = [
+            name for name, flag in (("camera", "camera_enable_camera"), ("depth", "camera_enable_depth"))
+            if bool(getattr(arch, flag, name == "camera"))
+        ]
 
         self.camera_controlnet: MiniMaxH3CameraControlNet | None = None
         if not self.enable_camera_controlnet:
             return
+        if not enabled:
+            raise ValueError("camera_enable_controlnet=true builds a control trunk, but both of its modalities are "
+                             "off. Enable camera_enable_camera (the Plücker ray field), camera_enable_depth (the "
+                             "proxy on the target grid), or turn the trunk off.")
 
         self.camera_controlnet = MiniMaxH3CameraControlNet(
             arch,

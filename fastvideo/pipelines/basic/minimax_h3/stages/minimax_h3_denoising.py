@@ -23,6 +23,7 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_camera_conditioning 
     MINIMAX_H3_CAMERA_ROWS_KEY,
 )
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
+    MINIMAX_H3_CONTROL_DEPTH_KEY,
     MINIMAX_H3_LAYOUT_KEY,
     MINIMAX_H3_NUM_FIXED_VIDEO_ROWS_KEY,
 )
@@ -145,14 +146,17 @@ class MiniMaxH3DenoisingStage(PipelineStage):
         text_indices = layout.text_indices.to(device)
         prompt_embeds = batch.prompt_embeds[0].to(device)
 
-        # Camera control is loop-invariant, so it is built once here rather than per step. Absent
-        # unless MiniMaxH3CameraConditioningStage ran and the request carried a trajectory; the
-        # plain backbone rejects these kwargs rather than ignoring them, so an empty dict is the
-        # only thing that keeps a non-ControlNet transformer working.
+        # Control conditioning is loop-invariant, so it is built once here rather than per step.
+        # Absent unless MiniMaxH3CameraConditioningStage ran and the request carried a trajectory or
+        # a proxy for the trunk to read; the plain backbone rejects these kwargs rather than
+        # ignoring them, so an empty dict is the only thing that keeps a non-ControlNet transformer
+        # working.
         control_kwargs: dict[str, torch.Tensor] = {}
-        camera_latent = batch.extra.get(MINIMAX_H3_CAMERA_LATENT_KEY)
-        if camera_latent is not None:
-            control_kwargs[MINIMAX_H3_CAMERA_LATENT_KEY] = camera_latent.to(device)
+        for key in (MINIMAX_H3_CAMERA_LATENT_KEY, MINIMAX_H3_CONTROL_DEPTH_KEY):
+            latent = batch.extra.get(key)
+            if latent is not None:
+                control_kwargs[key] = latent.to(device)
+        if control_kwargs:
             control_kwargs[MINIMAX_H3_CAMERA_ROWS_KEY] = batch.extra[MINIMAX_H3_CAMERA_ROWS_KEY].to(device)
 
         vsa_metadata_builder = _h3_vsa_metadata_builder(self.transformer, fastvideo_args)

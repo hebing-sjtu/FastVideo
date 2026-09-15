@@ -1,0 +1,230 @@
+# MiniMax-H3 proxy-to-video with the proxy on a ControlNet trunk.
+#
+# Why this exists. Every other scenario here feeds the proxy through H3's Ref2VA reference slot, and
+# that slot cannot express a per-token constraint. H3 packs references *ahead* of the target, so the
+# proxy sits a whole clip earlier in RoPE time -- 206.667 units at 124 frames -- and no proxy frame
+# ever shares a temporal position with the target frame it is meant to steer. It also sits at a
+# quarter of the target's resolution. What reaches the sampler is therefore a piece of content the
+# model reads once and decides how much to believe, which is enough for layout and rough heading and
+# not enough for rate: the LoRA runs on that pathway put out predictions that turn the right way at
+# the wrong speed, and their coherent drift collapsed to the random-walk floor by step 150.
+#
+# The trunk is the alternative reading of the same pixels. `fastvideo/models/dits/
+# minimax_h3_camera_controlnet.py` adds a zero-initialised residual into the backbone's stream every
+# `controlnet_layer_stride` blocks, at the exact row the signal belongs to, over the target's own
+# latent grid. Nothing about the proxy changes; where it is allowed to act does.
+#
+# The reference slot keeps the proxy anyway. The cached text embedding was tokenized around
+# `<Picture 1>` then `<Video 1>`, and the CWM system prompt spends most of its length telling the
+# model what `<Video 1>` is for. Removing it would invalidate every cached text embedding and
+# contradict a prompt this repo otherwise reproduces byte-for-byte. So the proxy is presented twice:
+# once as content the text can refer to, once as a constraint the trunk can enforce.
+#
+# --- what has to be true of the cache -------------------------------------------------------------
+#
+# `depth_latent` has to be in it, which means `--proxy-control` at encode time. The name is the
+# trunk's: it calls the modality `depth` after the depth video it was first built for, and what it
+# actually carries is whatever the proxy encodes, DUV included.
+#
+# The canvas has to be an integer multiple of the proxy grid. Getting the proxy onto the target grid
+# is a resize, and a DUV frame is three integer codes wearing an RGB costume -- interpolation
+# averages unrelated depths and paints class boundaries a code no segmenter ever predicted. So each
+# proxy pixel is replicated over an integer block instead, which introduces no code that was not
+# already written. 1344/336 == 768/192 == 4 exactly; a ratio that does not divide is an error rather
+# than a nearest-neighbour approximation, in the encoder and in the sampler both.
+#
+# This also settles a loose variable. The earlier GTA caches were written at 704x1280 while CWM's
+# released geometry is 768x1344, which left canvas confounded with everything else those runs
+# compared. 704/192 and 1280/336 do not divide, so this scenario cannot inherit that deviation.
+#
+#   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
+#       --manifest /data/binghe/h3_proxy/gta_v2_cwm_encode.jsonl \
+#       --root /data/binghe/datasets/gta_web_0902_v2/gta_web_0902 \
+#       --output /data/binghe/h3_proxy/cache/gta_v2_ctrl \
+#       --model-path /data/models/MiniMax-H3 \
+#       --num-frames 124 --height 768 --width 1344 \
+#       --proxy-height 192 --proxy-width 336 --proxy-control \
+#       --anchor-short-edge 2048 --cwm-system w0
+#
+# Expect the per-clip line to print a third shape, `control (24, 37, 48, 84)`. Encoding a second
+# full-canvas clip is roughly double the VAE work of a plain encode, and adds ~14 MB per clip.
+#
+# --- what is deliberately held fixed --------------------------------------------------------------
+#
+# `num_given_latent_frames: 1`. The `wn` regime -- CWM's 10 clean latent frames of prefix -- is the
+# other live hypothesis for the rate problem, and it pins rate by handing the model 1.4 seconds of
+# real motion. Turning both on at once means a result that cannot be attributed. This run is w0, so
+# it reads directly against the w0 LoRA baseline whose drift-to-noise numbers we already have.
+#
+# `camera_dropout: 0.0`. Dropout drops the whole trunk, and here the trunk is the only per-token
+# route the proxy has; dropping it would train the model to ignore the thing being tested. The
+# plugin rejects a nonzero value together with enable_control_depth rather than letting it through.
+#
+# `enable_control_camera: false`. The trunk's other modality is the Plücker ray field of a requested
+# trajectory. The GTA capture ships no extrinsics, so there is nothing to build one from -- and if a
+# trajectory ever does arrive, that modality is the more direct fix for camera control than a proxy
+# is, since it states the pose instead of implying it.
+#
+# Then launch (2 nodes of 8). Probe memory at one step before committing: the trunk attends over the
+# whole packed sequence, ~56k rows, at 25 injection points, so headroom is not what the LoRA runs
+# had.
+#   torchrun --nnodes 2 --nproc_per_node 8 -m fastvideo.train.entrypoint.train \
+#       --config examples/train/scenario/h3_proxy/proxy_controlnet_finetune.yaml
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
+    init_from: /data/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    # --- control trunk ---
+    enable_camera_controlnet: true
+    # The proxy on the target latent grid, read from the cache's `depth_latent`.
+    enable_control_depth: true
+    # No trajectory in the GTA capture, so the Plücker modality has nothing to read. With it off the
+    # trunk is a proxy ControlNet and the dataset loader stops requiring extrinsics.
+    enable_control_camera: false
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    # 1024 / 8 = 128 channels per head, which clears the 96 the H3 rotary table rotates. Must also
+    # divide sp_size.
+    controlnet_num_heads: 8
+    # One control block every two backbone blocks: 25 injection points over 50 layers.
+    controlnet_layer_stride: 2
+    # See the header. Nonzero is rejected alongside enable_control_depth.
+    camera_dropout: 0.0
+
+    # Trunk only. The residual is zero-initialised, so step 0 reproduces the released model exactly
+    # and anything the panel shows afterwards is the trunk's doing -- which is the whole point of
+    # running this against the LoRA baseline rather than alongside it. The alternative is
+    # freeze_backbone: false with the `lora` block from proxy_bd_finetune_abot.yaml, training both;
+    # do that only after the trunk alone has been read, or the attribution is gone again.
+    freeze_backbone: true
+
+    # --- reference conditioning ---
+    # Anchor first, proxy second: the cached text embedding was tokenized around `<Picture 1>` then
+    # `<Video 1>`, so this has to match how the data was encoded.
+    enable_anchor: true
+    # Held at the w0 contract. See the header on why this is not 10 here.
+    num_given_latent_frames: 1
+    # Game footage is silent; supervising the audio head against placeholder latents would train it
+    # towards silence for no benefit.
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    # 2 nodes of 8. These are not free knobs:
+    #   nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim
+    num_gpus: 16
+    # Probe this. sp_size 2 gives 8 data-parallel replicas, which reaches global batch 32 with the
+    # least accumulation, but the trunk's activations are new memory the LoRA runs did not carry. If
+    # a single step OOMs, go to 4 and halve gradient_accumulation_steps to hold the global batch.
+    sp_size: 2
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 16
+    pin_cpu_memory: true
+
+  data:
+    # Must be a cache written with --proxy-control: the loader raises rather than training a trunk
+    # against a missing modality. `scripts/h3_proxy/describe_cache.py` prints what a cache holds.
+    data_path: /data/binghe/h3_proxy/cache/gta_v2_ctrl
+    # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    # Both are contracts, not tuning knobs: packed row indices carry no batch offset, and H3 has no
+    # zero-embedding branch for text CFG.
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_frames: 124
+    num_latent_t: 37
+    # CWM's released geometry, and the only canvas the proxy grid divides. See the header.
+    num_height: 768
+    num_width: 1344
+
+  optimizer:
+    # A from-scratch trunk in front of a frozen backbone tolerates -- and needs -- more than the
+    # 2e-5 a LoRA finetune of the backbone would use.
+    learning_rate: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    lr_scheduler: constant_with_warmup
+    # A quarter of a 600-step run would be a warmup, so this is sized to the run and not to CWM's.
+    lr_warmup_steps: 25
+
+  loop:
+    max_train_steps: 600
+    # global batch = (num_gpus / sp_size) * train_batch_size * this = 8 * 1 * 4 = 32.
+    gradient_accumulation_steps: 4
+
+  checkpoint:
+    # Absolute, and on the data disk: a relative path resolves against the checked-out repo under
+    # `/workspace`, which does not outlive the node, and the validation mp4s land here too.
+    output_dir: /data/binghe/h3_proxy/runs/gta_v2_ctrl/checkpoints
+    # Frequent, because the question this run answers is whether coherent drift leaves the
+    # random-walk floor -- and that is read from checkpoint pairs, not from the loss curve.
+    training_state_checkpointing_steps: 25
+    checkpoints_total_limit: 20
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: gta_v2_proxy_controlnet
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+  # Logs a proxy | prediction | target panel per held-out clip. Nothing here configures the trunk:
+  # latent preparation notices the transformer has the depth modality and lifts the proxy onto the
+  # target canvas itself, from the same duv.mp4 the panel's left third shows.
+  validation:
+    _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
+    dataset_file: /data/binghe/h3_proxy/gta_v2_validation.json
+    every_steps: 50
+    run_at_start: true
+    sampling_steps: [50]
+    # H3 has no zero-embedding branch for text CFG, matching training_cfg_rate: 0.0 above.
+    guidance_scale: 1.0
+    num_frames: 124
+    # H3 packs one document per request.
+    num_videos_per_prompt: 1
+    # Required: this callback conditions through an ordered reference list, and image_path would
+    # present the proxy a second time. The callback rejects true rather than silently doubling it.
+    use_validation_media_conditioning: false
+    # Must equal the --anchor-short-edge used by encode_proxy_samples.py.
+    anchor_short_edge: 2048
+    # Must equal the encoder's --proxy-height/--proxy-width. These also set what the trunk replicates
+    # from, so a mismatch here changes the control signal and not just the reference.
+    proxy_height: 192
+    proxy_width: 336
+    # Must match encode_proxy_samples --cwm-system.
+    cwm_system_prompt: w0
+    # Must match `models.student.num_given_latent_frames` above, and `cwm_system_prompt`.
+    num_given_latent_frames: 1
+    # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
+    # edge and still shows whether the output tracks the proxy.
+    panel_height: 384
+    # A validation pipeline holds a second text encoder and VAE alongside the training state.
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+    text_encoder_cpu_offload: true
+    vae_cpu_offload: true
+
+pipeline: {}

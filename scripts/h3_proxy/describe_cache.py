@@ -85,7 +85,15 @@ def geometry(sample: dict[str, Any]) -> dict[str, Any]:
         pixels = (anchor.shape[-2] * LATENT_TO_PIXEL, anchor.shape[-1] * LATENT_TO_PIXEL)
         found["anchor_canvas"] = pixels
         found["anchor_short_edge"] = min(pixels)
-    found["camera"] = "extrinsics" in sample
+    # `camera_extrinsics` is the key the encoder writes and the loader reads; this used to look for
+    # a bare `extrinsics` and so reported every cache as having no trajectory.
+    found["camera"] = "camera_extrinsics" in sample
+    # The proxy on the target grid, written by --proxy-control. A run with enable_control_depth on
+    # refuses a cache without it, and a cache carrying it is ~14 MB per clip heavier for nothing if
+    # the trunk is off, so which one this is worth saying out loud.
+    control = sample.get("depth_latent")
+    found["proxy_control"] = ("absent" if control is None else
+                              (control.shape[-2] * LATENT_TO_PIXEL, control.shape[-1] * LATENT_TO_PIXEL))
     return found
 
 
@@ -148,8 +156,8 @@ def describe(directory: Path, args: argparse.Namespace, *, quiet: bool = False) 
             collected.setdefault(key, Counter())[value] += 1
 
     if not quiet:
-        for key in ("num_frames", "latent_frames", "target", "proxy", "anchor_canvas", "anchor_short_edge",
-                    "cwm_system", "camera"):
+        for key in ("num_frames", "latent_frames", "target", "proxy", "proxy_control", "anchor_canvas",
+                    "anchor_short_edge", "cwm_system", "camera"):
             if key in collected:
                 print(render(key, collected[key]))
 
