@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 from PIL import Image, ImageOps
 import torch
 
@@ -32,10 +33,17 @@ from fastvideo.pipelines.stages.validators import VerificationResult
 
 MINIMAX_H3_KEYFRAMES_KEY = "minimax_h3_keyframes"
 MINIMAX_H3_KEYFRAME_ANCHORS_KEY = "minimax_h3_keyframe_anchors"
-# Set by the caller to ask that the target's first latent frame be locked to the appearance anchor
-# instead of denoised. `MINIMAX_H3_FIXED_FIRST_FRAME_KEY` is this stage's answer: the anchor on the
-# target canvas, ready for the target's own encode path.
-MINIMAX_H3_LOCK_FIRST_FRAME_KEY = "minimax_h3_lock_first_frame"
+# Set by the caller: how many leading target latent frames are a given rather than something to
+# denoise. 1 is CWM's `w0` contract, where the given frame is the appearance anchor. 10 is its `wn`
+# contract ("the first 34 frames of this clip are ALREADY GIVEN"), where the given frames are real
+# footage the caller supplies through `MINIMAX_H3_GIVEN_FRAMES_KEY`.
+MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY = "minimax_h3_num_given_latent_frames"
+# Set by the caller for counts above one: decoded RGB frames of the clip whose opening is given,
+# already on H3's 24-fps timeline and trimmed to the request. This stage resizes them to the target
+# canvas; the latent stage encodes them and keeps the leading latent frames.
+MINIMAX_H3_GIVEN_FRAMES_KEY = "minimax_h3_given_frames"
+# This stage's answer: the pixels to encode into the given target rows, either one still (the
+# anchor) or a clip, both already on the target canvas.
 MINIMAX_H3_FIXED_FIRST_FRAME_KEY = "minimax_h3_fixed_first_frame"
 
 
@@ -209,8 +217,40 @@ class MiniMaxH3InputPreparationStage(PipelineStage):
         self._write_target_geometry(batch, height, width, ratio, num_frames)
         batch.extra[MINIMAX_H3_KEYFRAMES_KEY] = []
         batch.extra[MINIMAX_H3_KEYFRAME_ANCHORS_KEY] = ()
-        if batch.extra.get(MINIMAX_H3_LOCK_FIRST_FRAME_KEY):
+        given = int(batch.extra.get(MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY) or 0)
+        if given == 1:
             batch.extra[MINIMAX_H3_FIXED_FIRST_FRAME_KEY] = self._fixed_first_frame(references, height, width)
+        elif given > 1:
+            batch.extra[MINIMAX_H3_FIXED_FIRST_FRAME_KEY] = self._given_frames(batch, height, width, num_frames)
+
+    @staticmethod
+    def _given_frames(batch: ForwardBatch, height: int, width: int, num_frames: int) -> np.ndarray:
+        """Resize the caller's given clip onto the target canvas.
+
+        A prefix of more than one latent frame cannot come from the anchor: the anchor is a still,
+        and a still says nothing about how fast the scene is moving, which is the whole reason to
+        give more than one frame. So the caller has to supply real footage, and the only thing left
+        to settle here is the canvas -- resolved from the request, so it is not the caller's to
+        guess. Stretched rather than centre-cropped, matching the anchor's own path: a given frame
+        showing less of the scene than the source did would contradict the layout the proxy
+        describes.
+        """
+        frames = batch.extra.get(MINIMAX_H3_GIVEN_FRAMES_KEY)
+        if not isinstance(frames, np.ndarray) or frames.ndim != 4 or frames.shape[-1] != 3:
+            raise ValueError(f"{MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY}>1 needs "
+                             f"{MINIMAX_H3_GIVEN_FRAMES_KEY} to hold decoded RGB frames [F, H, W, 3]; got "
+                             f"{type(frames).__name__}. One latent frame can be taken from the anchor, more than "
+                             "one has to come from real footage.")
+        if frames.shape[0] < num_frames:
+            raise ValueError(f"{MINIMAX_H3_GIVEN_FRAMES_KEY} holds {frames.shape[0]} frames at 24 fps but the "
+                             f"request is {num_frames}. The given clip is encoded whole and sliced in the latent "
+                             "space, so it has to cover the request.")
+        frames = frames[:num_frames]
+        if frames.shape[1:3] == (height, width):
+            return np.ascontiguousarray(frames)
+        return np.stack([
+            np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames
+        ])
 
     @staticmethod
     def _fixed_first_frame(references: list[Any], height: int, width: int) -> Image.Image:
@@ -243,9 +283,10 @@ class MiniMaxH3InputPreparationStage(PipelineStage):
 
 __all__ = [
     "MINIMAX_H3_FIXED_FIRST_FRAME_KEY",
+    "MINIMAX_H3_GIVEN_FRAMES_KEY",
     "MINIMAX_H3_KEYFRAME_ANCHORS_KEY",
     "MINIMAX_H3_KEYFRAMES_KEY",
-    "MINIMAX_H3_LOCK_FIRST_FRAME_KEY",
+    "MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY",
     "MiniMaxH3InputPreparationStage",
     "prepare_common_request",
     "resolve_target_canvas",

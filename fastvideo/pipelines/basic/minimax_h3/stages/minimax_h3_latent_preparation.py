@@ -31,8 +31,10 @@ from fastvideo.pipelines.basic.minimax_h3.reference import (
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_conditioning import MINIMAX_H3_TEXT_TOKEN_TAGS_KEY
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import (
     MINIMAX_H3_FIXED_FIRST_FRAME_KEY,
+    MINIMAX_H3_GIVEN_FRAMES_KEY,
     MINIMAX_H3_KEYFRAME_ANCHORS_KEY,
     MINIMAX_H3_KEYFRAMES_KEY,
+    MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
@@ -108,22 +110,33 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         posterior = self.vae.encode_keyframe(self.vae.normalize_pixels(pixels)).latent_dist
         return self.vae.normalize_latents(_sample_visual_posterior(posterior).to(torch.float16).float()).cpu()
 
-    def _encode_fixed_first_frame(self, image, device: torch.device) -> torch.Tensor:
-        """Encode the anchor into the target's own latent space, keeping one latent frame.
+    def _encode_given_latent_frames(self, source, count: int, device: torch.device) -> torch.Tensor:
+        """Encode the given pixels into the target's own latent space, keeping ``count`` frames.
 
-        ``encode``, not ``encode_keyframe``: this lands in a *target* row, and target latents come
+        ``encode``, not ``encode_keyframe``: these land in *target* rows, and target latents come
         from the video encode path. That path splits its input into fixed-length clips with no
         cross-clip state, so the first latent of a still image and the first latent of the real clip
         describe the same moment through the same weights -- which is what makes a standalone anchor
         interchangeable with the clip's own first latent frame.
+
+        A multi-frame prefix is encoded *whole* and sliced afterwards rather than encoded from its
+        own 34 frames. The VAE's group structure only admits 2, 7, 12, ... latent frames, so 10 is
+        not something a standalone encode can produce; and slicing after a full encode is exactly
+        what training does to the cached target latents, so the rows agree by construction instead
+        of by a frame-count argument.
         """
-        pixels = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1)[None, :, None]
+        array = np.asarray(source)
+        if array.ndim == 3:
+            pixels = torch.from_numpy(array.copy()).permute(2, 0, 1)[None, :, None]
+        else:
+            pixels = torch.from_numpy(array.copy()).permute(3, 0, 1, 2)[None]
         pixels = pixels.to(device=device, dtype=torch.float32).div_(255.0)
         posterior = self.vae.encode(self.vae.normalize_pixels(pixels)).latent_dist
         latents = self.vae.normalize_latents(_sample_visual_posterior(posterior).to(torch.float16).float())
-        if latents.ndim != 5 or latents.shape[2] < 1:
-            raise ValueError(f"Encoding the fixed first frame produced no latent frame: {tuple(latents.shape)}.")
-        return latents[:, :, :1].cpu()
+        if latents.ndim != 5 or latents.shape[2] < count:
+            raise ValueError(f"Encoding the given frames produced {0 if latents.ndim != 5 else latents.shape[2]} "
+                             f"latent frames, fewer than the {count} being held as a given.")
+        return latents[:, :, :count].cpu()
 
     def _encode_visual_rows(
         self,
@@ -228,11 +241,13 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             raise TypeError("MiniMax-H3 Ref2VA latent preparation requires prepared references.")
 
         fixed_frame = batch.extra.get(MINIMAX_H3_FIXED_FIRST_FRAME_KEY)
+        num_given = int(batch.extra.get(MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY) or 0)
         vae_device = get_local_torch_device()
         self.vae.to(vae_device)
         try:
             video_rows = self._encode_visual_rows(references, vae_device)
-            fixed_latents = None if fixed_frame is None else self._encode_fixed_first_frame(fixed_frame, vae_device)
+            fixed_latents = (None if fixed_frame is None else self._encode_given_latent_frames(
+                fixed_frame, max(num_given, 1), vae_device))
         finally:
             if fastvideo_args.vae_cpu_offload:
                 self.vae.to("cpu")
@@ -371,14 +386,16 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
 
         num_fixed_video_rows = 0
         if fixed_video_rows is not None:
-            # Overwrite the target's first latent frame in place, after the reference prefix has
-            # been prepended, so the locked rows sit at the target's own rotary coordinates rather
+            # Overwrite the target's leading latent frames in place, after the reference prefix has
+            # been prepended, so the given rows sit at the target's own rotary coordinates rather
             # than in the prefix. That position is the whole point: the prefix is read once for the
-            # clip, while these rows say "at t=0 the scene looks exactly like this".
-            num_fixed_video_rows = target_rows_per_latent_frame(layout, self.transformer.patch_size)
+            # clip, while these rows say "this is what the take is actually doing, right here".
+            given = max(int(batch.extra.get(MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY) or 0), 1)
+            rows_per_frame = target_rows_per_latent_frame(layout, self.transformer.patch_size)
+            num_fixed_video_rows = given * rows_per_frame
             if fixed_video_rows.shape[0] != num_fixed_video_rows:
-                raise ValueError(f"The fixed first frame occupies {fixed_video_rows.shape[0]} rows but one target "
-                                 f"latent frame is {num_fixed_video_rows} rows; the anchor was encoded on a canvas "
+                raise ValueError(f"The given frames occupy {fixed_video_rows.shape[0]} rows but {given} target "
+                                 f"latent frame(s) are {num_fixed_video_rows} rows; they were encoded on a canvas "
                                  "other than the target's.")
             start = layout.num_condition_video_rows
             video_rows[start:start + num_fixed_video_rows] = fixed_video_rows.to(video_rows)
@@ -391,6 +408,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         batch.extra.pop(MINIMAX_H3_KEYFRAMES_KEY, None)
         batch.extra.pop(MINIMAX_H3_KEYFRAME_ANCHORS_KEY, None)
         batch.extra.pop(MINIMAX_H3_FIXED_FIRST_FRAME_KEY, None)
+        batch.extra.pop(MINIMAX_H3_GIVEN_FRAMES_KEY, None)
         batch.references = None
         return batch
 

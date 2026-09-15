@@ -102,9 +102,9 @@ what the encoder was told, and none of them is checked against the cache.
 | `anchor_short_edge` | the encoder's `--anchor-short-edge` |
 | `proxy_height` / `proxy_width` | the encoder's `--proxy-height` / `--proxy-width` |
 | `cwm_system_prompt` | the encoder's `--cwm-system` |
-| `lock_first_frame` | `models.student.lock_first_frame` |
+| `num_given_latent_frames` | `models.student.num_given_latent_frames`, and the regime `--cwm-system` names: 1 for `w0`, 10 for `wn` |
 
-The callback's defaults are the released values — 2048, 192 x 336, `w0`, locked — so a cache built at
+The callback's defaults are the released values — 2048, 192 x 336, `w0`, one given frame — so a cache built at
 the defaults needs no overrides at all. The failure mode is the reverse: overriding one of these to
 chase a cache that was itself built off-spec, or leaving a default in place against a cache that was
 not.

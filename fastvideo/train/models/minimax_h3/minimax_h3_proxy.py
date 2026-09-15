@@ -12,14 +12,28 @@ their own rotary coordinates, held at a near-clean timestep while the target den
 proxy there needs no architectural change at all. A single RGB anchor frame goes in the slot ahead
 of it to fix appearance, which the proxy by construction cannot supply.
 
-**The anchor also locks the target's first latent frame.** The reference prefix is read once for the
-whole clip and sits at its own rotary coordinates, so it says what the scene looks like but not
-where the camera starts. Writing the anchor into target latent frame 0 and holding it there says
-both, and it is what the released ``AWM_PROXY_CONTROL`` system prompt already promises the model
-("the first frame of the target is locked to this exact image ... camera framing and layout").
-Without it the proxy only ever constrains motion relative to an initial pose the model is free to
-invent. The locked row is a given rather than a target: it is held at the reference prefix's noise
-amount, excluded from the loss here, and excluded from every scheduler step at sampling time.
+**Some leading target latent frames are a given, not a target.** The reference prefix is read once
+for the whole clip and sits at its own rotary coordinates, so it says what the scene looks like but
+not where the camera starts, nor how fast anything in it moves. Handing the model real target
+frames at the target's own coordinates says both. ``num_given_latent_frames`` sets how many, and the
+count has to match the CWM system prompt the cache's text was wrapped in, because that prompt states
+the contract the model is being held to:
+
+``1`` is the ``w0`` contract -- "this clip is the very beginning of the take", with "the first frame
+of the target locked to this exact image ... camera framing and layout". It fixes the starting pose
+    20|the proxy's motion is relative to, but leaves the *rate* of that motion to be inferred from a
+reference the layout gives no frame-to-frame registration with.
+
+``10`` is the ``wn`` contract -- "The first 34 frames (1.4167 seconds) of this clip are ALREADY
+GIVEN ... continue the video seamlessly: the same ongoing time, positions, poses, action phase and
+camera simply carry forward". This is the regime CWM generates every window past the first in, and
+its ``VIDEO_PREFIX_LATENTS = 10`` is the count paired with those 34 frames. Real footage at the
+target's own coordinates establishes the motion rate directly, which leaves the proxy steering
+rather than also having to set the clock.
+
+Given rows are held at the reference prefix's noise amount, excluded from the loss here, and
+excluded from every scheduler step at sampling time -- the same mask CWM applies as
+``video_mask[:, :, :VIDEO_PREFIX_LATENTS] = False``.
 
 **The camera rides a ControlNet.** A trajectory is not content; it is a per-token constraint, and it
 has to bind tightly enough that the same proxy under two trajectories yields two different videos. A
@@ -107,7 +121,8 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         camera_dropout: float = 0.1,
         # --- reference conditioning ---
         enable_anchor: bool = True,
-        lock_first_frame: bool = True,
+        num_given_latent_frames: int = 1,
+        lock_first_frame: bool | None = None,
         supervise_audio: bool = False,
         lora: Any = None,
     ) -> None:
@@ -121,12 +136,21 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         self._freeze_backbone = bool(freeze_backbone)
         self._camera_dropout = float(camera_dropout)
         self._enable_anchor = bool(enable_anchor)
-        self._lock_first_frame = bool(lock_first_frame)
         self._supervise_audio = bool(supervise_audio)
 
-        if self._lock_first_frame and not self._enable_anchor:
-            raise ValueError("lock_first_frame=true needs enable_anchor=true: the frame it locks is the anchor, and "
-                             "sampling has nothing else to put there.")
+        if lock_first_frame is not None:
+            # A boolean cannot express the wn regime, and silently reading it as 1 would train the
+            # w0 contract against a cache wrapped in wn's "the first 34 frames are ALREADY GIVEN".
+            raise ValueError("lock_first_frame was replaced by num_given_latent_frames, which has to say how many "
+                             f"frames are given rather than whether any are: pass num_given_latent_frames="
+                             f"{1 if lock_first_frame else 0} for the old lock_first_frame={lock_first_frame} "
+                             "behaviour, or 10 to train CWM's wn regime.")
+        self._num_given_latent_frames = int(num_given_latent_frames)
+        if self._num_given_latent_frames < 0:
+            raise ValueError(f"num_given_latent_frames must be non-negative, got {num_given_latent_frames!r}")
+        if self._num_given_latent_frames and not self._enable_anchor:
+            raise ValueError("num_given_latent_frames>0 needs enable_anchor=true: sampling fills the first given "
+                             "frame from the anchor, and has nothing else to put there.")
         if self._enable_control_depth and not self._enable_camera_controlnet:
             raise ValueError("enable_control_depth=true requires enable_camera_controlnet=true; depth is a second "
                              "modality on the camera trunk, not a branch of its own.")
@@ -357,6 +381,10 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             raise ValueError(f"vae_latent must have shape [1, {_VIDEO_LATENT_CHANNELS}, frames, height, width], "
                              f"got {tuple(video_latents.shape)}")
         _, _, num_latent_frames, latent_height, latent_width = video_latents.shape
+        if self._num_given_latent_frames >= num_latent_frames:
+            raise ValueError(f"num_given_latent_frames={self._num_given_latent_frames} leaves nothing to denoise in a "
+                             f"{num_latent_frames}-latent-frame clip. CWM's wn regime gives 10 of 37; a cache with "
+                             "fewer latent frames needs a proportionally smaller prefix.")
 
         data_config = self.training_config.data
         num_audio_latents = audio_latent_num_frames(int(data_config.num_frames))
@@ -397,19 +425,20 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
                           (1.0 - MINIMAX_H3_KEYFRAME_NOISE_AUG) * condition_noise)
 
         noisy_video = (1.0 - video_sigmas) * video_latents + video_sigmas * video_noise
-        if self._lock_first_frame:
-            # Target latent frame 0 is a given, not a target. Sampling hands the model the anchor
-            # there and never denoises it, so training has to present that row the same way: held at
-            # the reference prefix's own near-clean amount, and carrying no gradient.
+        given = self._num_given_latent_frames
+        if given:
+            # The leading target latent frames are a given, not a target. Sampling hands the model
+            # real footage there and never denoises it, so training has to present those rows the
+            # same way: held at the reference prefix's own near-clean amount, carrying no gradient.
             #
             # Two independent tensors do the two halves. `noisy_video` is what the model sees, so it
-            # gets the augmented anchor. `video_noise` is only ever read as the flow target
-            # `noise - clean`, so substituting the clean latent there makes frame 0's target exactly
-            # zero, which `predict_noise` matches by zeroing its prediction. The row still occupies
-            # 1/37 of the loss mean as zeros, a constant factor that changes nothing across steps.
+            # gets the augmented footage. `video_noise` is only ever read as the flow target
+            # `noise - clean`, so substituting the clean latent there makes those frames' target
+            # exactly zero, which `predict_noise` matches by zeroing its prediction. The rows still
+            # occupy given/37 of the loss mean as zeros, a constant factor across steps.
             aug = MINIMAX_H3_KEYFRAME_NOISE_AUG
-            noisy_video[:, :, :1] = aug * video_latents[:, :, :1] + (1.0 - aug) * video_noise[:, :, :1]
-            video_noise[:, :, :1] = video_latents[:, :, :1]
+            noisy_video[:, :, :given] = aug * video_latents[:, :, :given] + (1.0 - aug) * video_noise[:, :, :given]
+            video_noise[:, :, :given] = video_latents[:, :, :given]
 
         control = self._camera_rows(
             raw_batch,
@@ -485,8 +514,8 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         num_audio_latents = audio_latents.shape[-1]
         audio_rows = audio_latents.permute(0, 1, 3, 2).reshape(-1, _AUDIO_LATENT_CHANNELS)
 
-        num_fixed_video_rows = (target_rows_per_latent_frame(layout, self.transformer.patch_size)
-                                if self._lock_first_frame else 0)
+        num_fixed_video_rows = (self._num_given_latent_frames *
+                                target_rows_per_latent_frame(layout, self.transformer.patch_size))
         video_timestep = float(batch.timesteps[0])
         unique_timesteps, timestep_indices = build_row_timesteps(
             layout,
@@ -534,12 +563,13 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             _VIDEO_LATENT_CHANNELS,
             self.transformer.patch_size,
         ).permute(0, 2, 1, 3, 4)
-        if num_fixed_video_rows:
-            # The locked frame's flow target was blanked in `prepare_batch`; blanking the prediction
-            # here is the other half, and keeps the row from pulling the adapters towards predicting
-            # zero velocity on frames that are genuinely being denoised.
+        given = self._num_given_latent_frames
+        if given:
+            # The given frames' flow target was blanked in `prepare_batch`; blanking the prediction
+            # here is the other half, and keeps those rows from pulling the adapters towards
+            # predicting zero velocity on frames that are genuinely being denoised.
             video_prediction = torch.cat(
-                (torch.zeros_like(video_prediction[:, :1]), video_prediction[:, 1:]),
+                (torch.zeros_like(video_prediction[:, :given]), video_prediction[:, given:]),
                 dim=1,
             )
         if not self._supervise_audio:

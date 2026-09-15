@@ -50,9 +50,33 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         proxy_height: int = 192,
         proxy_width: int = 336,
         cwm_system_prompt: str = "w0",
-        lock_first_frame: bool = True,
+        num_given_latent_frames: int = 1,
+        lock_first_frame: bool | None = None,
         **kwargs: Any,
     ) -> None:
+        # Before the base, which loads a pipeline: a contradiction between the given-frame count and
+        # the system prompt is decidable from the arguments alone, and is cheaper to report than to
+        # discover after a model is resident.
+        #
+        # Must match the model plugin's `num_given_latent_frames` *and* the CWM system prompt the
+        # cache's text was wrapped in: 1 is w0's "the first frame is locked to this image", 10 is
+        # wn's "the first 34 frames are ALREADY GIVEN". Sampling with fewer given frames than
+        # training supervised under leaves the model inventing rows it was never asked to predict.
+        if lock_first_frame is not None:
+            raise ValueError("lock_first_frame was replaced by num_given_latent_frames, which has to say how many "
+                             f"frames are given rather than whether any are: pass num_given_latent_frames="
+                             f"{1 if lock_first_frame else 0} for the old lock_first_frame={lock_first_frame} "
+                             "behaviour, or 10 to sample CWM's wn regime.")
+        self.num_given_latent_frames = int(num_given_latent_frames)
+        if self.num_given_latent_frames < 0:
+            raise ValueError(f"num_given_latent_frames must be non-negative, got {num_given_latent_frames!r}")
+        role = str(cwm_system_prompt or "none")
+        if self.num_given_latent_frames > 1 and role != "wn":
+            raise ValueError(f"num_given_latent_frames={self.num_given_latent_frames} is CWM's wn regime, but "
+                             f"cwm_system_prompt={role!r}. The w0 prompt tells the model this clip is the very "
+                             "beginning of the take with nothing preceding it, which contradicts handing it footage "
+                             "to continue; set cwm_system_prompt: wn and encode the cache to match.")
+
         super().__init__(**kwargs)
         self.panel_labels = self._coerce_bool(panel_labels)
         self.panel_separator_px = int(panel_separator_px)
@@ -79,11 +103,7 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         if min(self.proxy_size) <= 0:
             raise ValueError(f"proxy_height and proxy_width must be positive, got {self.proxy_size}.")
         # Must match how the training cache's text embedding was wrapped. ABot clips are window 0.
-        self.cwm_system_prompt = str(cwm_system_prompt or "none")
-        # Must match the model plugin's `lock_first_frame`. Sampling without the lock that training
-        # supervised under leaves the first latent frame to be invented, which is exactly the
-        # degree of freedom the lock exists to remove.
-        self.lock_first_frame = self._coerce_bool(lock_first_frame)
+        self.cwm_system_prompt = role
         # The base gates its second video stream on `overlay_actions`. Nothing about that plumbing
         # is overlay-specific -- it saves, gathers across sequence-parallel groups, and logs under
         # its own key -- so the comparison panel rides it rather than duplicating the 170-line
@@ -144,10 +164,14 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         if self.cwm_system_prompt and self.cwm_system_prompt != "none":
             batch.extra[CWM_SYSTEM_PROMPT_KEY] = self.cwm_system_prompt
 
-        if self.lock_first_frame:
+        if self.num_given_latent_frames:
             from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import (
-                MINIMAX_H3_LOCK_FIRST_FRAME_KEY, )
-            batch.extra[MINIMAX_H3_LOCK_FIRST_FRAME_KEY] = True
+                MINIMAX_H3_GIVEN_FRAMES_KEY,
+                MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY,
+            )
+            batch.extra[MINIMAX_H3_NUM_GIVEN_LATENT_FRAMES_KEY] = self.num_given_latent_frames
+            if self.num_given_latent_frames > 1:
+                batch.extra[MINIMAX_H3_GIVEN_FRAMES_KEY] = self._given_frames(validation_batch)
 
         # Held for `_post_process_validation_frames`, which the base calls later in the same loop
         # iteration and does not pass the record to.
@@ -173,6 +197,31 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
             decode_reference_video, )
         frames, _, _ = decode_reference_video(target)
         return Image.fromarray(frames[0])
+
+    def _given_frames(self, record: dict[str, Any]) -> np.ndarray:
+        """The target clip on H3's 24-fps timeline, to be encoded and sliced for the given prefix.
+
+        The whole clip, not its first 34 frames: the latent stage encodes it and keeps the leading
+        latent frames, because the VAE's group structure cannot produce 10 latent frames from a
+        standalone encode and slicing a full encode is what training does to the cached target.
+
+        Using the target's own opening is the validation analogue of CWM's windowed inference, where
+        every window past the first continues the previous window's decoded output. It does mean
+        this regime cannot be evaluated without a target, which is the point: the prefix is real
+        footage by definition.
+        """
+        target = self._record_path(record, TARGET_PATH_KEY)
+        if target is None:
+            raise ValueError(f"num_given_latent_frames={self.num_given_latent_frames} needs {TARGET_PATH_KEY!r} to "
+                             "supply the given footage; the record has none. Only a one-frame prefix can be taken "
+                             "from the anchor.")
+        from fastvideo.pipelines.basic.minimax_h3.reference import (
+            decode_reference_video,
+            resample_reference_frames,
+        )
+
+        frames, source_fps, _ = decode_reference_video(target)
+        return resample_reference_frames(frames, source_fps)
 
     @staticmethod
     def _record_path(record: dict[str, Any], key: str) -> str | None:

@@ -14,16 +14,30 @@ own rotary coordinates, held at a near-clean timestep while the target denoises.
 there needs no architectural change at all. A single RGB anchor frame goes in the slot ahead of it to
 fix appearance, which a depth/semantic proxy by construction cannot supply.
 
-**The anchor also locks the target's first latent frame** (`lock_first_frame`, on by default). The
+**Some leading target latent frames are a given** (`num_given_latent_frames`, 1 by default). The
 prefix is read once for the whole clip and sits at its own rotary coordinates, so it says what the
-scene looks like but not where the camera starts — which leaves the proxy constraining motion
-relative to an initial pose the model invents. Writing the anchor into target latent frame 0 and
-holding it there says both, and it is what the released `AWM_PROXY_CONTROL` system prompt already
-tells the model has happened: *"the first frame of the target is locked to this exact image …
-camera framing and layout"*. The locked row is a given rather than a target: held at the reference
-prefix's noise amount, left out of the loss, and left out of every scheduler step at sampling time.
-Sampling re-encodes the anchor onto the *target* canvas for this, since the row it lands in is a
-target row — the same thing the released inference cache does with its `input_video.safetensors`.
+scene looks like but neither where the camera starts nor how fast anything moves — which leaves the
+proxy constraining motion relative to an initial pose the model invents, at a rate it also invents.
+Handing it real target frames at the target's own coordinates says both. Given rows are held at the
+reference prefix's noise amount, left out of the loss, and left out of every scheduler step at
+sampling time — the same mask CWM applies as `video_mask[:, :, :VIDEO_PREFIX_LATENTS] = False`.
+
+The count has to match the CWM system prompt the cache's text was wrapped in, because that prompt
+states the contract the model is held to. Both the trainer and the validation callback raise rather
+than let the two drift apart.
+
+| `num_given_latent_frames` | `--cwm-system` | what the prompt promises | where the pixels come from |
+| --- | --- | --- | --- |
+| 1 | `w0` | *"this clip is the very beginning of the take"*, with *"the first frame of the target locked to this exact image … camera framing and layout"* | the anchor, re-encoded onto the *target* canvas since the row it lands in is a target row — what the released inference cache does with its `input_video.safetensors` |
+| 10 | `wn` | *"The first 34 frames (1.4167 seconds) of this clip are ALREADY GIVEN … continue the video seamlessly: the same ongoing time, positions, poses, action phase and camera simply carry forward"* | real footage; validation takes the record's target clip, as CWM's windows past the first take the previous window's decoded output |
+
+10 is CWM's own `VIDEO_PREFIX_LATENTS`, the count it pairs with those 34 frames. Real footage at the
+target's coordinates establishes the motion rate directly, which leaves the proxy steering rather
+than also having to set the clock — the layout gives it no frame-to-frame registration with the
+target to set it from. The prefix is encoded as a whole clip and sliced in the latent space: the
+VAE's group structure only admits 2, 7, 12, … latent frames, so 10 is not something a standalone
+34-frame encode can produce, and slicing a full encode is exactly what training does to the cached
+target latents.
 
 **The camera is a per-token constraint**, not content. Token `(t, h, w)` must show whatever the world
 puts along one specific ray, and the binding has to be tight enough that the same proxy under two

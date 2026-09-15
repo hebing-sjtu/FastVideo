@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Locking target latent frame 0 to the appearance anchor: row grouping and canvas."""
+"""Holding leading target latent frames as a given: row grouping, canvas, and regime contract."""
 
+import numpy as np
 from PIL import Image
 import pytest
 import torch
@@ -13,7 +14,10 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
 )
 from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference, MiniMaxH3Reference
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import (
-    MiniMaxH3InputPreparationStage, )
+    MINIMAX_H3_GIVEN_FRAMES_KEY,
+    MiniMaxH3InputPreparationStage,
+)
+from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 
 PATCH_SIZE = (1, 2, 2)
 
@@ -98,3 +102,55 @@ def test_fixed_first_frame_requires_an_image_reference():
             768,
             1344,
         )
+
+
+def test_given_rows_scale_with_the_prefix_length():
+    """CWM's wn regime holds 10 latent frames, so the fixed row count has to be a multiple."""
+    layout = _layout(num_latent_frames=4)
+    rows_per_frame = target_rows_per_latent_frame(layout, PATCH_SIZE)
+    given = 3
+    timesteps = build_row_timesteps(layout, 0.25, 0.5, 0.999, 0.75, given * rows_per_frame)
+    amounts = timesteps[0][timesteps[1]]
+
+    start = layout.num_condition_video_rows
+    fixed = layout.video_indices[start:start + given * rows_per_frame]
+    denoised = layout.video_indices[start + given * rows_per_frame:]
+    assert torch.all(amounts[fixed] == 0.999)
+    assert torch.all(amounts[denoised] == 0.25)
+    # One latent frame is left to predict out of four, and it is the last one.
+    assert denoised.numel() == rows_per_frame
+
+
+def test_given_frames_land_on_the_target_canvas():
+    frames = np.zeros((6, 480, 640, 3), dtype=np.uint8)
+    batch = ForwardBatch(data_type="video", prompt="x")
+    batch.extra[MINIMAX_H3_GIVEN_FRAMES_KEY] = frames
+    resized = MiniMaxH3InputPreparationStage._given_frames(batch, 768, 1344, 4)
+    # Trimmed to the request and stretched onto the target canvas, as the anchor's path is.
+    assert resized.shape == (4, 768, 1344, 3)
+
+
+def test_given_frames_rejects_a_still_and_a_short_clip():
+    batch = ForwardBatch(data_type="video", prompt="x")
+    batch.extra[MINIMAX_H3_GIVEN_FRAMES_KEY] = Image.new("RGB", (64, 64))
+    with pytest.raises(ValueError, match="decoded RGB frames"):
+        MiniMaxH3InputPreparationStage._given_frames(batch, 768, 1344, 4)
+
+    batch.extra[MINIMAX_H3_GIVEN_FRAMES_KEY] = np.zeros((3, 64, 64, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="holds 3 frames"):
+        MiniMaxH3InputPreparationStage._given_frames(batch, 768, 1344, 4)
+
+
+def test_lock_first_frame_is_rejected_rather_than_read_as_one():
+    """A boolean cannot express wn's 10 given frames, so silently reading it as 1 is a trap."""
+    from fastvideo.train.callbacks.minimax_h3_proxy_validation import MiniMaxH3ProxyValidationCallback
+
+    with pytest.raises(ValueError, match="num_given_latent_frames"):
+        MiniMaxH3ProxyValidationCallback(lock_first_frame=True)
+
+
+def test_a_multi_frame_prefix_requires_the_wn_prompt():
+    from fastvideo.train.callbacks.minimax_h3_proxy_validation import MiniMaxH3ProxyValidationCallback
+
+    with pytest.raises(ValueError, match="very beginning of the take"):
+        MiniMaxH3ProxyValidationCallback(num_given_latent_frames=10, cwm_system_prompt="w0")
