@@ -19,6 +19,10 @@ import numpy as np
 import pytest
 import torch
 
+from fastvideo.models.dits.minimax_h3_camera_controlnet import (
+    CAMERA_CONTROL_LATENT_KWARGS,
+    CAMERA_CONTROL_MODALITIES,
+)
 from fastvideo.pipelines.basic.minimax_h3.packing import patchify_video_latents, replicate_latents_to_grid
 from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
@@ -142,6 +146,26 @@ def test_an_unencoded_reference_is_reported_rather_than_skipped():
 
     with pytest.raises(ValueError, match="latents are missing"):
         _stage(("proxy", ))._control_proxy_rows([reference], _batch())
+
+
+# --- which kwargs reach the trunk ----------------------------------------------------------------
+
+
+def test_every_modality_has_exactly_one_forward_kwarg():
+    """A modality added to the registry without a kwarg would build embeddings nothing ever feeds."""
+    assert len(CAMERA_CONTROL_LATENT_KWARGS) == len(CAMERA_CONTROL_MODALITIES)
+    for modality, kwarg in zip(CAMERA_CONTROL_MODALITIES, CAMERA_CONTROL_LATENT_KWARGS, strict=True):
+        assert modality in kwarg
+
+
+def test_the_reference_prefix_is_not_a_trunk_kwarg():
+    """`prepare_batch` keeps the prefix rows in the same dict as the control rows.
+
+    So the dict cannot be forwarded wholesale, and the backbone rejects an unknown kwarg rather than
+    ignoring it -- which turns a wholesale forward into an immediate TypeError rather than a branch
+    that silently does nothing.
+    """
+    assert "condition_video_rows" not in CAMERA_CONTROL_LATENT_KWARGS
 
 
 def test_the_staged_latent_is_unpadded_so_it_can_be_replicated():

@@ -72,6 +72,11 @@ logger = init_logger(__name__)
 # Modality order is fixed: it decides the concatenation order into `fusion_proj` and is therefore
 # part of the ControlNet's state-dict contract.
 CAMERA_CONTROL_MODALITIES: tuple[str, ...] = ("camera", "proxy")
+# The forward kwarg each modality's rows arrive as. Callers assemble control rows in a dict
+# alongside other per-batch tensors, so they have to select by these names rather than forward that
+# dict wholesale -- the backbone rejects an unknown kwarg rather than ignoring it, which is what
+# makes a wholesale forward a loud failure instead of a silently inert branch.
+CAMERA_CONTROL_LATENT_KWARGS: tuple[str, ...] = ("camera_latent", "proxy_control_latent")
 
 
 class MiniMaxH3CameraControlBlock(nn.Module):

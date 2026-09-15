@@ -59,6 +59,7 @@ import torch
 
 from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
+from fastvideo.models.dits.minimax_h3_camera_controlnet import CAMERA_CONTROL_LATENT_KWARGS
 from fastvideo.pipelines import TrainingBatch
 from fastvideo.pipelines.basic.minimax_h3.camera import build_camera_latent
 from fastvideo.pipelines.basic.minimax_h3.packing import (
@@ -543,11 +544,12 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         timestep_indices = timestep_indices.to(device)
         video_indices = layout.video_indices.to(device)
 
-        # An empty `control` is how a dropped or disabled trunk opts out: without the row indices the
-        # branch cannot place a residual, and the forward skips it.
-        control_kwargs: dict[str, torch.Tensor] = {}
-        if control:
-            control_kwargs.update(control)
+        # Selected by name, not forwarded wholesale: `control` also carries `condition_video_rows`,
+        # which belongs to the reference prefix and is not a trunk kwarg. An empty result is how a
+        # dropped or disabled trunk opts out -- without the row indices the branch cannot place a
+        # residual, and the forward skips it.
+        control_kwargs = {key: control[key] for key in CAMERA_CONTROL_LATENT_KWARGS if key in control}
+        if control_kwargs:
             control_kwargs["camera_row_indices"] = video_indices[layout.num_condition_video_rows:]
 
         with torch.autocast(device.type, dtype=dtype), set_forward_context(
