@@ -154,3 +154,16 @@ def test_a_multi_frame_prefix_requires_the_wn_prompt():
 
     with pytest.raises(ValueError, match="very beginning of the take"):
         MiniMaxH3ProxyValidationCallback(num_given_latent_frames=10, cwm_system_prompt="w0")
+
+
+@pytest.mark.parametrize("given", [0, 1])
+def test_the_wn_prompt_requires_a_multi_frame_prefix(given):
+    """The direction a step-0 baseline falls into: a wn cache sampled by a w0 config.
+
+    Nothing downstream notices. The prompt promises thirty-four given frames, the rows supply one,
+    and the panel reads as a bad checkpoint rather than as a misconfigured run.
+    """
+    from fastvideo.train.callbacks.minimax_h3_proxy_validation import MiniMaxH3ProxyValidationCallback
+
+    with pytest.raises(ValueError, match="ALREADY GIVEN"):
+        MiniMaxH3ProxyValidationCallback(num_given_latent_frames=given, cwm_system_prompt="wn")

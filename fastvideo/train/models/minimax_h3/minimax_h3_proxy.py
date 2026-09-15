@@ -317,6 +317,34 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             rows.append(patchify_video_latents(latents, patch_size))
         return references, rows
 
+    def _check_given_frames_against_cache(self, raw_batch: dict[str, Any]) -> None:
+        """Hold the given-frame count against the prompt the cache's text was actually wrapped in.
+
+        The CWM system prompt is baked into ``text_embedding`` at encode time, and it states the
+        contract the model is held to: w0 says this clip is the very beginning of the take with its
+        first frame locked to the anchor, wn says the first 34 frames are already given. Neither is
+        a hint the model can weigh against the rows it receives -- if the two disagree, the prompt
+        wins and the rows are noise against it.
+
+        Checking against ``info["cwm_system"]`` rather than against a second config field is the
+        point: the config can be wrong in the same direction twice, whereas the cache records what
+        was encoded. A run that pairs a wn cache with a single given frame trains the model to
+        continue footage it was never shown, and nothing else in the stack notices.
+        """
+        role = ((raw_batch.get("info_list") or [{}])[0] or {}).get("cwm_system")
+        if not role or role == "none":
+            return
+        given = self._num_given_latent_frames
+        if role == "wn" and given <= 1:
+            raise ValueError(f"the cache's text was wrapped in CWM's wn prompt -- 'The first 34 frames (1.4167 "
+                             f"seconds) of this clip are ALREADY GIVEN' -- but num_given_latent_frames={given} hands "
+                             "the model none of them. Set num_given_latent_frames=10 (CWM's VIDEO_PREFIX_LATENTS), "
+                             "or point the run at a cache encoded with --cwm-system w0.")
+        if role == "w0" and given != 1:
+            raise ValueError(f"the cache's text was wrapped in CWM's w0 prompt -- the first frame of the target is "
+                             f"locked to the anchor image -- but num_given_latent_frames={given}. Set it to 1, or "
+                             "point the run at a cache encoded with --cwm-system wn.")
+
     def _camera_rows(
         self,
         raw_batch: dict[str, Any],
@@ -400,6 +428,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             raise ValueError(f"num_given_latent_frames={self._num_given_latent_frames} leaves nothing to denoise in a "
                              f"{num_latent_frames}-latent-frame clip. CWM's wn regime gives 10 of 37; a cache with "
                              "fewer latent frames needs a proportionally smaller prefix.")
+        self._check_given_frames_against_cache(raw_batch)
 
         data_config = self.training_config.data
         num_audio_latents = audio_latent_num_frames(int(data_config.num_frames))

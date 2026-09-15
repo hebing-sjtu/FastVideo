@@ -406,6 +406,25 @@ makes every setting that shapes a state-dict key agree *by construction* rather 
 someone picked the same file. `--config`, `--cache` and `--val-json` still override it, and
 `--step 0` requires the last two, being the one case with no checkpoint to read them from.
 
+Anything after a bare `--` is passed through to the trainer, last on the launch line, and recorded
+in `eval_manifest.json` — because it changes what was sampled, and a wn baseline and a w0 baseline
+are both "step 0" without being the same picture. This is how a regime the config does not describe
+gets sampled; `--step 0`'s default config is w0, so a wn cache needs it:
+
+```bash
+scripts/h3_proxy/eval_checkpoint.sh --step 0 \
+    --cache /data/binghe/h3_proxy/cache/gta_v2_cwm_wn \
+    --val-json /data/binghe/h3_proxy/gta_v2_validation.json \
+    -- --models.student.num_given_latent_frames 10 \
+       --callbacks.validation.num_given_latent_frames 10 \
+       --callbacks.validation.cwm_system_prompt wn
+```
+
+Forgetting them used to sample silently: the wn prompt promises the model 34 given frames while the
+rows supply one. Both the callback and the trainer now refuse that pairing — the trainer against
+`info["cwm_system"]` in the cache itself, which is the only record of what the text was wrapped in
+and cannot be wrong in the same direction as the config.
+
 The proof that the weights arrived is the resume's own log line, before any sampling is paid for:
 
 ```

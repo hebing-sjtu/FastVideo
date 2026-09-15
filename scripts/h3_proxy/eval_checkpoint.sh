@@ -29,6 +29,18 @@
 #         --val-json /data/binghe/h3_proxy/gta_v2_validation_val6.json
 #
 # `--step 0` is the base-model baseline and is the one case that legitimately has no checkpoint.
+#
+# Anything after a bare `--` is passed through to the trainer as extra overrides, and recorded in the
+# manifest so two runs can still be compared. That is how a regime the default config does not
+# describe gets sampled -- notably CWM's wn contract, which the default w0 config would otherwise
+# sample with one given frame against a prompt promising thirty-four::
+#
+#     scripts/h3_proxy/eval_checkpoint.sh --step 0 \
+#         --cache /data/binghe/h3_proxy/cache/gta_v2_cwm_wn \
+#         --val-json /data/binghe/h3_proxy/gta_v2_validation.json \
+#         -- --models.student.num_given_latent_frames 10 \
+#            --callbacks.validation.num_given_latent_frames 10 \
+#            --callbacks.validation.cwm_system_prompt wn
 
 set -euo pipefail
 
@@ -46,6 +58,9 @@ OUT=""
 TAG=""
 LIST=""
 RUNS_ROOT=/data/binghe/h3_proxy/runs
+# Trainer overrides after a bare `--`. Last on the torchrun line, so they win over what this script
+# derives -- the geometry included, which is worth knowing before overriding it.
+EXTRA=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --nproc) NPROC="$2"; shift 2 ;;
         --list) LIST=1; shift ;;
         --runs-root) RUNS_ROOT="$2"; shift 2 ;;
+        --) shift; EXTRA=("$@"); break ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -244,7 +260,8 @@ mkdir -p "$OUT"
 # Values travel as argv rather than interpolated into the source, so a path holding a quote writes
 # a manifest instead of a syntax error.
 python - "$OUT/eval_manifest.json" \
-    "$STEP" "$CKPT" "$CONFIG_SOURCE" "$CACHE" "$GEOM" "$VAL_JSON" "$EVERY" "$NPROC" <<'PY'
+    "$STEP" "$CKPT" "$CONFIG_SOURCE" "$CACHE" "$GEOM" "$VAL_JSON" "$EVERY" "$NPROC" \
+    ${EXTRA[@]+"${EXTRA[@]}"} <<'PY'
 import json, sys
 
 out, step, ckpt, config_source, cache, geometry, val_json, every, nproc = sys.argv[1:10]
@@ -259,6 +276,9 @@ with open(out, "w", encoding="utf-8") as handle:
             "val_json": val_json,
             "every_steps": int(every),
             "nproc": int(nproc),
+            # Recorded because they change what was sampled. A wn baseline and a w0 baseline are
+            # both "step 0" and are not the same picture, and the mp4 does not say which it is.
+            "extra_overrides": sys.argv[10:],
         },
         handle,
         indent=2,
@@ -281,4 +301,4 @@ torchrun --standalone --nproc_per_node "$NPROC" \
     --callbacks.validation.run_at_start true \
     --training.checkpoint.output_dir "$OUT" \
     --training.tracker.run_name "eval_$(basename "$CACHE")_step${STEP}${TAG:+_$TAG}" \
-    $GEOM
+    $GEOM ${EXTRA[@]+"${EXTRA[@]}"}

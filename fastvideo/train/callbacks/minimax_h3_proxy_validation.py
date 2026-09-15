@@ -76,6 +76,16 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
                              f"cwm_system_prompt={role!r}. The w0 prompt tells the model this clip is the very "
                              "beginning of the take with nothing preceding it, which contradicts handing it footage "
                              "to continue; set cwm_system_prompt: wn and encode the cache to match.")
+        # And the other direction, which is the one a step-0 baseline falls into: the eval wrapper
+        # defaults to a w0 config, so pointing it at a wn cache samples one given frame against a
+        # prompt that says thirty-four are already given. The prompt wins, the rows contradict it,
+        # and the panel reads as a bad checkpoint rather than as a misconfigured run.
+        if role == "wn" and self.num_given_latent_frames <= 1:
+            raise ValueError(f"cwm_system_prompt='wn' promises the model that 'The first 34 frames (1.4167 seconds) "
+                             f"of this clip are ALREADY GIVEN', but num_given_latent_frames="
+                             f"{self.num_given_latent_frames} hands it none of them. Set "
+                             "num_given_latent_frames: 10 (CWM's VIDEO_PREFIX_LATENTS), or sample a w0 cache with "
+                             "cwm_system_prompt: w0.")
 
         super().__init__(**kwargs)
         self.panel_labels = self._coerce_bool(panel_labels)
