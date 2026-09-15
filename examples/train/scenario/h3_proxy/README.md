@@ -335,6 +335,17 @@ scripts/h3_proxy/eval_checkpoint.sh \
     --step 150 --run /data/binghe/h3_proxy/runs/gta_v2_cwm/checkpoints
 ```
 
+`--list` finds them first. Directory names drift, but every checkpoint records the cache it trained
+on, and that is what separates one experiment from another:
+
+```bash
+scripts/h3_proxy/eval_checkpoint.sh --list                    # every run, its last loadable step
+scripts/h3_proxy/eval_checkpoint.sh --list --run <dir>        # one run, every step, loadable or not
+```
+
+A checkpoint a live run is still writing shows as `incomplete`; resuming it raises rather than
+loading half a model.
+
 `CheckpointManager._write_metadata` stores the whole training config in the checkpoint's
 `metadata.json`, so the config, the cache and the validation set are read back from the checkpoint
 instead of being named again. That is not just brevity: evaluating against the run's own config

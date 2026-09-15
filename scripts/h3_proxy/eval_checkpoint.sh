@@ -44,6 +44,8 @@ VAL_JSON=""
 VAL_JSON_FROM=""
 OUT=""
 TAG=""
+LIST=""
+RUNS_ROOT=/data/binghe/h3_proxy/runs
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -55,9 +57,43 @@ while [[ $# -gt 0 ]]; do
         --tag) TAG="$2"; shift 2 ;;
         --config) CONFIG="$2"; CONFIG_GIVEN=1; CONFIG_SOURCE="$2"; shift 2 ;;
         --nproc) NPROC="$2"; shift 2 ;;
+        --list) LIST=1; shift ;;
+        --runs-root) RUNS_ROOT="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# Which run is which is not answerable from directory names, which drift, but every checkpoint
+# records the cache it trained on, and that is what separates one experiment from another.
+if [[ -n "$LIST" ]]; then
+    if [[ -n "$RUN" ]]; then
+        echo "$RUN"
+        for candidate in $(ls -d "$RUN"/checkpoint-* 2>/dev/null | sort -V); do
+            if [[ -f "$candidate/dcp/.metadata" ]]; then
+                printf '  %-18s  %s  loadable\n' "$(basename "$candidate")" \
+                    "$(date -r "$candidate" '+%m-%d %H:%M' 2>/dev/null || echo '     ')"
+            else
+                printf '  %-18s  %s  incomplete\n' "$(basename "$candidate")" \
+                    "$(date -r "$candidate" '+%m-%d %H:%M' 2>/dev/null || echo '     ')"
+            fi
+        done
+        exit 0
+    fi
+    shopt -s nullglob
+    for run in "$RUNS_ROOT"/*/checkpoints; do
+        last=""
+        for candidate in $(ls -d "$run"/checkpoint-* 2>/dev/null | sort -V); do
+            [[ -f "$candidate/dcp/.metadata" ]] && last="$candidate"
+        done
+        [[ -n "$last" ]] || continue
+        cache="$(python scripts/h3_proxy/probe_resume.py "$last" --emit training.data.data_path 2>/dev/null \
+                 || echo '<unrecorded>')"
+        printf '%-56s  last=%-18s  trained on %s\n' "${run#"$RUNS_ROOT"/}" "$(basename "$last")" "$cache"
+    done
+    echo
+    echo "Then: $0 --list --run $RUNS_ROOT/<run>/checkpoints"
+    exit 0
+fi
 
 [[ -n "$STEP" ]] || { echo "--step is required." >&2; exit 2; }
 if [[ ! "$STEP" =~ ^[0-9]+$ ]]; then
