@@ -87,13 +87,6 @@ def parse_args() -> argparse.Namespace:
     # costs ~1/16 the tokens of a full-resolution one. 336x192 is the released CWM geometry.
     parser.add_argument("--proxy-height", type=int, default=192)
     parser.add_argument("--proxy-width", type=int, default=336)
-    parser.add_argument(
-        "--proxy-control",
-        action="store_true",
-        help="Additionally encode the proxy on the *target* canvas into 'depth_latent', for the "
-        "control trunk. The Ref2VA reference is still written, so the text's <Video 1> keeps its "
-        "referent; this adds the copy the ControlNet can inject token-by-token.",
-    )
     # The released short edge, which CWM also uses. It costs ~7x the anchor tokens of a 768 canvas
     # -- both as Qwen vision tokens and as Ref2VA reference rows -- and buys detail the target
     # canvas cannot show. That trade only looks bad if the anchor is treated as a picture of the
@@ -195,30 +188,6 @@ def read_duv_video_clip(path: Path, num_frames: int, height: int, width: int) ->
                          "resampling it would average unrelated depth codes and blend class colours. Re-encode the "
                          "clip, or set --proxy-width/--proxy-height to the grid it was written at.")
     return rgb_clip_to_pixels(frames), frames
-
-
-def replicate_onto_canvas(pixels: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    """Lift a proxy clip onto the target canvas by exact block replication.
-
-    The control trunk adds its residual at the token it is meant to constrain, so it needs the
-    proxy on the target grid rather than on the reference's quarter-resolution one. Getting there is
-    a resize, and the caution in :func:`read_duv_video_clip` applies with full force: a DUV frame is
-    three integer codes wearing an RGB costume, and interpolation averages unrelated depths and
-    paints class boundaries a code no segmenter ever predicted.
-
-    Replicating each proxy pixel over an integer block is the one resize that introduces no code
-    that was not already written. It adds no spatial detail either -- that is not the point, the
-    registration is -- so a non-integer ratio is reported rather than approximated: the released
-    geometries divide exactly (1344/336 == 768/192 == 4), and a ratio that does not is a sign the
-    two canvases were chosen independently.
-    """
-    src_height, src_width = pixels.shape[-2:]
-    if height % src_height or width % src_width:
-        raise ValueError(f"the target canvas {width}x{height} is not an integer multiple of the proxy grid "
-                         f"{src_width}x{src_height}, so the proxy cannot be lifted onto it without interpolating "
-                         "codes. Re-compose the DUV at a grid that divides the canvas, or set --height/--width to a "
-                         "multiple of --proxy-height/--proxy-width.")
-    return pixels.repeat_interleave(height // src_height, dim=-2).repeat_interleave(width // src_width, dim=-1)
 
 
 def read_anchor_image(path: Path | None, target_frames: np.ndarray, short_edge: int) -> Image.Image:
@@ -442,8 +411,6 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
             "cwm_system": role,
         },
     }
-    if args.proxy_control:
-        sample["depth_latent"] = encoders.encode_pixels(replicate_onto_canvas(proxy_pixels, args.height, args.width))
     camera_path = resolve("camera")
     if camera_path is not None:
         camera = read_camera(camera_path, args.num_frames)
@@ -585,10 +552,8 @@ def main() -> None:
             print(f"[{index + 1}/{len(entries)}] {name}: text {tuple(sample['text_embedding'].shape)} "
                   f"cwm_system={sample['info'].get('cwm_system')}")
         else:
-            control = sample.get("depth_latent")
             print(f"[{index + 1}/{len(entries)}] {name}: target {tuple(sample['vae_latent'].shape)}, "
-                  f"proxy {tuple(sample['proxy_latent'].shape)}"
-                  f"{f', control {tuple(control.shape)}' if control is not None else ''}")
+                  f"proxy {tuple(sample['proxy_latent'].shape)}")
 
     print(f"Done: {written} written, {skipped} skipped, {failed} failed -> {output_dir}")
 

@@ -22,20 +22,26 @@
 #
 # --- what has to be true of the cache -------------------------------------------------------------
 #
-# `depth_latent` has to be in it, which means `--proxy-control` at encode time. The name is the
-# trunk's: it calls the modality `depth` after the depth video it was first built for, and what it
-# actually carries is whatever the proxy encodes, DUV included.
+# Nothing extra is cached. The trunk reads the same `proxy_latent` the reference prefix reads, and
+# replicates it onto the target's latent grid: the VAE's stride of 16 means proxy latent cell
+# `(i, j)` covers the same pixels as target cells `(4i..4i+3, 4j..4j+3)`, so copying each cell over
+# that block puts it exactly where the pixels it describes ended up.
 #
-# The canvas has to be an integer multiple of the proxy grid. Getting the proxy onto the target grid
-# is a resize, and a DUV frame is three integer codes wearing an RGB costume -- interpolation
-# averages unrelated depths and paints class boundaries a code no segmenter ever predicted. So each
-# proxy pixel is replicated over an integer block instead, which introduces no code that was not
-# already written. 1344/336 == 768/192 == 4 exactly; a ratio that does not divide is an error rather
-# than a nearest-neighbour approximation, in the encoder and in the sampler both.
+# Replicating latents rather than re-encoding blown-up pixels is deliberate, and not only cheaper.
+# The two differ -- the VAE is not linear -- but only in that encoding blown-up pixels also encodes
+# the block edges the blow-up introduced, which is an artifact and not scene detail. Neither route
+# adds detail the reference did not have; what either adds is a position at which the signal can
+# act. And this tensor is read by a freshly initialised linear and never decoded, so there is no
+# reason for it to look like something the VAE would have produced.
 #
-# This also settles a loose variable. The earlier GTA caches were written at 704x1280 while CWM's
-# released geometry is 768x1344, which left canvas confounded with everything else those runs
-# compared. 704/192 and 1280/336 do not divide, so this scenario cannot inherit that deviation.
+# What *does* have to hold is that the target latent grid is an integer multiple of the proxy's.
+# Otherwise one proxy cell spreads over a fractional number of target cells and the registration
+# varies across the frame. At the released geometries it divides exactly: 48/12 == 84/21 == 4.
+#
+# That is the one reason to re-encode, and it is a variable worth clearing anyway. `gta_v2_cwm` was
+# written at 704x1280 -- latent 44 x 80, which is 3.67x by 3.81x of the proxy's 12 x 21 -- while
+# CWM's released geometry is 768x1344. So the canvas deviation these GTA runs carried is also what
+# blocks replication, and one plain encode fixes both:
 #
 #   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
 #       --manifest /data/binghe/h3_proxy/gta_v2_cwm_encode.jsonl \
@@ -43,11 +49,12 @@
 #       --output /data/binghe/h3_proxy/cache/gta_v2_ctrl \
 #       --model-path /data/models/MiniMax-H3 \
 #       --num-frames 124 --height 768 --width 1344 \
-#       --proxy-height 192 --proxy-width 336 --proxy-control \
+#       --proxy-height 192 --proxy-width 336 \
 #       --anchor-short-edge 2048 --cwm-system w0
 #
-# Expect the per-clip line to print a third shape, `control (24, 37, 48, 84)`. Encoding a second
-# full-canvas clip is roughly double the VAE work of a plain encode, and adds ~14 MB per clip.
+# `cache/gta_v2_train` is already 768x1344 over a 192x336 proxy, so it can drive the trunk with no
+# encoding at all. Its DUV predates the CWM depth range and palette, which makes it the wrong
+# baseline but a fine smoke test of the plumbing.
 #
 # --- what is deliberately held fixed --------------------------------------------------------------
 #
@@ -58,7 +65,7 @@
 #
 # `camera_dropout: 0.0`. Dropout drops the whole trunk, and here the trunk is the only per-token
 # route the proxy has; dropping it would train the model to ignore the thing being tested. The
-# plugin rejects a nonzero value together with enable_control_depth rather than letting it through.
+# plugin rejects a nonzero value together with enable_control_proxy rather than letting it through.
 #
 # `enable_control_camera: false`. The trunk's other modality is the Plücker ray field of a requested
 # trajectory. The GTA capture ships no extrinsics, so there is nothing to build one from -- and if a
@@ -82,8 +89,8 @@ models:
 
     # --- control trunk ---
     enable_camera_controlnet: true
-    # The proxy on the target latent grid, read from the cache's `depth_latent`.
-    enable_control_depth: true
+    # The proxy replicated onto the target latent grid, derived from the cached `proxy_latent`.
+    enable_control_proxy: true
     # No trajectory in the GTA capture, so the Plücker modality has nothing to read. With it off the
     # trunk is a proxy ControlNet and the dataset loader stops requiring extrinsics.
     enable_control_camera: false
@@ -94,7 +101,7 @@ models:
     controlnet_num_heads: 8
     # One control block every two backbone blocks: 25 injection points over 50 layers.
     controlnet_layer_stride: 2
-    # See the header. Nonzero is rejected alongside enable_control_depth.
+    # See the header. Nonzero is rejected alongside enable_control_proxy.
     camera_dropout: 0.0
 
     # Trunk only. The residual is zero-initialised, so step 0 reproduces the released model exactly
@@ -123,7 +130,8 @@ training:
     #   nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim
     num_gpus: 16
     # Probe this. sp_size 2 gives 8 data-parallel replicas, which reaches global batch 32 with the
-    # least accumulation, but the trunk's activations are new memory the LoRA runs did not carry. If
+    # least accumulation, but the trunk's activations are new memory the LoRA runs did not carry --
+    # and replication means it carries a full target-grid control signal, not a quarter-res one. If
     # a single step OOMs, go to 4 and halve gradient_accumulation_steps to hold the global batch.
     sp_size: 2
     tp_size: 1
@@ -132,8 +140,8 @@ training:
     pin_cpu_memory: true
 
   data:
-    # Must be a cache written with --proxy-control: the loader raises rather than training a trunk
-    # against a missing modality. `scripts/h3_proxy/describe_cache.py` prints what a cache holds.
+    # The target latent grid must be an integer multiple of the proxy's, which at 768x1344 over a
+    # 192x336 proxy is 4x. `scripts/h3_proxy/describe_cache.py` prints both geometries.
     data_path: /data/binghe/h3_proxy/cache/gta_v2_ctrl
     # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
     preprocessed_data_type: t2va
@@ -191,8 +199,8 @@ callbacks:
     max_grad_norm: 1.0
 
   # Logs a proxy | prediction | target panel per held-out clip. Nothing here configures the trunk:
-  # latent preparation notices the transformer has the depth modality and lifts the proxy onto the
-  # target canvas itself, from the same duv.mp4 the panel's left third shows.
+  # latent preparation notices the transformer has the proxy modality and replicates the proxy
+  # latent it already encoded, so sampling pays no second VAE pass for it.
   validation:
     _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
     pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
@@ -210,8 +218,8 @@ callbacks:
     use_validation_media_conditioning: false
     # Must equal the --anchor-short-edge used by encode_proxy_samples.py.
     anchor_short_edge: 2048
-    # Must equal the encoder's --proxy-height/--proxy-width. These also set what the trunk replicates
-    # from, so a mismatch here changes the control signal and not just the reference.
+    # Must equal the encoder's --proxy-height/--proxy-width. These also set the grid the trunk
+    # replicates from, so a mismatch here changes the control signal and not just the reference.
     proxy_height: 192
     proxy_width: 336
     # Must match encode_proxy_samples --cwm-system.

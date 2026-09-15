@@ -23,7 +23,7 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_camera_conditioning 
     MINIMAX_H3_CAMERA_ROWS_KEY,
 )
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
-    MINIMAX_H3_CONTROL_DEPTH_KEY,
+    MINIMAX_H3_CONTROL_PROXY_KEY,
     MINIMAX_H3_LAYOUT_KEY,
     MINIMAX_H3_NUM_FIXED_VIDEO_ROWS_KEY,
 )
@@ -152,7 +152,7 @@ class MiniMaxH3DenoisingStage(PipelineStage):
         # ignoring them, so an empty dict is the only thing that keeps a non-ControlNet transformer
         # working.
         control_kwargs: dict[str, torch.Tensor] = {}
-        for key in (MINIMAX_H3_CAMERA_LATENT_KEY, MINIMAX_H3_CONTROL_DEPTH_KEY):
+        for key in (MINIMAX_H3_CAMERA_LATENT_KEY, MINIMAX_H3_CONTROL_PROXY_KEY):
             latent = batch.extra.get(key)
             if latent is not None:
                 control_kwargs[key] = latent.to(device)

@@ -1,125 +1,153 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lifting the proxy onto the target latent grid for the control trunk.
+"""Replicating the proxy onto the target latent grid for the control trunk.
 
-The trunk is the one route by which a proxy can act per-token, and everything that can go wrong on
-the way in goes wrong quietly. An interpolated DUV frame looks like a plausible image while carrying
-depths that were never rendered and class colours no segmenter predicts. A cache encoded at a canvas
-the proxy grid does not divide would train on that. A trunk pointed at the wrong reference would
-train on the anchor. A sampler that skips the lift would render from a trunk that saw nothing, and
-report a checkpoint as dead.
+The trunk is the one route by which a proxy can act per-token, and everything on the way in fails
+quietly. A grid that does not divide would spread one proxy cell over a fractional number of target
+cells, so the registration would vary across the frame -- while still producing a control signal
+that trains. Replicating the *padded* reference latent would put the pad column inside the frame.
+A trunk pointed at the anchor would train on a still. A sampler that skips the replication renders
+from a trunk that saw nothing and reports a live checkpoint as dead.
 
-So these cover the guards rather than the arithmetic of the residual: exact block replication, the
-canvas contract, which reference is read, and when the lift is skipped entirely.
+So these cover the guards and the registration, not the arithmetic of the residual.
 """
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-import sys
 import types
 
 import numpy as np
 import pytest
 import torch
 
+from fastvideo.pipelines.basic.minimax_h3.packing import patchify_video_latents, replicate_latents_to_grid
 from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
     MiniMaxH3LatentPreparationStage,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 
-SCRIPTS = Path(__file__).resolve().parents[3] / "scripts" / "h3_proxy" / "prepare_data"
+PATCH_SIZE = (1, 2, 2)
+# The released geometries: a 336x192 proxy is 12 x 21 latents, a 768x1344 target is 48 x 84.
+PROXY_GRID = (12, 21)
+TARGET_GRID = (48, 84)
 
 
-def _encoder_module() -> types.ModuleType:
-    if str(SCRIPTS) not in sys.path:
-        sys.path.insert(0, str(SCRIPTS))
-    spec = importlib.util.spec_from_file_location("encode_proxy_samples", SCRIPTS / "encode_proxy_samples.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _latent(height: int, width: int, num_frames: int = 3) -> torch.Tensor:
+    """A latent whose every cell is distinguishable, so replication is checkable cell by cell."""
+    cells = torch.arange(float(num_frames * height * width)).reshape(1, 1, num_frames, height, width)
+    return cells.expand(1, 24, num_frames, height, width).contiguous()
 
 
-# --- the encoder's lift, which writes `depth_latent` into the cache ------------------------------
+# --- replication, which is the whole mechanism ----------------------------------------------------
 
 
-def test_replication_onto_the_canvas_repeats_codes_and_invents_none():
-    """The whole point of replicating rather than interpolating: the code set is unchanged."""
-    encoder = _encoder_module()
-    # Three distinct codes with nothing between them, so any averaging shows up as a new value.
-    pixels = torch.tensor([0.0, 0.5, 1.0]).reshape(1, 1, 1, 1, 3).expand(1, 3, 2, 1, 3).contiguous()
+def test_each_proxy_cell_lands_on_the_block_of_target_cells_it_describes():
+    """The VAE's stride of 16 makes proxy cell (i, j) cover target cells (4i..4i+3, 4j..4j+3)."""
+    proxy = _latent(*PROXY_GRID)
 
-    lifted = encoder.replicate_onto_canvas(pixels, height=4, width=12)
+    replicated = replicate_latents_to_grid(proxy, *TARGET_GRID)
 
-    assert lifted.shape == (1, 3, 2, 4, 12)
-    assert torch.equal(torch.unique(lifted), torch.unique(pixels))
-    # Each source pixel occupies a 4x4 block, and the blocks tile the canvas in source order.
-    assert torch.equal(lifted[0, :, 0, 0, :4], pixels[0, :, 0, 0, 0].unsqueeze(-1).expand(3, 4))
-    assert torch.equal(lifted[0, :, 0, 3, 8:], pixels[0, :, 0, 0, 2].unsqueeze(-1).expand(3, 4))
+    assert replicated.shape == (1, 24, 3, *TARGET_GRID)
+    # Registration is exact, not approximate: every target cell holds the proxy cell over it.
+    scale_h, scale_w = TARGET_GRID[0] // PROXY_GRID[0], TARGET_GRID[1] // PROXY_GRID[1]
+    for i, j in ((0, 0), (1, 2), (11, 20)):
+        block = replicated[0, 0, 0, i * scale_h:(i + 1) * scale_h, j * scale_w:(j + 1) * scale_w]
+        assert torch.equal(block, proxy[0, 0, 0, i, j].expand(scale_h, scale_w))
+    # No value is invented, which is what separates this from interpolating.
+    assert torch.equal(torch.unique(replicated), torch.unique(proxy))
 
 
-def test_the_released_geometries_divide_and_a_stale_one_does_not():
-    """704x1280 is the canvas the earlier GTA caches used; it cannot carry a replicated proxy."""
-    encoder = _encoder_module()
-    pixels = torch.zeros(1, 3, 2, 192, 336)
+def test_the_replicated_grid_fills_the_target_rows_exactly():
+    """The residual is an elementwise add onto target rows, so the counts have to match."""
+    proxy_rows = patchify_video_latents(replicate_latents_to_grid(_latent(*PROXY_GRID), *TARGET_GRID), PATCH_SIZE)
+    target_rows = patchify_video_latents(_latent(*TARGET_GRID), PATCH_SIZE)
 
-    assert encoder.replicate_onto_canvas(pixels, height=768, width=1344).shape[-2:] == (768, 1344)
+    assert proxy_rows.shape == target_rows.shape
+
+
+def test_a_grid_that_does_not_divide_is_refused():
+    """704x1280 is 44 x 80 latents, which is 3.67x by 3.81x of the proxy's -- the cache gta_v2_cwm used."""
     with pytest.raises(ValueError, match="integer multiple"):
-        encoder.replicate_onto_canvas(pixels, height=704, width=1280)
+        replicate_latents_to_grid(_latent(*PROXY_GRID), 44, 80)
 
 
-# --- the sampler's lift, which has to agree with the cache's --------------------------------------
+def test_the_padded_reference_latent_would_overshoot():
+    """Why the unpadded latent is the one staged: 21 columns pad to 22, and 22 does not divide 84."""
+    with pytest.raises(ValueError, match="integer multiple"):
+        replicate_latents_to_grid(_latent(12, 22), *TARGET_GRID)
+
+
+# --- the sampler's gating, which decides whether any of the above runs ----------------------------
 
 
 def _stage(modalities: tuple[str, ...] | None) -> MiniMaxH3LatentPreparationStage:
-    """A latent-preparation stage with only what the lift reads.
+    """A latent-preparation stage holding only what the replication step reads.
 
     Constructed without ``__init__`` on purpose: the real one builds a VAE and a text encoder, and
-    every path under test refuses before the VAE would be touched.
+    this step needs neither -- which is the point of replicating latents instead of re-encoding.
     """
     stage = object.__new__(MiniMaxH3LatentPreparationStage)
     controlnet = None if modalities is None else types.SimpleNamespace(enabled_modalities=modalities)
-    stage.transformer = types.SimpleNamespace(camera_controlnet=controlnet, patch_size=(1, 2, 2))
+    stage.transformer = types.SimpleNamespace(camera_controlnet=controlnet, patch_size=PATCH_SIZE)
     return stage
 
 
-def _batch(height: int = 768, width: int = 1344) -> ForwardBatch:
-    return ForwardBatch(data_type="video", num_frames=124, height=height, width=width)
+def _batch(latent_height: int = TARGET_GRID[0], latent_width: int = TARGET_GRID[1]) -> ForwardBatch:
+    batch = ForwardBatch(data_type="video", num_frames=124)
+    batch.raw_latent_shape = (1, 24, 3, latent_height, latent_width)
+    return batch
 
 
-def _proxy(height: int = 192, width: int = 336) -> MiniMaxH3PreparedReference:
-    reference = MiniMaxH3PreparedReference(media_type="video", num_latent_frames=2, latent_height=12, latent_width=21)
-    reference.frames = np.zeros((124, height, width, 3), dtype=np.uint8)
+def _proxy_reference(height: int = PROXY_GRID[0], width: int = PROXY_GRID[1]) -> MiniMaxH3PreparedReference:
+    reference = MiniMaxH3PreparedReference(media_type="video", num_latent_frames=3, latent_height=height,
+                                           latent_width=width)
+    reference.latents = _latent(height, width)
     return reference
 
 
 @pytest.mark.parametrize("modalities", [None, ("camera", )])
-def test_the_lift_is_skipped_when_no_trunk_reads_the_proxy(modalities):
-    """A plain backbone, or a trunk on the Plücker field alone, must not pay for a second encode."""
-    stage = _stage(modalities)
-
-    assert stage._encode_control_depth_rows([_proxy()], _batch(), torch.device("cpu")) is None
+def test_replication_is_skipped_when_no_trunk_reads_the_proxy(modalities):
+    """A plain backbone, or a trunk on the Plücker field alone, must get no control rows."""
+    assert _stage(modalities)._control_proxy_rows([_proxy_reference()], _batch()) is None
 
 
-def test_a_canvas_the_proxy_grid_does_not_divide_is_refused():
-    stage = _stage(("depth", ))
+def test_the_sampler_produces_one_control_row_per_target_row():
+    rows = _stage(("proxy", ))._control_proxy_rows([_proxy_reference()], _batch())
 
+    assert rows is not None
+    assert rows.shape == (1, patchify_video_latents(_latent(*TARGET_GRID), PATCH_SIZE).shape[0], 24 * 2 * 2)
+
+
+def test_a_target_grid_the_proxy_does_not_divide_is_refused_at_sampling_too():
     with pytest.raises(ValueError, match="integer multiple"):
-        stage._encode_control_depth_rows([_proxy()], _batch(height=704, width=1280), torch.device("cpu"))
+        _stage(("proxy", ))._control_proxy_rows([_proxy_reference()], _batch(latent_height=44, latent_width=80))
 
 
 def test_the_trunk_reads_the_proxy_and_not_the_anchor():
     """The anchor is an image reference, so it is not a candidate; a second video makes it ambiguous."""
-    stage = _stage(("depth", ))
+    stage = _stage(("proxy", ))
     anchor = MiniMaxH3PreparedReference(media_type="image", num_latent_frames=1, latent_height=128, latent_width=224)
-    device = torch.device("cpu")
+    anchor.latents = _latent(128, 224, num_frames=1)
 
-    # One video alongside the anchor is unambiguous, and gets as far as the canvas check.
-    with pytest.raises(ValueError, match="integer multiple"):
-        stage._encode_control_depth_rows([anchor, _proxy()], _batch(height=704, width=1280), device)
-
-    for references in ([anchor], [anchor, _proxy(), _proxy()]):
+    assert stage._control_proxy_rows([anchor, _proxy_reference()], _batch()) is not None
+    for references in ([anchor], [anchor, _proxy_reference(), _proxy_reference()]):
         with pytest.raises(ValueError, match="exactly one video reference"):
-            stage._encode_control_depth_rows(references, _batch(), device)
+            stage._control_proxy_rows(references, _batch())
+
+
+def test_an_unencoded_reference_is_reported_rather_than_skipped():
+    """`latents` is staged by condition encoding; None means the stages ran out of order."""
+    reference = _proxy_reference()
+    reference.latents = None
+
+    with pytest.raises(ValueError, match="latents are missing"):
+        _stage(("proxy", ))._control_proxy_rows([reference], _batch())
+
+
+def test_the_staged_latent_is_unpadded_so_it_can_be_replicated():
+    """The contract between the two halves: what condition encoding stages, replication can consume."""
+    reference = _proxy_reference()
+
+    assert reference.latents is not None
+    assert reference.latents.shape[-2:] == PROXY_GRID
+    assert np.prod(TARGET_GRID) % np.prod(PROXY_GRID) == 0

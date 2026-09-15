@@ -131,6 +131,40 @@ def pad_video_latents_to_patch(latents: torch.Tensor, patch_size: tuple[int, int
     return torch.nn.functional.pad(latents, (0, pad_w, 0, pad_h), value=0.0)
 
 
+def replicate_latents_to_grid(latents: torch.Tensor, latent_height: int, latent_width: int) -> torch.Tensor:
+    """Replicate a latent grid up onto a larger one, for a control signal that acts on target rows.
+
+    The control trunk adds its residual to a target video row, so it needs one row for every target
+    row -- and a proxy encoded at its own reference resolution has a small fraction of them. A
+    336x192 proxy is 12 x 21 latents against a 768x1344 target's 48 x 84.
+
+    Replication closes that gap exactly rather than approximately. The VAE's stride of 16 means
+    proxy latent cell ``(i, j)`` covers the same pixels as target latent cells
+    ``(4i..4i+3, 4j..4j+3)``, so copying each cell over that block puts it precisely where the pixels
+    it describes ended up. A grid that does not divide is an error: interpolating would spread one
+    proxy cell over a non-integer number of target cells, and the registration would then vary
+    across the frame.
+
+    Replicating latents rather than re-encoding replicated pixels is deliberate. The two are not the
+    same tensor, because the VAE is not linear -- but they differ only in that encoding blown-up
+    pixels also encodes the block edges the blow-up introduced, which is an artifact rather than
+    scene detail. Neither route adds detail the reference did not have; what either adds is a
+    position at which the signal is allowed to act. And this tensor is read by a freshly initialised
+    linear and never decoded, so there is no reason for it to look like something the VAE would have
+    produced -- which is what makes the cheaper route also the cleaner one.
+    """
+    if latents.ndim != 5:
+        raise ValueError(f"Video latents must be [B, C, T, H, W], got shape {tuple(latents.shape)}.")
+    source_height, source_width = int(latents.shape[-2]), int(latents.shape[-1])
+    if latent_height % source_height or latent_width % source_width:
+        raise ValueError(f"the target latent grid {latent_height}x{latent_width} is not an integer multiple of the "
+                         f"proxy's {source_height}x{source_width}, so the proxy cannot be replicated onto it with "
+                         "uniform registration. Encode both at geometries whose latent grids divide -- 768x1344 over "
+                         "192x336 is 4x, while 704x1280 over the same proxy is 3.67x by 3.81x.")
+    return latents.repeat_interleave(latent_height // source_height,
+                                     dim=-2).repeat_interleave(latent_width // source_width, dim=-1)
+
+
 def patchify_video_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
     patch_t, patch_h, patch_w = patch_size
     latents = pad_video_latents_to_patch(latents, patch_size)

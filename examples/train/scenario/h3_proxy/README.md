@@ -54,10 +54,9 @@ meant to steer. That is enough for layout and rough heading and not for rate, wh
 runs on that pathway showed: predictions that turn the right way at the wrong speed, with coherent
 drift down to the random-walk floor by step 150.
 
-So the trunk gets a second copy of the same pixels, on the target's own latent grid, through the
-`depth` modality — named for the depth video it was first built for, carrying whatever the proxy
-encodes. Either modality is a valid trunk on its own (`enable_control_camera: false` gives a proxy
-ControlNet, which is what footage without a captured trajectory gets).
+So the trunk reads the proxy a second time through the `proxy` modality, on the target's own latent
+grid. Either modality is a valid trunk on its own — `enable_control_camera: false` gives a proxy
+ControlNet, which is what footage without a captured trajectory gets.
 
 The reference slot keeps the proxy anyway. The cached text embedding was tokenized around `<Picture
 1>` then `<Video 1>`, and the CWM system prompt spends most of its length saying what `<Video 1>` is
@@ -65,14 +64,24 @@ for; dropping it would invalidate every cached text embedding and contradict a p
 otherwise reproduces byte-for-byte. The proxy is therefore presented twice — once as content the text
 can refer to, once as a constraint the trunk can enforce.
 
-Getting it onto the target grid is a resize, and that is the one liberty not taken. A DUV frame is
-three integer codes wearing an RGB costume, so interpolation averages unrelated depths and paints
-class boundaries a code no segmenter ever predicted — while producing a perfectly plausible-looking
-image. Each proxy pixel is replicated over an integer block instead, which introduces no code that
-was not already written; a canvas the proxy grid does not divide is an error rather than a
-nearest-neighbour approximation, in `encode_proxy_samples.py --proxy-control` and in the sampler
-both. The released geometries divide exactly (1344/336 == 768/192 == 4). 704x1280 does not, so this
-variant cannot inherit the canvas the earlier GTA caches were written at.
+**Nothing extra is cached for it.** The trunk's copy is the same `proxy_latent`, replicated cell by
+cell onto the target grid: the VAE's stride of 16 means proxy latent cell `(i, j)` covers the same
+pixels as target cells `(4i..4i+3, 4j..4j+3)`, so copying each cell over that block lands it exactly
+where the pixels it describes ended up. Registration is exact, not approximate.
+
+Replicating latents rather than re-encoding blown-up pixels is deliberate, and not only cheaper. The
+two are not the same tensor — the VAE is not linear — but they differ only in that encoding blown-up
+pixels also encodes the block edges the blow-up introduced, which is an artifact rather than scene
+detail. Neither route adds detail the reference did not have; what either adds is a *position* at
+which the signal is allowed to act. And this tensor is read by a freshly initialised linear and never
+decoded, so there is no reason for it to look like something the VAE would have produced.
+
+What does have to hold is that the **target latent grid is an integer multiple of the proxy's**;
+otherwise one proxy cell spreads over a fractional number of target cells and the registration
+varies across the frame. The released geometries divide exactly (48/12 == 84/21 == 4). 704x1280 is
+44 x 80 latents, which is 3.67x by 3.81x — so this variant cannot inherit the canvas `gta_v2_cwm` was
+written at, and the deviation from CWM's released canvas those runs carried is the same thing that
+blocks replication. One plain re-encode clears both.
 
 Everything else follows from that split:
 
@@ -451,7 +460,10 @@ unconditional side of camera guidance.
 - **Audio.** `supervise_audio` is off. The packed layout still requires audio rows, so silent
   footage gets zero latents, and returning a video-only prediction is what tells the finetune loss
   to leave the audio head alone rather than train it towards placeholder silence.
-- **Depth on the trunk.** `enable_control_depth` exists and works, but is off by default: the proxy
-  already carries geometry through the reference slot, so a second copy of it on the trunk mostly
-  costs memory. It is also incompatible with `camera_dropout`, which drops the whole trunk and would
-  therefore drop depth along with the camera.
+- **A captured camera trajectory**, for the datasets here. ABot ships sparse non-metric COLMAP poses
+  and the GTA capture ships none, so `enable_control_camera` has nothing to build a ray field from
+  and the trunk runs on the proxy alone. A trajectory would be the more direct fix for camera
+  control than a proxy is, since it states the pose instead of implying it.
+- **The trunk together with `camera_dropout`.** Dropout drops the whole trunk. With the proxy on it
+  that is the proxy's only per-token route, so dropping it would train the model to ignore the thing
+  the variant exists to test; the plugin rejects the combination rather than letting it through.

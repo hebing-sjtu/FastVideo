@@ -22,6 +22,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     keyframe_condition_noise,
     pad_video_latents_to_patch,
     patchify_video_latents,
+    replicate_latents_to_grid,
     target_rows_per_latent_frame,
 )
 from fastvideo.pipelines.basic.minimax_h3.reference import (
@@ -46,9 +47,9 @@ MINIMAX_H3_LAYOUT_KEY = "minimax_h3_layout"
 # the denoising stage, which holds them at the reference prefix's noise amount and leaves them out
 # of every scheduler step.
 MINIMAX_H3_NUM_FIXED_VIDEO_ROWS_KEY = "minimax_h3_num_fixed_video_rows"
-# The proxy on the target latent grid, for the control trunk. Named for the transformer kwarg it
-# becomes; the trunk calls the modality `depth` after the depth video it was built for.
-MINIMAX_H3_CONTROL_DEPTH_KEY = "depth_latent"
+# The proxy replicated onto the target latent grid, for the control trunk. Named for the
+# transformer kwarg it becomes.
+MINIMAX_H3_CONTROL_PROXY_KEY = "proxy_control_latent"
 
 
 def _video_geometry(batch: ForwardBatch) -> tuple[int, int, int, int]:
@@ -59,20 +60,6 @@ def _video_geometry(batch: ForwardBatch) -> tuple[int, int, int, int]:
     if min(channels, num_frames, height, width) <= 0:
         raise ValueError(f"MiniMax-H3 raw latent geometry must be positive, got {shape}.")
     return channels, num_frames, height, width
-
-
-def _request_canvas(batch: ForwardBatch) -> tuple[int, int]:
-    """The target's pixel height and width, which are typed as optional lists but are scalars here."""
-    values: list[int] = []
-    for name in ("height", "width"):
-        value = getattr(batch, name)
-        if isinstance(value, list):
-            value = value[0] if value else None
-        if value is None:
-            raise ValueError(f"MiniMax-H3 needs a target {name} on the request to place the proxy on the target "
-                             "canvas.")
-        values.append(int(value))
-    return values[0], values[1]
 
 
 def _sample_visual_posterior(posterior: Any) -> torch.Tensor:
@@ -178,6 +165,9 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
                 posterior = self.vae.encode(self.vae.normalize_pixels(pixels)).latent_dist
                 latents = self.vae.normalize_latents(_sample_visual_posterior(posterior).to(
                     torch.float16).float()).cpu()
+            # Staged before the pad: the control trunk replicates this onto the target's latent
+            # grid, and a padded 22 columns would put the pad inside the frame and overshoot 84.
+            reference.latents = latents
             # Same pad the training cache applies: a 336x192 proxy is 21 x 12 after the VAE, and
             # 21 is not a multiple of the 2x2 patch. Geometry on the reference has to be the padded
             # size so the packed layout and the condition noise agree with the rows.
@@ -188,57 +178,43 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             rows.append(patchify_video_latents(latents, patch_size))
         return rows
 
-    def _encode_control_depth_rows(
+    def _control_proxy_rows(
         self,
         references: list[MiniMaxH3PreparedReference],
         batch: ForwardBatch,
-        device: torch.device,
     ) -> torch.Tensor | None:
-        """Encode the proxy onto the *target* latent grid, for the control trunk's ``depth`` modality.
+        """Replicate the proxy onto the target latent grid, for the control trunk's ``proxy`` modality.
 
         The Ref2VA reference already carries the proxy, but not anywhere a per-token constraint can
         act from: it sits at a quarter of the target's resolution and, because H3 packs references
-        ahead of the target, at RoPE positions a whole clip earlier. So the trunk gets a second copy
-        of the same pixels on the target's own grid, and the reference stays where the text's
+        ahead of the target, at rotary positions a whole clip earlier. So the trunk reads the same
+        latent a second time on the target's own grid, and the reference stays where the text's
         ``<Video 1>`` expects to find it.
 
-        Resizing a proxy is the one liberty not taken. A DUV frame is three integer codes wearing an
-        RGB costume, so each proxy pixel is replicated over an integer block rather than
-        interpolated -- the released geometries divide exactly, and a ratio that does not is reported
-        rather than approximated. This adds no spatial detail over the reference, which is not what
-        it is for; the registration is.
+        This costs no second encode. The proxy latent the reference path just produced is replicated
+        cell-by-cell -- see :func:`replicate_latents_to_grid` for why that is exact rather than
+        approximate, and why it is preferable to re-encoding blown-up pixels.
+
+        The *unpadded* latent is the one replicated. The reference path pads 21 latent columns to 22
+        so the 2x2 patch tiles, and replicating the padded grid would put the pad column inside the
+        frame and overshoot the target's 84 columns.
         """
         controlnet = getattr(self.transformer, "camera_controlnet", None)
-        if controlnet is None or "depth" not in controlnet.enabled_modalities:
+        if controlnet is None or "proxy" not in controlnet.enabled_modalities:
             return None
 
         videos = [reference for reference in references if reference.media_type not in ("audio", "image")]
         if len(videos) != 1:
-            raise ValueError(f"The control trunk's depth modality needs exactly one video reference to read as the "
+            raise ValueError(f"The control trunk's proxy modality needs exactly one video reference to read as the "
                              f"proxy, but the request carries {len(videos)}. Drop the extra video references, or "
-                             "turn enable_control_depth off.")
-        frames = videos[0].frames
-        if frames is None:
-            raise ValueError("MiniMax-H3 proxy reference frames are missing.")
+                             "turn enable_control_proxy off.")
+        latents = videos[0].latents
+        if latents is None:
+            raise ValueError("MiniMax-H3 proxy reference latents are missing; condition encoding has to run first.")
 
-        # The pixel canvas, not `_video_geometry`'s latent grid: the proxy is replicated as pixels
-        # and then encoded, so it has to land on the canvas the target was rendered at. Whether the
-        # two agree once through the VAE is checked by row count in camera conditioning.
-        height, width = _request_canvas(batch)
-        src_height, src_width = int(frames.shape[1]), int(frames.shape[2])
-        if height % src_height or width % src_width:
-            raise ValueError(f"the target canvas {width}x{height} is not an integer multiple of the proxy grid "
-                             f"{src_width}x{src_height}, so the proxy cannot be lifted onto it without interpolating "
-                             "codes. Render the request at a canvas that is a multiple of the proxy's grid.")
-        frames = frames.repeat(height // src_height, axis=1).repeat(width // src_width, axis=2)
-
-        frames = frames[:trim_reference_num_frames(frames.shape[0])]
-        pixels = torch.from_numpy(frames.copy()).permute(3, 0, 1, 2)[None]
-        pixels = pixels.to(device=device, dtype=torch.float32).div_(255.0)
-        posterior = self.vae.encode(self.vae.normalize_pixels(pixels)).latent_dist
-        latents = self.vae.normalize_latents(_sample_visual_posterior(posterior).to(torch.float16).float()).cpu()
-        latents = pad_video_latents_to_patch(latents, self.transformer.patch_size)
-        return patchify_video_latents(latents, self.transformer.patch_size)[None]
+        _, _, latent_height, latent_width = _video_geometry(batch)
+        replicated = replicate_latents_to_grid(latents, latent_height, latent_width)
+        return patchify_video_latents(replicated, self.transformer.patch_size)[None]
 
     def _encode_audio_rows(
         self,
@@ -317,9 +293,6 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             video_rows = self._encode_visual_rows(references, vae_device)
             fixed_latents = (None if fixed_frame is None else self._encode_given_latent_frames(
                 fixed_frame, max(num_given, 1), vae_device))
-            # Last, so that enabling the control trunk does not shift the posterior draws the
-            # references and the given prefix make, and a run with and without it stays comparable.
-            control_depth = self._encode_control_depth_rows(references, batch, vae_device)
         finally:
             if fastvideo_args.vae_cpu_offload:
                 self.vae.to("cpu")
@@ -336,8 +309,11 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
 
         if not video_rows:
             raise ValueError("MiniMax-H3 Ref2VA requires at least one visual reference.")
-        if control_depth is not None:
-            batch.extra[MINIMAX_H3_CONTROL_DEPTH_KEY] = control_depth
+        # After the encode, and drawing no randomness of its own, so enabling the trunk leaves the
+        # posterior draws the references and the given prefix make exactly where they were.
+        control_proxy = self._control_proxy_rows(references, batch)
+        if control_proxy is not None:
+            batch.extra[MINIMAX_H3_CONTROL_PROXY_KEY] = control_proxy
         shapes = tuple((reference.num_latent_frames, reference.latent_height, reference.latent_width)
                        for reference in references if reference.media_type != "audio")
         # The locked frame's shape goes last so that turning the lock on does not shift the noise
@@ -370,6 +346,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             reference.image = None
             reference.frames = None
             reference.waveform = None
+            reference.latents = None
         return video_conditions, audio_conditions, fixed_video_rows
 
     def _build_layout(self, batch: ForwardBatch) -> MiniMaxH3PackedLayout:
@@ -488,7 +465,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
 
 
 __all__ = [
-    "MINIMAX_H3_CONTROL_DEPTH_KEY",
+    "MINIMAX_H3_CONTROL_PROXY_KEY",
     "MINIMAX_H3_LAYOUT_KEY",
     "MINIMAX_H3_NUM_FIXED_VIDEO_ROWS_KEY",
     "MiniMaxH3LatentPreparationStage",

@@ -25,7 +25,7 @@ from fastvideo.logger import init_logger
 from fastvideo.pipelines.basic.minimax_h3.camera import build_camera_latent
 from fastvideo.pipelines.basic.minimax_h3.packing import MiniMaxH3PackedLayout, patchify_video_latents
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import (
-    MINIMAX_H3_CONTROL_DEPTH_KEY,
+    MINIMAX_H3_CONTROL_PROXY_KEY,
     MINIMAX_H3_LAYOUT_KEY,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
@@ -96,10 +96,10 @@ class MiniMaxH3CameraConditioningStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> ForwardBatch:
         source = batch.extra.get(MINIMAX_H3_CAMERA_TRAJECTORY_KEY)
-        # Latent preparation puts the proxy on the target grid when the trunk reads it, and that
-        # copy needs the same row indices a trajectory would. Either signal alone is a valid trunk.
-        depth_rows = batch.extra.get(MINIMAX_H3_CONTROL_DEPTH_KEY)
-        if source is None and depth_rows is None:
+        # Latent preparation replicates the proxy onto the target grid when the trunk reads it, and
+        # that copy needs the same row indices a trajectory would. Either alone is a valid trunk.
+        proxy_rows = batch.extra.get(MINIMAX_H3_CONTROL_PROXY_KEY)
+        if source is None and proxy_rows is None:
             return batch
 
         controlnet = getattr(self.transformer, "camera_controlnet", None)
@@ -141,11 +141,11 @@ class MiniMaxH3CameraConditioningStage(PipelineStage):
                                  "target video rows; the ray field and the target latent grid disagree.")
             batch.extra[MINIMAX_H3_CAMERA_LATENT_KEY] = rows[None]
 
-        if depth_rows is not None and int(depth_rows.shape[1]) != target_rows.numel():
-            raise ValueError(f"The proxy produced {int(depth_rows.shape[1])} control rows for "
-                             f"{target_rows.numel()} target video rows. Block replication lands the proxy on the "
-                             "target canvas exactly, so a mismatch here means the two clips disagree on frame count "
-                             "rather than on resolution.")
+        if proxy_rows is not None and int(proxy_rows.shape[1]) != target_rows.numel():
+            raise ValueError(f"The proxy produced {int(proxy_rows.shape[1])} control rows for "
+                             f"{target_rows.numel()} target video rows. Replication lands it on the target latent "
+                             "grid exactly, so a mismatch here means the two clips disagree on frame count rather "
+                             "than on resolution.")
 
         batch.extra[MINIMAX_H3_CAMERA_ROWS_KEY] = target_rows
         logger.info("MiniMax-H3 control trunk (%s): %d rows over a %dx%dx%d latent grid",

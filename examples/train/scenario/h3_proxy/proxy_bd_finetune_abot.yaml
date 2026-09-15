@@ -100,7 +100,7 @@ models:
     # No trajectory in the KOF data, so there is nothing for the control trunk to read. With the
     # branch off the DiT is the released model unchanged.
     enable_camera_controlnet: false
-    enable_control_depth: false
+    enable_control_proxy: false
     # LoRA *is* how this stage trains the backbone, so freezing it would leave nothing to optimize.
     # The plugin rejects freeze_backbone=true together with lora.enable=true.
     freeze_backbone: false

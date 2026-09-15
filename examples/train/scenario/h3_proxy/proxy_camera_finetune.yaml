@@ -23,9 +23,9 @@ models:
 
     # --- camera control branch ---
     enable_camera_controlnet: true
-    # depth as a second control modality. Off by default: the proxy already carries geometry
-    # through the reference slot, and a second copy of it on the trunk mostly costs memory.
-    enable_control_depth: false
+    # The proxy as a second control modality, replicated onto the target latent grid. Off here so
+    # this scenario stays a test of the trajectory alone; proxy_controlnet_finetune.yaml turns it on.
+    enable_control_proxy: false
     controlnet_dim: 1024
     controlnet_ffn_dim: 4096
     # 1024 / 8 = 128 channels per head, which clears the 96 the H3 rotary table rotates. Must also

@@ -85,7 +85,7 @@ class MiniMaxH3ArchConfig(DiTArchConfig):
     # with only `depth` the branch is a proxy ControlNet, which is the way to bind a proxy to the
     # token it constrains when no camera trajectory was captured alongside the clip.
     camera_enable_camera: bool = True
-    camera_enable_depth: bool = False
+    camera_enable_proxy: bool = False
     camera_control_layer_stride: int = 2
     camera_control_dim: int = 1024
     camera_control_ffn_dim: int = 4096

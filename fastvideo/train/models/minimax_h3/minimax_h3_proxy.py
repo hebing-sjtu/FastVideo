@@ -70,6 +70,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     build_row_timesteps,
     pad_video_latents_to_patch,
     patchify_video_latents,
+    replicate_latents_to_grid,
     target_rows_per_latent_frame,
     unpack_audio_tokens,
     unpatchify_video_tokens,
@@ -112,7 +113,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         # --- camera control branch ---
         enable_camera_controlnet: bool = True,
         enable_control_camera: bool = True,
-        enable_control_depth: bool = False,
+        enable_control_proxy: bool = False,
         controlnet_dim: int = 1024,
         controlnet_ffn_dim: int = 4096,
         controlnet_num_heads: int = 8,
@@ -129,7 +130,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
     ) -> None:
         self._enable_camera_controlnet = bool(enable_camera_controlnet)
         self._enable_control_camera = bool(enable_control_camera)
-        self._enable_control_depth = bool(enable_control_depth)
+        self._enable_control_proxy = bool(enable_control_proxy)
         self._controlnet_dim = int(controlnet_dim)
         self._controlnet_ffn_dim = int(controlnet_ffn_dim)
         self._controlnet_num_heads = int(controlnet_num_heads)
@@ -153,18 +154,19 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         if self._num_given_latent_frames and not self._enable_anchor:
             raise ValueError("num_given_latent_frames>0 needs enable_anchor=true: sampling fills the first given "
                              "frame from the anchor, and has nothing else to put there.")
-        if self._enable_control_depth and not self._enable_camera_controlnet:
-            raise ValueError("enable_control_depth=true requires enable_camera_controlnet=true; depth is a modality "
-                             "on the control trunk, and enable_camera_controlnet is what builds the trunk.")
-        if self._enable_camera_controlnet and not (self._enable_control_camera or self._enable_control_depth):
+        if self._enable_control_proxy and not self._enable_camera_controlnet:
+            raise ValueError("enable_control_proxy=true requires enable_camera_controlnet=true; the proxy is a "
+                             "modality on the control trunk, and enable_camera_controlnet is what builds the trunk.")
+        if self._enable_camera_controlnet and not (self._enable_control_camera or self._enable_control_proxy):
             raise ValueError("enable_camera_controlnet=true builds a control trunk with nothing to read. Enable "
                              "enable_control_camera (the Plücker ray field of a requested trajectory), "
-                             "enable_control_depth (the proxy on the target latent grid), or both.")
+                             "enable_control_proxy (the proxy on the target latent grid), or both.")
         if not 0.0 <= self._camera_dropout < 1.0:
             raise ValueError(f"camera_dropout must be in [0, 1), got {camera_dropout!r}")
-        if self._camera_dropout and self._enable_control_depth:
-            raise ValueError("camera_dropout drops the whole control trunk, which would also drop depth. Set "
-                             "camera_dropout=0.0 when enable_control_depth=true.")
+        if self._camera_dropout and self._enable_control_proxy:
+            raise ValueError("camera_dropout drops the whole control trunk, and here the trunk is the only per-token "
+                             "route the proxy has, so dropping it would train the model to ignore the thing being "
+                             "tested. Set camera_dropout=0.0 when enable_control_proxy=true.")
 
         from fastvideo.train.utils.lora import LoraConfig
         lora_config = LoraConfig.coerce(lora)
@@ -236,7 +238,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
                              "camera ControlNet")
         arch_config.camera_enable_controlnet = self._enable_camera_controlnet
         arch_config.camera_enable_camera = self._enable_control_camera
-        arch_config.camera_enable_depth = self._enable_control_depth
+        arch_config.camera_enable_proxy = self._enable_control_proxy
         arch_config.camera_freeze_backbone = self._freeze_backbone
         arch_config.camera_control_dim = self._controlnet_dim
         arch_config.camera_control_ffn_dim = self._controlnet_ffn_dim
@@ -265,7 +267,6 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             global_rank=world_group.rank,
             include_anchor=self._enable_anchor,
             include_camera=self._enable_camera_controlnet and self._enable_control_camera,
-            include_depth=self._enable_control_depth,
         )
         self.start_step = 0
 
@@ -338,9 +339,9 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         if drop:
             return {}
 
+        num_latent_frames, latent_height, latent_width = latent_shape
         control: dict[str, torch.Tensor] = {}
         if self._enable_control_camera:
-            num_latent_frames, latent_height, latent_width = latent_shape
             info = (raw_batch.get("info_list") or [{}])[0]
             pixel_size = info.get("pixel_size")
             if pixel_size is None:
@@ -357,9 +358,14 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             )
             control["camera_latent"] = patchify_video_latents(camera_latent.to(dtype),
                                                               self.transformer.patch_size)[None]
-        if self._enable_control_depth:
-            depth = raw_batch["depth_latent"].to(device=device, dtype=dtype)
-            control["depth_latent"] = patchify_video_latents(depth, self.transformer.patch_size)[None]
+        if self._enable_control_proxy:
+            # The same cached proxy the reference prefix reads, replicated onto the target's latent
+            # grid so the trunk can add its residual at the row each proxy cell describes. Nothing
+            # extra is cached for this: replication adds no detail a re-encode would have, and the
+            # trunk's embedding is a fresh linear that never decodes what it is given.
+            proxy = replicate_latents_to_grid(
+                raw_batch["proxy_latent"].to(device=device, dtype=dtype), latent_height, latent_width)
+            control["proxy_control_latent"] = patchify_video_latents(proxy, self.transformer.patch_size)[None]
         return control
 
     def prepare_batch(

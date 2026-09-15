@@ -80,6 +80,10 @@ class MiniMaxH3PreparedReference:
     image: Image.Image | None = None
     frames: np.ndarray | None = None
     waveform: torch.Tensor | None = None
+    # The unpadded VAE latent, staged by condition encoding for anything that needs the reference on
+    # a grid rather than as rows -- the control trunk replicates it onto the target's grid. Cleared
+    # with the pixels once the rows are built.
+    latents: torch.Tensor | None = None
     block_timestamps: list[float] = field(default_factory=list)
     num_latent_frames: int = 1
     latent_height: int = 0

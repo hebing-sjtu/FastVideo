@@ -18,7 +18,6 @@ key                          shape                                       require
 ``anchor_latent``            ``[24, 1, H_a, W_a]`` RGB first frame       when anchor on
 ``camera_extrinsics``        ``[F, 4, 4]`` world-to-camera               when camera on
 ``camera_intrinsics``        ``[F, 3, 3]`` pixel units                   when camera on
-``depth_latent``             ``[24, T, H, W]`` target-clip depth         when depth on
 ``audio_latent``             ``[2, 32, A]``                              no
 ``info``                     dict, must carry ``pixel_size``             when camera on
 ===========================  ==========================================  ==============
@@ -54,7 +53,6 @@ _TENSOR_KEYS = (
     "text_token_tags",
     "camera_extrinsics",
     "camera_intrinsics",
-    "depth_latent",
     "audio_latent",
 )
 _REQUIRED_KEYS = (
@@ -120,15 +118,13 @@ class MiniMaxH3ProxyCachedDataset(Dataset):
         *,
         include_anchor: bool = True,
         include_camera: bool = True,
-        include_depth: bool = False,
         sample_paths: list[str] | None = None,
     ) -> None:
         self.sample_paths = sample_paths if sample_paths is not None else list_sample_paths(data_path)
         self.include_anchor = bool(include_anchor)
         self.include_camera = bool(include_camera)
-        self.include_depth = bool(include_depth)
         logger.info("MiniMaxH3ProxyCachedDataset: %d samples (anchor=%s, camera=%s, depth=%s)", len(self.sample_paths),
-                    self.include_anchor, self.include_camera, self.include_depth)
+                    self.include_anchor, self.include_camera)
 
     def __len__(self) -> int:
         return len(self.sample_paths)
@@ -162,8 +158,6 @@ class MiniMaxH3ProxyCachedDataset(Dataset):
         if self.include_camera and not {"camera_extrinsics", "camera_intrinsics"} <= sample.keys():
             raise KeyError(f"enable_camera_controlnet=true but cached sample {path!r} has no camera trajectory; "
                            "add a 'camera' field naming an .npz to the encoder's manifest and re-encode.")
-        if self.include_depth and "depth_latent" not in sample:
-            raise KeyError(f"enable_control_depth=true but cached sample {path!r} has no 'depth_latent'")
 
         sample.setdefault("info", {})
         if isinstance(sample["info"], dict):
@@ -175,8 +169,6 @@ class MiniMaxH3ProxyCachedDataset(Dataset):
         if not self.include_camera:
             sample.pop("camera_extrinsics", None)
             sample.pop("camera_intrinsics", None)
-        if not self.include_depth:
-            sample.pop("depth_latent", None)
         return sample
 
 
@@ -197,7 +189,6 @@ def build_proxy_train_dataloader(
     global_rank: int,
     include_anchor: bool = True,
     include_camera: bool = True,
-    include_depth: bool = False,
 ) -> StatefulDataLoader:
     from fastvideo.dataset.parquet_dataset_map_style import DP_SP_BatchSampler
 
@@ -205,7 +196,6 @@ def build_proxy_train_dataloader(
         data_config.data_path,
         include_anchor=include_anchor,
         include_camera=include_camera,
-        include_depth=include_depth,
     )
     batch_size = int(getattr(data_config, "train_batch_size", 1) or 1)
     sampler = DP_SP_BatchSampler(

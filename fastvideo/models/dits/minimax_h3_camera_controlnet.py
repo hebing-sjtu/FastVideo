@@ -7,10 +7,10 @@ backbone is normally frozen, so this trunk is the only route by which that signa
 sampler.
 
 Two modalities can drive it, together or alone. ``camera`` is the Plücker ray field of a requested
-trajectory. ``depth`` is the proxy resampled onto the target latent grid -- named for the depth
-video it was built for, though what it carries is whatever the proxy encodes, DUV included. Running
-``depth`` alone turns the branch into a proxy ControlNet, which is how a proxy binds to the tokens
-it constrains for footage that arrived without a camera trajectory.
+trajectory. ``proxy`` is the proxy render replicated onto the target latent grid, which is how a
+proxy reaches the tokens it is meant to constrain rather than sitting in the reference prefix a
+whole clip earlier in rotary time. Running ``proxy`` alone turns the branch into a proxy ControlNet,
+which is what footage that arrived without a captured trajectory gets.
 
 Why a ControlNet and not another Ref2VA reference. A reference is *content*: the model reads it,
 decides how much of it to believe, and the decision is made once for the whole clip. Camera motion
@@ -71,7 +71,7 @@ logger = init_logger(__name__)
 
 # Modality order is fixed: it decides the concatenation order into `fusion_proj` and is therefore
 # part of the ControlNet's state-dict contract.
-CAMERA_CONTROL_MODALITIES: tuple[str, ...] = ("camera", "depth")
+CAMERA_CONTROL_MODALITIES: tuple[str, ...] = ("camera", "proxy")
 
 
 class MiniMaxH3CameraControlBlock(nn.Module):
@@ -195,10 +195,10 @@ class MiniMaxH3CameraControlNet(nn.Module):
         patch_volume = math.prod(int(size) for size in arch.patch_size)
         # Both modalities arrive already patchified into rows, exactly like the backbone's video
         # rows, so these are linears over a patch and not convolutions over a latent grid. They
-        # differ in width because a Plücker field is six raw channels while depth is a VAE latent.
+        # differ in width because a Plücker field is six raw channels while a proxy is a VAE latent.
         self._modality_widths = {
             "camera": MINIMAX_H3_CAMERA_CHANNELS * patch_volume,
-            "depth": int(arch.in_channels) * patch_volume,
+            "proxy": int(arch.in_channels) * patch_volume,
         }
         self.embeddings = nn.ModuleDict({
             name:
@@ -367,7 +367,7 @@ class MiniMaxH3CameraTransformer3DModel(MiniMaxH3Transformer3DModel):
         self.freeze_backbone_for_camera = bool(getattr(arch, "camera_freeze_backbone", True))
 
         enabled = [
-            name for name, flag in (("camera", "camera_enable_camera"), ("depth", "camera_enable_depth"))
+            name for name, flag in (("camera", "camera_enable_camera"), ("proxy", "camera_enable_proxy"))
             if bool(getattr(arch, flag, name == "camera"))
         ]
 
@@ -376,7 +376,7 @@ class MiniMaxH3CameraTransformer3DModel(MiniMaxH3Transformer3DModel):
             return
         if not enabled:
             raise ValueError("camera_enable_controlnet=true builds a control trunk, but both of its modalities are "
-                             "off. Enable camera_enable_camera (the Plücker ray field), camera_enable_depth (the "
+                             "off. Enable camera_enable_camera (the Plücker ray field), camera_enable_proxy (the "
                              "proxy on the target grid), or turn the trunk off.")
 
         self.camera_controlnet = MiniMaxH3CameraControlNet(
@@ -411,7 +411,7 @@ class MiniMaxH3CameraTransformer3DModel(MiniMaxH3Transformer3DModel):
     ) -> torch.Tensor:
         """Interleave the control trunk with the backbone trunk."""
         camera_latent = kwargs.pop("camera_latent", None)
-        depth_latent = kwargs.pop("depth_latent", None)
+        proxy_latent = kwargs.pop("proxy_control_latent", None)
         target_row_indices = kwargs.pop("camera_row_indices", None)
         if kwargs:
             raise TypeError(f"{type(self).__name__} received unsupported forward arguments {sorted(kwargs)}.")
@@ -426,7 +426,7 @@ class MiniMaxH3CameraTransformer3DModel(MiniMaxH3Transformer3DModel):
             control_states, control_mask = self.camera_controlnet.scatter(
                 {
                     "camera": camera_latent,
-                    "depth": depth_latent
+                    "proxy": proxy_latent
                 },
                 target_row_indices=target_row_indices,
                 row_start=row_start,

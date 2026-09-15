@@ -32,8 +32,8 @@ The proxy grid is the easiest of the three to get wrong without noticing, becaus
 reads its flag at all — the grid is baked into `proxy_latent` and the trainer just uses the shape it
 finds. Only validation has to be told, and a cache encoded at the wrong proxy resolution trains and
 validates without complaint either way; it shows up as a proxy that cannot steer the camera. With
-`--proxy-control` the same two numbers also decide what the control trunk replicates from, so a
-mismatch there changes the constraint and not just the reference.
+`enable_control_proxy` the same two numbers also set the grid the control trunk replicates from, so
+a mismatch there changes the constraint and not just the reference.
 
 ## Reading geometry off the shapes
 
@@ -43,7 +43,6 @@ transformer's 2x2 patch. So the shapes are the geometry, and a cache is self-doc
 ```
 vae_latent    (24, 37, 48, 84)    ->  768 x 1344 target
 proxy_latent  (24, 37, 12, 21)    ->  192 x 336 proxy
-depth_latent  (24, 37, 48, 84)    ->  the proxy replicated onto the target canvas
 anchor_latent (24,  1, 128, 224)  ->  2048 x 3584, short edge 2048
 ```
 
@@ -62,19 +61,19 @@ to clip — 224 and 232 in the same cache is normal. Only the short edge has to 
 | `anchor_latent` | `(24, 1, h, w)` | appearance dictionary for the whole take, not a first frame |
 | `text_embedding` | `(tokens, 5120)` | Qwen3-VL, already wrapped in the CWM chat |
 | `text_token_tags` | `(tokens,)` | per-token modality tags |
-| `depth_latent` | `(24, T, H, W)` | only with `--proxy-control`: the proxy on the **target** grid |
 | `info` | dict | `num_frames`, `pixel_size`, `prompt`, `cwm_system` |
 | `camera_extrinsics` / `camera_intrinsics` | `(F, 4, 4)` / `(F, 3, 3)` | only when the trunk reads a trajectory |
 
-`depth_latent` is the proxy a second time, for the control trunk rather than the reference slot — so
-its grid is the target's `(48, 84)`, not the proxy's `(12, 21)`. It costs a second full-canvas VAE
-encode and about 14 MB per clip, and `enable_control_depth: true` refuses a cache without it.
+The proxy ControlNet variant (`enable_control_proxy`) adds **nothing** to this format. It replicates
+the cached `proxy_latent` onto the target's latent grid at batch-prep time, which is exact because
+the VAE's stride of 16 makes proxy cell `(i, j)` cover the same pixels as target cells
+`(4i..4i+3, 4j..4j+3)`.
 
-Producing it is a resize, and the proxy grid must **divide the target canvas exactly**: each proxy
-pixel is replicated over an integer block rather than interpolated, because a DUV frame is three
-integer codes and interpolating them averages unrelated depths and invents class colours. The
-released geometries divide (1344/336 == 768/192 == 4); 704 x 1280 does not, so a `--proxy-control`
-cache cannot be written at the canvas `gta_v2_cwm` used.
+It does constrain geometry, though: the **target latent grid has to be an integer multiple of the
+proxy's**, or one proxy cell spreads over a fractional number of target cells and the registration
+varies across the frame. 768x1344 over 192x336 is 48/12 == 84/21 == 4. **704x1280 is 44 x 80, which
+is 3.67x by 3.81x — so `gta_v2_cwm` cannot drive the trunk.** `gta_v2_train` and `abot_train` can,
+being 768x1344 already.
 
 `info["pixel_size"]` is the one geometry the encoder records explicitly. The proxy grid and anchor
 short edge are not recorded and have to be recovered from the shapes.
