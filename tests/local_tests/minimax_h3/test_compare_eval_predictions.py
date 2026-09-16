@@ -145,15 +145,15 @@ def test_a_flat_error_with_an_improved_rate_is_not_reported_as_a_failure():
     failure to learn would be the wrong conclusion from the right numbers.
     """
     module = _load("compare_eval_predictions")
-    sluggish = module.verdict(moved=11.0, before=32.16, after=32.36, rates={"left": 0.55, "right": 0.80})
+    sluggish = module.verdict(moved=11.0, before=32.16, after=32.36, rates={"left": 0.55, "right": 0.80}, tracks={"left": 0.30, "right": 0.30})
     assert "rate of change moved toward" in sluggish
 
-    stuck = module.verdict(moved=11.0, before=32.16, after=32.36, rates={"left": 0.55, "right": 0.56})
+    stuck = module.verdict(moved=11.0, before=32.16, after=32.36, rates={"left": 0.55, "right": 0.56}, tracks={"left": 0.30, "right": 0.30})
     assert "not learning to track" in stuck
 
     # And the rate has to be consulted *before* the error-worsened verdict, or a large improvement
     # in tracking gets reported as training on the wrong thing whenever appearance error ticks up.
-    risen = module.verdict(moved=56.0, before=51.06, after=53.33, rates={"left": 0.25, "right": 0.83})
+    risen = module.verdict(moved=56.0, before=51.06, after=53.33, rates={"left": 0.25, "right": 0.83}, tracks={"left": 0.30, "right": 0.30})
     assert "rate of change moved toward" in risen and "up 4.4%" in risen
 
 
@@ -170,7 +170,32 @@ def test_the_verdict_separates_outcomes_that_look_alike(moved, before, after, ex
     nothing must never be confused with a run that trained and did not learn."""
     module = _load("compare_eval_predictions")
     rates = {"left": 1.0, "right": 1.0}
-    assert expected in module.verdict(moved=moved, before=before, after=after, rates=rates)
+    tracks = {"left": 0.30, "right": 0.30}
+    assert expected in module.verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks)
+
+
+def test_tracking_outranks_the_rate_and_the_error():
+    """Direction beats magnitude beats appearance, because that is the order of their resolution.
+
+    Rate is blind to direction -- a prediction churning in the wrong place changes by as much per
+    frame as the take does -- so a rate that did not move says nothing once tracking has.
+    """
+    module = _load("compare_eval_predictions")
+    tracked = module.verdict(moved=11.0,
+                             before=32.16,
+                             after=32.36,
+                             rates={"left": 1.02, "right": 1.02},
+                             tracks={"left": 0.21, "right": 0.34})
+    assert "Tracking rose" in tracked
+
+    # And the real gta_v2_wn numbers: everything still, including a rate that was already 1.02x in
+    # the base model, so the sluggishness hypothesis was never the one to test.
+    stalled = module.verdict(moved=11.0,
+                             before=32.16,
+                             after=32.36,
+                             rates={"left": 1.02, "right": 1.02},
+                             tracks={"left": 0.21, "right": 0.21})
+    assert "none of the three measurements improved" in stalled
 
 
 def _wn_panels(module, tmp_path, monkeypatch, *, improvement: float, reseed: bool = False):

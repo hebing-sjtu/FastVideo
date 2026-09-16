@@ -273,7 +273,7 @@ def correlation(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.corrcoef(left, right)[0, 1])
 
 
-def verdict(*, moved: float, before: float, after: float, rates: dict[str, float]) -> str:
+def verdict(*, moved: float, before: float, after: float, rates: dict[str, float], tracks: dict[str, float]) -> str:
     """Which of the five outcomes this is, given the three numbers that separate them.
 
     The thresholds are independent because the failures are unrelated. A drift below a quantisation
@@ -288,10 +288,15 @@ def verdict(*, moved: float, before: float, after: float, rates: dict[str, float
         return ("The prediction moved and moved toward the target, so the LoRA is learning the task. Whether it has\n"
                 "learned enough is a question about how much further the error can fall, not about whether training\n"
                 "is working -- compare a third checkpoint to see if the trend is still going.")
-    # Before the error-worsened verdict, not after it. When the two disagree the rate is the one
-    # the run is being asked about, and the error is the coarser instrument: at a mean of tens of
-    # levels it is measuring appearance, where a few percent is not evidence about alignment.
-    # Ordering these the other way calls a large improvement in tracking a failure.
+    # Before the error-worsened verdict, not after it. When these disagree the motion measurements
+    # are the ones the run is being asked about, and the error is the coarser instrument: at a mean
+    # of tens of levels it is measuring appearance, where a few percent is not evidence about
+    # alignment. Ordering these the other way calls a large improvement in tracking a failure.
+    if tracks["right"] - tracks["left"] > 0.02:
+        return (f"Tracking rose from {tracks['left']:+.3f} to {tracks['right']:+.3f}: the prediction's frame-to-frame\n"
+                "change is landing more where the take's does. That is the claim 'it follows the picture' makes,\n"
+                "and it is direction-sensitive in a way neither the appearance error nor the rate is. Read it as\n"
+                "the result even if the error did not move.")
     if abs(rates["left"] - 1.0) - abs(rates["right"] - 1.0) > 0.05:
         direction = "flat" if after <= before * 1.02 else f"up {(after - before) / before * 100:.1f}%"
         return (f"The prediction's rate of change moved toward the take's while pixel error stayed {direction}.\n"
@@ -303,11 +308,12 @@ def verdict(*, moved: float, before: float, after: float, rates: dict[str, float
                 "adapter is training on something, and it is not this. A conditioning signal the model reads\n"
                 "differently at sampling time than at training time does exactly this, so check that the sampled\n"
                 "regime matches the cache's: given-frame count, system prompt, proxy grid.")
-    return ("The prediction moved but neither toward the target nor toward its rate of change. The adapter is\n"
-            "reaching the model and the optimiser is doing something, so this is not a plumbing failure -- it\n"
-            "is the substantive outcome that the run is not learning to track. Weight-space drift is the next\n"
-            "thing to read: compare_lora_checkpoints.py says whether the gradient has a consistent direction\n"
-            "or is circling.")
+    return (f"The prediction moved, and none of the three measurements improved: appearance error, rate, and\n"
+            f"tracking ({tracks['left']:+.3f} -> {tracks['right']:+.3f}) all sat still. The adapter is reaching the\n"
+            "model and the optimiser is doing something, so this is not a plumbing failure -- it is the\n"
+            "substantive outcome that the run is not learning to track. Weight-space drift is the next thing to\n"
+            "read: compare_lora_checkpoints.py says whether the gradient has a consistent direction or is\n"
+            "circling, and a random walk there confirms this reading rather than adding to it.")
 
 
 def main() -> None:
@@ -335,6 +341,7 @@ def main() -> None:
     left_errors: list[np.ndarray] = []
     right_errors: list[np.ndarray] = []
     motions: dict[str, list[np.ndarray]] = {"left": [], "right": [], "target": []}
+    trackings: dict[str, list[np.ndarray]] = {"left": [], "right": []}
     layout_note: str | None = None
     print(f"\n{len(shared)} panels in common:")
     for index in shared:
@@ -364,6 +371,11 @@ def main() -> None:
         # about. Distance to the target is dominated by appearance -- a mean of 32/255 is nowhere
         # near a near-miss on alignment -- so it can sit flat while tracking improves underneath it.
         motion = {"left": np.zeros(count), "right": np.zeros(count), "target": np.zeros(count)}
+        # Rate is a magnitude and blind to direction: a prediction churning in the wrong place can
+        # change by exactly as much per frame as the take does. Correlating the two frame
+        # differences pixel by pixel asks whether the change happens in the same places and the
+        # same sense, which is what "it does not follow the picture" actually claims.
+        tracking = {"left": np.zeros(count), "right": np.zeros(count)}
         previous: tuple[np.ndarray, ...] | None = None
         for frame in range(count):
             left_prediction = layout.crop(left_frames[frame], "prediction")
@@ -376,12 +388,19 @@ def main() -> None:
             if previous is not None:
                 for name, now, before in zip(motion, current, previous, strict=True):
                     motion[name][frame] = mean_abs_diff(now, before)
+                target_delta = target.astype(np.float32) - previous[2].astype(np.float32)
+                for name, now, before in (("left", left_prediction, previous[0]), ("right", right_prediction,
+                                                                                   previous[1])):
+                    delta = now.astype(np.float32) - before.astype(np.float32)
+                    tracking[name][frame] = correlation(delta.ravel(), target_delta.ravel())
             previous = current
         drifts.append(drift)
         left_errors.append(left_error)
         right_errors.append(right_error)
         for name, values in motion.items():
             motions[name].append(values)
+        for name, values in tracking.items():
+            trackings[name].append(values)
         print(f"  video_{index}: {count} frames, drift {drift.mean():6.2f}, "
               f"error {left_error.mean():6.2f} -> {right_error.mean():6.2f}")
 
@@ -393,6 +412,7 @@ def main() -> None:
     left_error = np.mean([e[:count] for e in left_errors], axis=0)
     right_error = np.mean([e[:count] for e in right_errors], axis=0)
     motion = {name: np.mean([values[:count] for values in curves], axis=0) for name, curves in motions.items()}
+    track = {name: np.mean([values[:count] for values in curves], axis=0) for name, curves in trackings.items()}
 
     boundary = args.prefix_frames if args.prefix_frames is not None else detect_prefix(drift)
     print(f"\nper-frame curves over {count} frames, averaged across panels (0-255 scale):")
@@ -430,16 +450,21 @@ def main() -> None:
     phased = reference.std() > 0.05 * reference.mean() if reference.mean() else False
     print(f"\nframe-to-frame motion over the same frames (target {reference.mean():.2f}):")
     rates = {}
+    tracks = {}
     for name, label in (("left", "baseline "), ("right", "checkpoint")):
         observed = motion[name][judged]
         rates[name] = observed.mean() / reference.mean() if reference.mean() else float("nan")
+        tracks[name] = float(np.nanmean(track[name][judged]))
         phase = f"phase {correlation(observed, reference):+.2f}" if phased else "phase n/a"
-        print(f"  {label}            {observed.mean():.2f}   rate {rates[name]:.2f}x   {phase}")
+        print(f"  {label}            {observed.mean():.2f}   rate {rates[name]:.2f}x   {phase}   "
+              f"tracking {tracks[name]:+.3f}")
     if not phased:
         print("  (the take's own rate barely varies over these frames, so there are no accelerations to match)")
+    print("  rate is a magnitude; tracking is the pixelwise correlation of the two frame differences, so it is\n"
+          "  the one that says whether the change happens where the take's does. 0 means unrelated.")
 
     print()
-    print(verdict(moved=moved, before=before, after=after, rates=rates))
+    print(verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks))
 
 
 if __name__ == "__main__":
