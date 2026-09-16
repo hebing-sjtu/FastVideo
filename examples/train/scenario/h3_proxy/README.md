@@ -462,6 +462,57 @@ Four settings have to agree for that to mean what it says, and each one fails qu
 wrapper also writes to a fresh `output_dir` by default, since a training directory prunes by highest
 step and would delete the early checkpoints the eval exists to inspect.
 
+### Reading the panels in pixels
+
+`compare_eval_outputs.py` hashes the mp4s, which proves only that the adapter reached the sampling
+model: a weight delta far too small to see changes every byte, and so does one that made the output
+worse. `compare_eval_predictions.py` reads the pixels instead, splitting each panel into its
+`proxy | prediction | target` columns and reporting three things over the *generated* frames only —
+under `wn` the given prefix is the same target footage in both runs and cannot differ however
+training went, so a clip average dilutes the result with a quarter of the clip that is identical by
+construction.
+
+The three are ordered by how finely each resolves the thing under judgement, and the verdict
+consults them in that order:
+
+- **appearance error**, the distance to the target. Coarsest. At a mean of tens of levels it is
+  measuring appearance, not alignment, so a few percent either way is not evidence.
+- **rate**, how fast the picture changes relative to the take. A magnitude, and blind to direction:
+  a prediction churning in the wrong place changes by exactly as much per frame.
+- **tracking**, the pixelwise correlation of the two frame differences, which asks whether the
+  change lands *where* the take's does. This is what "it does not follow the picture" claims.
+
+Tracking only means something between its own two bounds, and both come out of the same data:
+
+- the **off-time floor**, the same arithmetic against target frames that cannot correspond. Not
+  zero in general — a steady pan matches a steady pan at any offset — so it has to be measured
+  rather than assumed.
+- the **given prefix**, where the prediction *is* the decoded target footage, so its score is what
+  an exact match returns through the same VAE roundtrip, panel resampling and encoder.
+
+The proxy's own column is also scored and is **not** a ceiling. DUV's semantic channels are codes,
+piecewise constant across a road or a wall, so a pan over one produces no difference where RGB
+produces a large one; the two have different spatial support and correlating them says nothing
+about what the DUV determines.
+
+Measured on `gta_v2_cwm_wn`, step 0 against step 525, as the reference any later variant is read
+against:
+
+| | value |
+| --- | --- |
+| off-time floor | −0.006 |
+| exact match, given prefix | +0.965 |
+| base model | +0.100, or 11% of achievable |
+| after 525 LoRA steps | +0.095 |
+
+So the conditioning does reach the model as a correspondence and not merely as a global statistic —
+the floor settles that — the headroom is nearly all of the range, and 525 steps closed none of it.
+`compare_lora_checkpoints.py` on the same run reports the increments as orthogonal to the
+accumulated delta from early on, 1:14 over steps 75–225 and 1:42 over 375–525. Two independent
+measurements of one thing: the signal is present and the gradient cannot attribute it. That is a
+property of the conditioning pathway, which is what the ControlNet variant changes, and not of how
+long it trained.
+
 ## Sampling
 
 `MiniMaxH3ProxyCameraPipeline` is the Ref2VA pipeline plus one stage that turns a requested
