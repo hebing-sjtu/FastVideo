@@ -203,7 +203,10 @@ callbacks:
   # latent it already encoded, so sampling pays no second VAE pass for it.
   validation:
     _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
-    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
+    # The Ref2VA pipeline plus the stage that turns the replicated proxy into control rows. The
+    # plain Ref pipeline also builds that stage when the checkpoint has a trunk, so this names the
+    # intent rather than carrying it.
+    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3ProxyCameraPipeline
     # The same six clips the wn baseline was measured on, so the tracking numbers are about the
     # same content. A validation set is mp4 paths and captions, so it carries no canvas of its own
     # and is reusable across geometries -- the callback re-derives conditioning at the run's.

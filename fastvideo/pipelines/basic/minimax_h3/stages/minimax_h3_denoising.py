@@ -157,7 +157,14 @@ class MiniMaxH3DenoisingStage(PipelineStage):
             if latent is not None:
                 control_kwargs[key] = latent.to(device)
         if control_kwargs:
-            control_kwargs[MINIMAX_H3_CAMERA_ROWS_KEY] = batch.extra[MINIMAX_H3_CAMERA_ROWS_KEY].to(device)
+            target_rows = batch.extra.get(MINIMAX_H3_CAMERA_ROWS_KEY)
+            if target_rows is None:
+                raise ValueError(
+                    f"The request carries {'/'.join(sorted(control_kwargs))} for the control trunk but no "
+                    f"{MINIMAX_H3_CAMERA_ROWS_KEY}, so there is no way to say which target rows the control "
+                    "conditions. MiniMaxH3CameraConditioningStage writes those indices and did not run: the "
+                    "pipeline was built without it.")
+            control_kwargs[MINIMAX_H3_CAMERA_ROWS_KEY] = target_rows.to(device)
 
         vsa_metadata_builder = _h3_vsa_metadata_builder(self.transformer, fastvideo_args)
         if vsa_metadata_builder is not None:

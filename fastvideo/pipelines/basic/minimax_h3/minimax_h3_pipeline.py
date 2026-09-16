@@ -80,9 +80,16 @@ class MiniMaxH3BasePipeline(ComposedPipelineBase):
                 ref2va=ref2va,
             ),
         )
-        if camera_control:
-            # After latent preparation: the ray field is sampled on the target latent grid, and the
-            # rows it writes are indices into the layout that stage builds.
+        # After latent preparation: the ray field is sampled on the target latent grid, and the rows
+        # it writes are indices into the layout that stage builds.
+        #
+        # The trunk's own presence is enough to require this stage, whatever the caller asked for.
+        # Latent preparation replicates the proxy whenever the transformer has a trunk that reads
+        # it, and denoising needs the row indices that go with that latent, so a ControlNet
+        # checkpoint loaded into a pipeline built without this stage has a control latent and
+        # nowhere to put it. The stage is inert when the request carries neither a trajectory nor a
+        # proxy, so adding it on that basis costs a plain run nothing.
+        if camera_control or getattr(transformer, "camera_controlnet", None) is not None:
             self.add_stage("camera_conditioning_stage", MiniMaxH3CameraConditioningStage(transformer=transformer))
         self.add_stage(
             "denoising_stage",

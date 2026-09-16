@@ -13,6 +13,7 @@ So these cover the guards and the registration, not the arithmetic of the residu
 
 from __future__ import annotations
 
+import importlib
 import types
 
 import numpy as np
@@ -175,3 +176,62 @@ def test_the_staged_latent_is_unpadded_so_it_can_be_replicated():
     assert reference.latents is not None
     assert reference.latents.shape[-2:] == PROXY_GRID
     assert np.prod(TARGET_GRID) % np.prod(PROXY_GRID) == 0
+
+
+# --- the stage that carries the row indices -------------------------------------------------------
+
+
+@pytest.mark.parametrize("pipeline_name", ["MiniMaxH3RefPipeline", "MiniMaxH3ProxyCameraPipeline"])
+def test_a_trunk_checkpoint_gets_the_conditioning_stage_whichever_pipeline_loads_it(monkeypatch, pipeline_name):
+    """Latent preparation replicates the proxy off the transformer alone, so this stage cannot be optional.
+
+    It writes the row indices saying which target rows the control conditions, and denoising needs
+    them alongside the latent. Gating it on the pipeline class instead let a ControlNet checkpoint
+    load into the plain Ref2VA pipeline, replicate the proxy, and fail at the first denoising step.
+    """
+    module = importlib.import_module("fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline")
+    pipeline = object.__new__(getattr(module, pipeline_name))
+    modules = {
+        "transformer": types.SimpleNamespace(camera_controlnet=object(), patch_size=PATCH_SIZE),
+        "vae": object(),
+        "audio_vae": object(),
+        "scheduler": object(),
+        "audio_scheduler": object(),
+        "text_encoder": object(),
+        "tokenizer": object(),
+        "processor": object(),
+    }
+    added: list[str] = []
+    monkeypatch.setattr(module.MiniMaxH3BasePipeline, "get_module", lambda self, name: modules[name])
+    monkeypatch.setattr(module.MiniMaxH3BasePipeline, "add_stage", lambda self, name, stage: added.append(name))
+    for stage_class in ("MiniMaxH3InputPreparationStage", "MiniMaxH3ConditioningStage",
+                        "MiniMaxH3LatentPreparationStage", "MiniMaxH3DenoisingStage",
+                        "MiniMaxH3VideoDecodingStage", "MiniMaxH3AudioDecodingStage",
+                        "MiniMaxH3CameraConditioningStage"):
+        monkeypatch.setattr(module, stage_class, lambda **kwargs: object())
+
+    pipeline.create_pipeline_stages(None)
+
+    assert "camera_conditioning_stage" in added
+    assert added.index("camera_conditioning_stage") > added.index("latent_preparation_stage")
+    assert added.index("camera_conditioning_stage") < added.index("denoising_stage")
+
+
+def test_a_plain_checkpoint_does_not_get_the_stage(monkeypatch):
+    """Without a trunk nothing writes a control latent, so the stage would only ever be a no-op."""
+    module = importlib.import_module("fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline")
+    pipeline = object.__new__(module.MiniMaxH3RefPipeline)
+    modules = dict.fromkeys(
+        ("vae", "audio_vae", "scheduler", "audio_scheduler", "text_encoder", "tokenizer", "processor"), object())
+    modules["transformer"] = types.SimpleNamespace(patch_size=PATCH_SIZE)
+    added: list[str] = []
+    monkeypatch.setattr(module.MiniMaxH3BasePipeline, "get_module", lambda self, name: modules[name])
+    monkeypatch.setattr(module.MiniMaxH3BasePipeline, "add_stage", lambda self, name, stage: added.append(name))
+    for stage_class in ("MiniMaxH3InputPreparationStage", "MiniMaxH3ConditioningStage",
+                        "MiniMaxH3LatentPreparationStage", "MiniMaxH3DenoisingStage",
+                        "MiniMaxH3VideoDecodingStage", "MiniMaxH3AudioDecodingStage"):
+        monkeypatch.setattr(module, stage_class, lambda **kwargs: object())
+
+    pipeline.create_pipeline_stages(None)
+
+    assert "camera_conditioning_stage" not in added
