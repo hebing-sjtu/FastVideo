@@ -192,6 +192,61 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
     # Config plumbing
     # ------------------------------------------------------------------
 
+    def _load_transformer(
+        self,
+        *,
+        trainable: bool,
+        disable_custom_init_weights: bool,
+        enable_gradient_checkpointing_type: str | None,
+        transformer_override_safetensor: str | None,
+    ) -> torch.nn.Module:
+        """Load, then re-apply the trunk-only freeze the construction-time one cannot survive.
+
+        The FSDP loader materialises new Parameters and then zeroes ``requires_grad`` on every one of
+        them; ``apply_trainable(trainable=True)`` then flips the whole module back on. The
+        construction-time ``freeze_backbone_for_camera`` loop ran against the meta tensors that load
+        replaced, so without this the trunk-only experiment silently trains the backbone too.
+        """
+        transformer = super()._load_transformer(
+            trainable=trainable,
+            disable_custom_init_weights=disable_custom_init_weights,
+            enable_gradient_checkpointing_type=enable_gradient_checkpointing_type,
+            transformer_override_safetensor=transformer_override_safetensor,
+        )
+        if not (trainable and self._freeze_backbone and self._enable_camera_controlnet):
+            return transformer
+        kept = 0
+        for name, param in transformer.named_parameters():
+            train = name.startswith("camera_controlnet.")
+            param.requires_grad_(train)
+            if train:
+                kept += param.numel()
+        if not kept:
+            raise RuntimeError("freeze_backbone=true but no camera_controlnet.* parameters were found to keep "
+                               "trainable after load.")
+        logger.info("Froze the backbone; %.1fM control-trunk parameters remain trainable", kept / 1e6)
+        self._check_trainable_parameters_are_on_one_device(transformer)
+        return transformer
+
+    @staticmethod
+    def _check_trainable_parameters_are_on_one_device(transformer: torch.nn.Module) -> None:
+        """Refuse a trunk whose parameters are split across CPU and GPU.
+
+        FSDP reduces gradients on the accelerator and assigns them onto the sharded parameter, so a
+        parameter left on CPU fails at the first backward with a device mismatch that names neither
+        the parameter nor the stage that moved it. The trunk is built on meta and materialised by the
+        loader rather than read from the checkpoint, which is the path where this can differ.
+        """
+        devices: dict[str, list[str]] = {}
+        for name, param in transformer.named_parameters():
+            if param.requires_grad:
+                devices.setdefault(param.device.type, []).append(name)
+        if len(devices) > 1:
+            summary = ", ".join(f"{device}: {len(names)} ({names[0]}, ...)" for device, names in sorted(devices.items()))
+            raise RuntimeError(f"Trainable parameters are on more than one kind of device -- {summary}. FSDP assigns "
+                               "reduced gradients onto the sharded parameter, so this fails at the first backward "
+                               "instead of here.")
+
     def _restore_trainable_after_lora(self, transformer: torch.nn.Module) -> None:
         """Keep the control trunk fully trainable alongside the backbone's adapters.
 
