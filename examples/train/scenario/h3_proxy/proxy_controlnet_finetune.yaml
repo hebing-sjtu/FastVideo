@@ -198,50 +198,20 @@ callbacks:
     _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
     max_grad_norm: 1.0
 
-  # Logs a proxy | prediction | target panel per held-out clip. Nothing here configures the trunk:
-  # latent preparation notices the transformer has the proxy modality and replicates the proxy
-  # latent it already encoded, so sampling pays no second VAE pass for it.
-  validation:
-    _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
-    # The Ref2VA pipeline plus the stage that turns the replicated proxy into control rows. The
-    # plain Ref pipeline also builds that stage when the checkpoint has a trunk, so this names the
-    # intent rather than carrying it.
-    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3ProxyCameraPipeline
-    # The same six clips the wn baseline was measured on, so the tracking numbers are about the
-    # same content. A validation set is mp4 paths and captions, so it carries no canvas of its own
-    # and is reusable across geometries -- the callback re-derives conditioning at the run's.
-    dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
-    # Off for this run. In-loop sampling shares the FSDP-wrapped training transformer, and after a
-    # validation pass the first training backward has failed with cuda-grad-onto-cpu-param. Eval the
-    # checkpoints with eval_checkpoint.sh instead; the panels are the same ones.
-    every_steps: 0
-    run_at_start: false
-    sampling_steps: [50]
-    # H3 has no zero-embedding branch for text CFG, matching training_cfg_rate: 0.0 above.
-    guidance_scale: 1.0
-    num_frames: 124
-    # H3 packs one document per request.
-    num_videos_per_prompt: 1
-    # Required: this callback conditions through an ordered reference list, and image_path would
-    # present the proxy a second time. The callback rejects true rather than silently doubling it.
-    use_validation_media_conditioning: false
-    # Must equal the --anchor-short-edge used by encode_proxy_samples.py.
-    anchor_short_edge: 2048
-    # Must equal the encoder's --proxy-height/--proxy-width. These also set the grid the trunk
-    # replicates from, so a mismatch here changes the control signal and not just the reference.
-    proxy_height: 192
-    proxy_width: 336
-    # Must match encode_proxy_samples --cwm-system.
-    cwm_system_prompt: w0
-    # Must match `models.student.num_given_latent_frames` above, and `cwm_system_prompt`.
-    num_given_latent_frames: 1
-    # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
-    # edge and still shows whether the output tracks the proxy.
-    panel_height: 384
-    # A validation pipeline holds a second text encoder and VAE alongside the training state.
-    offload_training_state: true
-    unload_pipeline_after_validation: true
-    text_encoder_cpu_offload: true
-    vae_cpu_offload: true
+  # No validation callback, deliberately. In-loop sampling hands the FSDP-wrapped training
+  # transformer to an inference pipeline, which holds a second text encoder and VAE alongside the
+  # training state and moves modules between devices around the sampling call. This run does its
+  # sampling out-of-process instead, on a checkpoint, so nothing between the loader and the
+  # optimizer step touches the module:
+  #
+  #   scripts/h3_proxy/eval_checkpoint.sh --step <N> \
+  #       --run /data/binghe/h3_proxy/runs/gta_v2_ctrl/checkpoints \
+  #       --cache /data/binghe/h3_proxy/cache/gta_v2_ctrl \
+  #       --val-json /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json \
+  #       --tag ctrl
+  #
+  # That writes the same proxy | prediction | target panels, against the same six clips the wn
+  # baseline was measured on, so the numbers stay comparable. `training_state_checkpointing_steps`
+  # below sets how often there is something to point it at.
 
 pipeline: {}
