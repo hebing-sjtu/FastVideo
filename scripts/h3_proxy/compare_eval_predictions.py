@@ -273,7 +273,13 @@ def correlation(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.corrcoef(left, right)[0, 1])
 
 
-def verdict(*, moved: float, before: float, after: float, rates: dict[str, float], tracks: dict[str, float]) -> str:
+def verdict(*,
+            moved: float,
+            before: float,
+            after: float,
+            rates: dict[str, float],
+            tracks: dict[str, float],
+            ceiling: float = 0.0) -> str:
     """Which of the five outcomes this is, given the three numbers that separate them.
 
     The thresholds are independent because the failures are unrelated. A drift below a quantisation
@@ -308,12 +314,35 @@ def verdict(*, moved: float, before: float, after: float, rates: dict[str, float
                 "adapter is training on something, and it is not this. A conditioning signal the model reads\n"
                 "differently at sampling time than at training time does exactly this, so check that the sampled\n"
                 "regime matches the cache's: given-frame count, system prompt, proxy grid.")
-    return (f"The prediction moved, and none of the three measurements improved: appearance error, rate, and\n"
-            f"tracking ({tracks['left']:+.3f} -> {tracks['right']:+.3f}) all sat still. The adapter is reaching the\n"
-            "model and the optimiser is doing something, so this is not a plumbing failure -- it is the\n"
-            "substantive outcome that the run is not learning to track. Weight-space drift is the next thing to\n"
-            "read: compare_lora_checkpoints.py says whether the gradient has a consistent direction or is\n"
-            "circling, and a random walk there confirms this reading rather than adding to it.")
+    lines = [
+        "The prediction moved, and none of the three measurements improved: appearance error, rate, and",
+        f"tracking ({tracks['left']:+.3f} -> {tracks['right']:+.3f}) all sat still. The adapter is reaching the "
+        "model and the",
+        "optimiser is doing something, so this is not a plumbing failure -- it is the substantive outcome that",
+        "the run is not learning to track.",
+    ]
+    if ceiling > 0.05:
+        lines += [
+            "",
+            f"Against a ceiling of {ceiling:+.3f} for the proxy itself, the checkpoint captures "
+            f"{tracks['right'] / ceiling * 100:.0f}% of the",
+            "localisable motion the conditioning carries. The signal is present and is not being read, which is",
+            "a statement about the conditioning pathway rather than about how long it trained.",
+        ]
+    elif ceiling:
+        lines += [
+            "",
+            f"But the proxy's own score is only {ceiling:+.3f}, so the conditioning barely carries localisable",
+            "motion in these units either. Tracking cannot separate a model that ignores the proxy from one",
+            "following a proxy that does not say where things move; fix the reference before reading this.",
+        ]
+    lines += [
+        "",
+        "Weight-space drift is the next thing to read: compare_lora_checkpoints.py says whether the gradient",
+        "has a consistent direction or is circling, and a random walk there confirms this rather than adding",
+        "to it.",
+    ]
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -341,7 +370,7 @@ def main() -> None:
     left_errors: list[np.ndarray] = []
     right_errors: list[np.ndarray] = []
     motions: dict[str, list[np.ndarray]] = {"left": [], "right": [], "target": []}
-    trackings: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+    trackings: dict[str, list[np.ndarray]] = {"left": [], "right": [], "proxy": []}
     layout_note: str | None = None
     print(f"\n{len(shared)} panels in common:")
     for index in shared:
@@ -375,12 +404,15 @@ def main() -> None:
         # change by exactly as much per frame as the take does. Correlating the two frame
         # differences pixel by pixel asks whether the change happens in the same places and the
         # same sense, which is what "it does not follow the picture" actually claims.
-        tracking = {"left": np.zeros(count), "right": np.zeros(count)}
+        tracking = {"left": np.zeros(count), "right": np.zeros(count), "proxy": np.zeros(count)}
         previous: tuple[np.ndarray, ...] | None = None
+        previous_proxy: np.ndarray | None = None
         for frame in range(count):
             left_prediction = layout.crop(left_frames[frame], "prediction")
             right_prediction = layout.crop(right_frames[frame], "prediction")
             target = match_width(layout.crop(left_frames[frame], "target"), left_prediction.shape[1])
+            proxy = (match_width(layout.crop(left_frames[frame], "proxy"), left_prediction.shape[1])
+                     if "proxy" in layout.columns else None)
             drift[frame] = mean_abs_diff(left_prediction, right_prediction)
             left_error[frame] = mean_abs_diff(left_prediction, target)
             right_error[frame] = mean_abs_diff(right_prediction, target)
@@ -393,7 +425,15 @@ def main() -> None:
                                                                                    previous[1])):
                     delta = now.astype(np.float32) - before.astype(np.float32)
                     tracking[name][frame] = correlation(delta.ravel(), target_delta.ravel())
+                # The proxy against the same target, which is the ceiling this metric can see: a
+                # prediction cannot be scored for following a signal the signal itself does not
+                # carry. Without it, a low tracking score cannot be told apart from a proxy whose
+                # motion simply does not land where the take's does in these units.
+                if proxy is not None and previous_proxy is not None:
+                    proxy_delta = proxy.astype(np.float32) - previous_proxy.astype(np.float32)
+                    tracking["proxy"][frame] = correlation(proxy_delta.ravel(), target_delta.ravel())
             previous = current
+            previous_proxy = proxy
         drifts.append(drift)
         left_errors.append(left_error)
         right_errors.append(right_error)
@@ -460,11 +500,15 @@ def main() -> None:
               f"tracking {tracks[name]:+.3f}")
     if not phased:
         print("  (the take's own rate barely varies over these frames, so there are no accelerations to match)")
+    ceiling = float(np.nanmean(track["proxy"][judged]))
+    if ceiling:
+        print(f"  proxy itself                            {'':17}tracking {ceiling:+.3f}   <- the ceiling")
     print("  rate is a magnitude; tracking is the pixelwise correlation of the two frame differences, so it is\n"
-          "  the one that says whether the change happens where the take's does. 0 means unrelated.")
+          "  the one that says whether the change happens where the take's does. 0 means unrelated. The proxy's\n"
+          "  own score bounds it: a prediction cannot be faulted for not following what the proxy does not carry.")
 
     print()
-    print(verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks))
+    print(verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks, ceiling=ceiling))
 
 
 if __name__ == "__main__":

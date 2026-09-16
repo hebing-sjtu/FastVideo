@@ -198,6 +198,26 @@ def test_tracking_outranks_the_rate_and_the_error():
     assert "none of the three measurements improved" in stalled
 
 
+def test_the_proxy_bounds_what_a_low_tracking_score_can_mean():
+    """A model cannot be faulted for not following a signal its conditioning does not carry.
+
+    The two readings below are the same tracking score against different ceilings, and they call
+    for opposite next actions: read the conditioning pathway, or fix the reference.
+    """
+    module = _load("compare_eval_predictions")
+    stalled = dict(moved=11.0, before=32.16, after=32.36, rates={"left": 1.02, "right": 1.02})
+
+    available = module.verdict(**stalled, tracks={"left": 0.076, "right": 0.072}, ceiling=0.42)
+    assert "17% of the" in available and "is not being read" in available
+
+    absent = module.verdict(**stalled, tracks={"left": 0.076, "right": 0.072}, ceiling=0.03)
+    assert "barely carries localisable" in absent
+
+    # No proxy column at all: neither claim is available, and neither is made.
+    silent = module.verdict(**stalled, tracks={"left": 0.076, "right": 0.072})
+    assert "ceiling" not in silent and "barely carries" not in silent
+
+
 def _wn_panels(module, tmp_path, monkeypatch, *, improvement: float, reseed: bool = False):
     """Two eval directories whose panels share a prefix and diverge after it, as wn produces.
 
