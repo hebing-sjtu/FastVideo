@@ -215,6 +215,17 @@ def test_a_tracking_score_is_read_against_its_own_off_time_floor():
     locked = module.verdict(**stalled, null={"left": 0.010, "right": 0.011})
     assert "locked to this take, though" in locked
 
+    # With the prefix's exact-match score in hand, "is +0.095 good" becomes a fraction. These are
+    # the real gta_v2_wn numbers: a tenth of the way to what a perfectly tracking prediction gets.
+    measured = module.verdict(moved=11.0,
+                              before=32.16,
+                              after=32.36,
+                              rates={"left": 1.02, "right": 1.02},
+                              tracks={"left": 0.100, "right": 0.095},
+                              null={"left": -0.006, "right": -0.006},
+                              achievable=0.94)
+    assert "11% of the +0.940" in measured and "headroom" in measured
+
     adrift = module.verdict(**stalled, null={"left": 0.070, "right": 0.069})
     assert "not locked to this take at all" in adrift
     assert "global statistic rather than as a" in adrift

@@ -328,7 +328,8 @@ def verdict(*,
             after: float,
             rates: dict[str, float],
             tracks: dict[str, float],
-            null: dict[str, float] | None = None) -> str:
+            null: dict[str, float] | None = None,
+            achievable: float = float("nan")) -> str:
     """Which of the five outcomes this is, given the three numbers that separate them.
 
     The thresholds are independent because the failures are unrelated. A drift below a quantisation
@@ -383,6 +384,15 @@ def verdict(*,
                 "means the change does land where the take's does, more than it would for frames that cannot",
                 "correspond. The conditioning is reaching the model. What did not move is how well it is used.",
             ]
+            if achievable == achievable and achievable > 0.1:
+                lines += [
+                    "",
+                    f"How well is {margin / achievable * 100:.0f}% of the {achievable:+.3f} an exact match scores on "
+                    "the given prefix. So there is",
+                    "headroom and the signal to climb it is present -- what is missing is a gradient that can",
+                    "attribute the difference, which is a property of the conditioning pathway and not of how",
+                    "long it trained.",
+                ]
         else:
             lines += [
                 "",
@@ -567,20 +577,41 @@ def main() -> None:
               f"tracking {tracks[name]:+.3f}  (off-time {null[name]:+.3f})")
     if not phased:
         print("  (the take's own rate barely varies over these frames, so there are no accelerations to match)")
+    # The given prefix is an exact match by construction -- the prediction there *is* the decoded
+    # target footage -- so its score is what this metric returns for a prediction that tracks
+    # perfectly, through the same VAE roundtrip, panel resampling and encoder. Unlike the proxy's
+    # cross-modal number this is a real ceiling, and it turns "+0.100, is that good" into a
+    # fraction. Frame 0 has no difference, hence the 1.
+    achievable = float("nan")
+    if judged.start:
+        prefix = np.concatenate([track["left"][1:judged.start], track["right"][1:judged.start]])
+        achievable = float(np.nanmean(prefix)) if prefix.size else float("nan")
+        print(f"  given prefix, both runs                                  tracking {achievable:+.3f}   "
+              "<- an exact match")
+
     cross_modal = float(np.nanmean(track["proxy"][judged]))
     if cross_modal:
         print(f"  proxy vs target                                          tracking {cross_modal:+.3f}")
     print("\n  rate is a magnitude. tracking is the pixelwise correlation of the two frame differences, so it is\n"
           "  the one that says whether the change lands where the take's does -- but only against its own\n"
           "  off-time score, which is the same arithmetic on frames that cannot correspond. A steady pan\n"
-          "  matches a steady pan at any offset, so the floor is not zero and the gap is the whole signal.")
+          "  matches a steady pan at any offset, so the floor is not zero and the gap is the whole signal.\n"
+          "  The prefix bounds it from above: there the prediction is the given footage, so that is what\n"
+          "  tracking returns for an exact match under the same roundtrip and compression.")
     if cross_modal:
         print("  The proxy's number is not a ceiling. DUV's semantic channels are codes, constant across a road\n"
               "  or a wall, so a pan over one changes nothing where RGB changes a lot: the two have different\n"
               "  spatial support and correlating them says nothing about what the DUV determines.")
 
     print()
-    print(verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks, null=null))
+    print(
+        verdict(moved=moved,
+                before=before,
+                after=after,
+                rates=rates,
+                tracks=tracks,
+                null=null,
+                achievable=achievable))
 
 
 if __name__ == "__main__":
