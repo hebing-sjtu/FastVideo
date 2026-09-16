@@ -266,11 +266,60 @@ def curve(values: np.ndarray, width: int = 48) -> str:
     return "".join(str(min(9, int(round(height / top * 9)))) for height in heights)
 
 
+# Frame differences are correlated at a quarter resolution. The point is where the change lands,
+# which survives it, and it makes the off-time null affordable: that needs every frame's difference
+# kept, then correlated against several time offsets.
+DELTA_DOWNSAMPLE = 4
+
+# Offsets for the off-time null, spread and coprime with nothing in particular so that a clip with
+# periodic motion cannot line up with all of them.
+NULL_LAGS = (5, 17, 41)
+
+
+def downsample(frame: np.ndarray, factor: int = DELTA_DOWNSAMPLE) -> np.ndarray:
+    """Block-mean to 1/factor in each axis, trimming the remainder rather than padding it."""
+    height = frame.shape[0] - frame.shape[0] % factor
+    width = frame.shape[1] - frame.shape[1] % factor
+    trimmed = frame[:height, :width].astype(np.float32)
+    return trimmed.reshape(height // factor, factor, width // factor, factor, -1).mean(axis=(1, 3))
+
+
 def correlation(left: np.ndarray, right: np.ndarray) -> float:
     """Pearson correlation, or nan when either side is constant and has none to report."""
     if left.size < 2 or left.std() == 0 or right.std() == 0:
         return float("nan")
     return float(np.corrcoef(left, right)[0, 1])
+
+
+def lagged_null(store: list[dict[str, np.ndarray]], first: int) -> dict[str, float]:
+    """What tracking scores when the prediction is held against the take at the wrong time.
+
+    Without this the on-time score has no scale. 0.076 is a real number only relative to what the
+    same arithmetic returns for frames that cannot correspond, and for a clip whose motion barely
+    changes over its length that floor is not near zero: a steady pan matches a steady pan whenever
+    you sample it. The gap between the two is the part that says the prediction is locked to *this*
+    take rather than merely moving like it.
+    """
+    scores: dict[str, list[float]] = {"left": [], "right": []}
+    for entry in store:
+        frames = entry["target"].shape[0]
+        # ``first`` is a frame index and the stored differences begin at frame 1, so it shifts by
+        # one. Getting this wrong would fold given frames into the null and flatter it.
+        indices = np.arange(max(0, first - 1), frames)
+        if indices.size == 0:
+            continue
+        for lag in NULL_LAGS:
+            if lag >= frames:
+                continue
+            shifted = (indices + lag) % frames
+            for name in scores:
+                scores[name].append(
+                    float(
+                        np.nanmean([
+                            correlation(entry[name][at].ravel(), entry["target"][to].ravel())
+                            for at, to in zip(indices, shifted, strict=True)
+                        ])))
+    return {name: float(np.nanmean(values)) if values else float("nan") for name, values in scores.items()}
 
 
 def verdict(*,
@@ -279,7 +328,7 @@ def verdict(*,
             after: float,
             rates: dict[str, float],
             tracks: dict[str, float],
-            ceiling: float = 0.0) -> str:
+            null: dict[str, float] | None = None) -> str:
     """Which of the five outcomes this is, given the three numbers that separate them.
 
     The thresholds are independent because the failures are unrelated. A drift below a quantisation
@@ -321,21 +370,28 @@ def verdict(*,
         "optimiser is doing something, so this is not a plumbing failure -- it is the substantive outcome that",
         "the run is not learning to track.",
     ]
-    if ceiling > 0.05:
-        lines += [
-            "",
-            f"Against a ceiling of {ceiling:+.3f} for the proxy itself, the checkpoint captures "
-            f"{tracks['right'] / ceiling * 100:.0f}% of the",
-            "localisable motion the conditioning carries. The signal is present and is not being read, which is",
-            "a statement about the conditioning pathway rather than about how long it trained.",
-        ]
-    elif ceiling:
-        lines += [
-            "",
-            f"But the proxy's own score is only {ceiling:+.3f}, so the conditioning barely carries localisable",
-            "motion in these units either. Tracking cannot separate a model that ignores the proxy from one",
-            "following a proxy that does not say where things move; fix the reference before reading this.",
-        ]
+    if null:
+        # Against the off-time floor rather than against zero. Whether the prediction is locked to
+        # this take at all is a different question from whether training improved the locking, and
+        # it is the one that decides if the conditioning is reaching the model in any form.
+        margin = tracks["right"] - null["right"]
+        if margin > 0.02:
+            lines += [
+                "",
+                f"It is locked to this take, though: tracking {tracks['right']:+.3f} against an off-time floor of "
+                f"{null['right']:+.3f}",
+                "means the change does land where the take's does, more than it would for frames that cannot",
+                "correspond. The conditioning is reaching the model. What did not move is how well it is used.",
+            ]
+        else:
+            lines += [
+                "",
+                f"And it is not locked to this take at all: tracking {tracks['right']:+.3f} against an off-time "
+                f"floor of {null['right']:+.3f}",
+                "is no gap. The prediction moves as much as the take and at the same moments, and in places the",
+                "take does not. That is a conditioning signal arriving as a global statistic rather than as a",
+                "correspondence, which is what a pathway with no frame or token registration would produce.",
+            ]
     lines += [
         "",
         "Weight-space drift is the next thing to read: compare_lora_checkpoints.py says whether the gradient",
@@ -371,6 +427,7 @@ def main() -> None:
     right_errors: list[np.ndarray] = []
     motions: dict[str, list[np.ndarray]] = {"left": [], "right": [], "target": []}
     trackings: dict[str, list[np.ndarray]] = {"left": [], "right": [], "proxy": []}
+    delta_store: list[dict[str, np.ndarray]] = []
     layout_note: str | None = None
     print(f"\n{len(shared)} panels in common:")
     for index in shared:
@@ -405,6 +462,10 @@ def main() -> None:
         # differences pixel by pixel asks whether the change happens in the same places and the
         # same sense, which is what "it does not follow the picture" actually claims.
         tracking = {"left": np.zeros(count), "right": np.zeros(count), "proxy": np.zeros(count)}
+        # Kept for the off-time null, which cannot be computed until the prefix boundary is known
+        # and that comes from the drift curve averaged over every panel. A quarter-resolution
+        # difference is ~50k floats, so all six clips together are tens of megabytes.
+        deltas: dict[str, list[np.ndarray]] = {"left": [], "right": [], "target": []}
         previous: tuple[np.ndarray, ...] | None = None
         previous_proxy: np.ndarray | None = None
         for frame in range(count):
@@ -420,17 +481,19 @@ def main() -> None:
             if previous is not None:
                 for name, now, before in zip(motion, current, previous, strict=True):
                     motion[name][frame] = mean_abs_diff(now, before)
-                target_delta = target.astype(np.float32) - previous[2].astype(np.float32)
+                target_delta = downsample(target) - downsample(previous[2])
+                deltas["target"].append(target_delta)
                 for name, now, before in (("left", left_prediction, previous[0]), ("right", right_prediction,
                                                                                    previous[1])):
-                    delta = now.astype(np.float32) - before.astype(np.float32)
+                    delta = downsample(now) - downsample(before)
+                    deltas[name].append(delta)
                     tracking[name][frame] = correlation(delta.ravel(), target_delta.ravel())
-                # The proxy against the same target, which is the ceiling this metric can see: a
-                # prediction cannot be scored for following a signal the signal itself does not
-                # carry. Without it, a low tracking score cannot be told apart from a proxy whose
-                # motion simply does not land where the take's does in these units.
+                # The proxy on the same metric. Not a ceiling: DUV's semantic channels are codes,
+                # piecewise constant over a road or a wall, so a camera pan across one produces no
+                # difference at all where RGB produces a large one. The two signals have different
+                # spatial support, and correlating them says nothing about what DUV determines.
                 if proxy is not None and previous_proxy is not None:
-                    proxy_delta = proxy.astype(np.float32) - previous_proxy.astype(np.float32)
+                    proxy_delta = downsample(proxy) - downsample(previous_proxy)
                     tracking["proxy"][frame] = correlation(proxy_delta.ravel(), target_delta.ravel())
             previous = current
             previous_proxy = proxy
@@ -441,6 +504,9 @@ def main() -> None:
             motions[name].append(values)
         for name, values in tracking.items():
             trackings[name].append(values)
+        # The first frame has no difference, so the stored deltas start at frame 1 and the null's
+        # indices have to line up with that.
+        delta_store.append({name: np.stack(values) for name, values in deltas.items() if values})
         print(f"  video_{index}: {count} frames, drift {drift.mean():6.2f}, "
               f"error {left_error.mean():6.2f} -> {right_error.mean():6.2f}")
 
@@ -489,6 +555,7 @@ def main() -> None:
     # no accelerations to match, and correlating two near-constant curves reports noise.
     phased = reference.std() > 0.05 * reference.mean() if reference.mean() else False
     print(f"\nframe-to-frame motion over the same frames (target {reference.mean():.2f}):")
+    null = lagged_null(delta_store, judged.start or 0)
     rates = {}
     tracks = {}
     for name, label in (("left", "baseline "), ("right", "checkpoint")):
@@ -497,18 +564,23 @@ def main() -> None:
         tracks[name] = float(np.nanmean(track[name][judged]))
         phase = f"phase {correlation(observed, reference):+.2f}" if phased else "phase n/a"
         print(f"  {label}            {observed.mean():.2f}   rate {rates[name]:.2f}x   {phase}   "
-              f"tracking {tracks[name]:+.3f}")
+              f"tracking {tracks[name]:+.3f}  (off-time {null[name]:+.3f})")
     if not phased:
         print("  (the take's own rate barely varies over these frames, so there are no accelerations to match)")
-    ceiling = float(np.nanmean(track["proxy"][judged]))
-    if ceiling:
-        print(f"  proxy itself                            {'':17}tracking {ceiling:+.3f}   <- the ceiling")
-    print("  rate is a magnitude; tracking is the pixelwise correlation of the two frame differences, so it is\n"
-          "  the one that says whether the change happens where the take's does. 0 means unrelated. The proxy's\n"
-          "  own score bounds it: a prediction cannot be faulted for not following what the proxy does not carry.")
+    cross_modal = float(np.nanmean(track["proxy"][judged]))
+    if cross_modal:
+        print(f"  proxy vs target                                          tracking {cross_modal:+.3f}")
+    print("\n  rate is a magnitude. tracking is the pixelwise correlation of the two frame differences, so it is\n"
+          "  the one that says whether the change lands where the take's does -- but only against its own\n"
+          "  off-time score, which is the same arithmetic on frames that cannot correspond. A steady pan\n"
+          "  matches a steady pan at any offset, so the floor is not zero and the gap is the whole signal.")
+    if cross_modal:
+        print("  The proxy's number is not a ceiling. DUV's semantic channels are codes, constant across a road\n"
+              "  or a wall, so a pan over one changes nothing where RGB changes a lot: the two have different\n"
+              "  spatial support and correlating them says nothing about what the DUV determines.")
 
     print()
-    print(verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks, ceiling=ceiling))
+    print(verdict(moved=moved, before=before, after=after, rates=rates, tracks=tracks, null=null))
 
 
 if __name__ == "__main__":

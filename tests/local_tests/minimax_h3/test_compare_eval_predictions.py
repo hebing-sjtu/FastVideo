@@ -198,24 +198,30 @@ def test_tracking_outranks_the_rate_and_the_error():
     assert "none of the three measurements improved" in stalled
 
 
-def test_the_proxy_bounds_what_a_low_tracking_score_can_mean():
-    """A model cannot be faulted for not following a signal its conditioning does not carry.
+def test_a_tracking_score_is_read_against_its_own_off_time_floor():
+    """The same tracking score means opposite things at different floors.
 
-    The two readings below are the same tracking score against different ceilings, and they call
-    for opposite next actions: read the conditioning pathway, or fix the reference.
+    A steady pan correlates with a steady pan whenever you sample it, so the floor is not zero and
+    an on-time score above it is the only evidence that the prediction follows *this* take rather
+    than merely moving like it.
     """
     module = _load("compare_eval_predictions")
-    stalled = dict(moved=11.0, before=32.16, after=32.36, rates={"left": 1.02, "right": 1.02})
+    stalled = dict(moved=11.0,
+                   before=32.16,
+                   after=32.36,
+                   rates={"left": 1.02, "right": 1.02},
+                   tracks={"left": 0.076, "right": 0.072})
 
-    available = module.verdict(**stalled, tracks={"left": 0.076, "right": 0.072}, ceiling=0.42)
-    assert "17% of the" in available and "is not being read" in available
+    locked = module.verdict(**stalled, null={"left": 0.010, "right": 0.011})
+    assert "locked to this take, though" in locked
 
-    absent = module.verdict(**stalled, tracks={"left": 0.076, "right": 0.072}, ceiling=0.03)
-    assert "barely carries localisable" in absent
+    adrift = module.verdict(**stalled, null={"left": 0.070, "right": 0.069})
+    assert "not locked to this take at all" in adrift
+    assert "global statistic rather than as a" in adrift
 
-    # No proxy column at all: neither claim is available, and neither is made.
-    silent = module.verdict(**stalled, tracks={"left": 0.076, "right": 0.072})
-    assert "ceiling" not in silent and "barely carries" not in silent
+    # No null computed: neither claim is available, and neither is made.
+    silent = module.verdict(**stalled)
+    assert "locked to this take" not in silent
 
 
 def _wn_panels(module, tmp_path, monkeypatch, *, improvement: float, reseed: bool = False):
