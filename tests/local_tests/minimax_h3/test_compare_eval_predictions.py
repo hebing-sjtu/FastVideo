@@ -137,6 +137,42 @@ def test_a_wn_prefix_shows_up_as_the_boundary():
     assert module.detect_prefix(drift) == 34
 
 
+def test_a_flat_error_with_an_improved_rate_is_not_reported_as_a_failure():
+    """The two measurements can disagree, and the rate is the one the run is being asked about.
+
+    At a mean error of tens of levels, distance to the target is an appearance measurement. It can
+    sit still while the prediction's rate of change moves onto the take's -- and calling that a
+    failure to learn would be the wrong conclusion from the right numbers.
+    """
+    module = _load("compare_eval_predictions")
+    sluggish = module.verdict(moved=11.0, before=32.16, after=32.36, rates={"left": 0.55, "right": 0.80})
+    assert "rate of change moved toward" in sluggish
+
+    stuck = module.verdict(moved=11.0, before=32.16, after=32.36, rates={"left": 0.55, "right": 0.56})
+    assert "not learning to track" in stuck
+
+    # And the rate has to be consulted *before* the error-worsened verdict, or a large improvement
+    # in tracking gets reported as training on the wrong thing whenever appearance error ticks up.
+    risen = module.verdict(moved=56.0, before=51.06, after=53.33, rates={"left": 0.25, "right": 0.83})
+    assert "rate of change moved toward" in risen and "up 4.4%" in risen
+
+
+@pytest.mark.parametrize(
+    ("moved", "before", "after", "expected"),
+    [
+        (0.2, 32.0, 32.0, "barely moved"),
+        (11.0, 32.0, 28.0, "moved toward the target"),
+        (11.0, 32.0, 36.0, "moved *away*"),
+    ],
+)
+def test_the_verdict_separates_outcomes_that_look_alike(moved, before, after, expected):
+    """Each of these has a different cause and a different next action, and a resume that loaded
+    nothing must never be confused with a run that trained and did not learn."""
+    module = _load("compare_eval_predictions")
+    rates = {"left": 1.0, "right": 1.0}
+    assert expected in module.verdict(moved=moved, before=before, after=after, rates=rates)
+
+
 def _wn_panels(module, tmp_path, monkeypatch, *, improvement: float, reseed: bool = False):
     """Two eval directories whose panels share a prefix and diverge after it, as wn produces.
 

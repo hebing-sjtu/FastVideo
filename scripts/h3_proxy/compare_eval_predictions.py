@@ -252,14 +252,62 @@ def detect_prefix(drift: np.ndarray) -> int | None:
 
 
 def curve(values: np.ndarray, width: int = 48) -> str:
-    """A fixed-width bar per frame bucket, so the shape of the curve survives a terminal."""
+    """One digit per frame bucket, scaled 0-9 against the row's own maximum.
+
+    Digits rather than block-drawing characters: those need a font that has them and a paste that
+    preserves them, and when either fails every bucket collapses to the same glyph and the curve
+    reads as flat -- which is one of the conclusions this is supposed to distinguish.
+    """
     if values.size == 0:
         return ""
     buckets = np.array_split(values, min(width, values.size))
     heights = np.array([float(bucket.mean()) for bucket in buckets])
     top = float(heights.max()) or 1.0
-    blocks = " ▁▂▃▄▅▆▇█"
-    return "".join(blocks[min(len(blocks) - 1, int(round(height / top * (len(blocks) - 1))))] for height in heights)
+    return "".join(str(min(9, int(round(height / top * 9)))) for height in heights)
+
+
+def correlation(left: np.ndarray, right: np.ndarray) -> float:
+    """Pearson correlation, or nan when either side is constant and has none to report."""
+    if left.size < 2 or left.std() == 0 or right.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def verdict(*, moved: float, before: float, after: float, rates: dict[str, float]) -> str:
+    """Which of the five outcomes this is, given the three numbers that separate them.
+
+    The thresholds are independent because the failures are unrelated. A drift below a quantisation
+    step is not a small effect but no effect: training that did anything at all perturbs a diffusion
+    trajectory. A 2% error change is inside the spread between two samplings of one checkpoint.
+    """
+    if moved < 1.0:
+        return ("The prediction barely moved, which is not a weak-training result -- training that did anything at\n"
+                "all perturbs a diffusion trajectory visibly. Suspect the adapter instead: check the resume's\n"
+                "'lora_B norm 0 -> ...' line, and that the step in these filenames is the step you asked for.")
+    if after < before * 0.98:
+        return ("The prediction moved and moved toward the target, so the LoRA is learning the task. Whether it has\n"
+                "learned enough is a question about how much further the error can fall, not about whether training\n"
+                "is working -- compare a third checkpoint to see if the trend is still going.")
+    # Before the error-worsened verdict, not after it. When the two disagree the rate is the one
+    # the run is being asked about, and the error is the coarser instrument: at a mean of tens of
+    # levels it is measuring appearance, where a few percent is not evidence about alignment.
+    # Ordering these the other way calls a large improvement in tracking a failure.
+    if abs(rates["left"] - 1.0) - abs(rates["right"] - 1.0) > 0.05:
+        direction = "flat" if after <= before * 1.02 else f"up {(after - before) / before * 100:.1f}%"
+        return (f"The prediction's rate of change moved toward the take's while pixel error stayed {direction}.\n"
+                "Those are not in conflict: at a mean error of tens of levels the distance to the target is an\n"
+                "appearance measurement, too coarse to register an alignment that improved. Rate is the axis the\n"
+                "run is being asked about, so read it as the result and the error as uninformative here.")
+    if after > before * 1.02:
+        return ("The prediction moved *away* from the target, and its rate of change did not improve either. The\n"
+                "adapter is training on something, and it is not this. A conditioning signal the model reads\n"
+                "differently at sampling time than at training time does exactly this, so check that the sampled\n"
+                "regime matches the cache's: given-frame count, system prompt, proxy grid.")
+    return ("The prediction moved but neither toward the target nor toward its rate of change. The adapter is\n"
+            "reaching the model and the optimiser is doing something, so this is not a plumbing failure -- it\n"
+            "is the substantive outcome that the run is not learning to track. Weight-space drift is the next\n"
+            "thing to read: compare_lora_checkpoints.py says whether the gradient has a consistent direction\n"
+            "or is circling.")
 
 
 def main() -> None:
@@ -286,6 +334,7 @@ def main() -> None:
     drifts: list[np.ndarray] = []
     left_errors: list[np.ndarray] = []
     right_errors: list[np.ndarray] = []
+    motions: dict[str, list[np.ndarray]] = {"left": [], "right": [], "target": []}
     layout_note: str | None = None
     print(f"\n{len(shared)} panels in common:")
     for index in shared:
@@ -311,6 +360,11 @@ def main() -> None:
                              "the right, so one panel's columns cannot locate the other's. The runs composed at "
                              "different panel_height or included different columns, which makes them "
                              "incomparable however the checkpoints did.")
+        # Frame-to-frame change, which is what "the camera moves at the wrong speed" is a statement
+        # about. Distance to the target is dominated by appearance -- a mean of 32/255 is nowhere
+        # near a near-miss on alignment -- so it can sit flat while tracking improves underneath it.
+        motion = {"left": np.zeros(count), "right": np.zeros(count), "target": np.zeros(count)}
+        previous: tuple[np.ndarray, ...] | None = None
         for frame in range(count):
             left_prediction = layout.crop(left_frames[frame], "prediction")
             right_prediction = layout.crop(right_frames[frame], "prediction")
@@ -318,9 +372,16 @@ def main() -> None:
             drift[frame] = mean_abs_diff(left_prediction, right_prediction)
             left_error[frame] = mean_abs_diff(left_prediction, target)
             right_error[frame] = mean_abs_diff(right_prediction, target)
+            current = (left_prediction, right_prediction, target)
+            if previous is not None:
+                for name, now, before in zip(motion, current, previous, strict=True):
+                    motion[name][frame] = mean_abs_diff(now, before)
+            previous = current
         drifts.append(drift)
         left_errors.append(left_error)
         right_errors.append(right_error)
+        for name, values in motion.items():
+            motions[name].append(values)
         print(f"  video_{index}: {count} frames, drift {drift.mean():6.2f}, "
               f"error {left_error.mean():6.2f} -> {right_error.mean():6.2f}")
 
@@ -331,6 +392,7 @@ def main() -> None:
     drift = np.mean([d[:count] for d in drifts], axis=0)
     left_error = np.mean([e[:count] for e in left_errors], axis=0)
     right_error = np.mean([e[:count] for e in right_errors], axis=0)
+    motion = {name: np.mean([values[:count] for values in curves], axis=0) for name, curves in motions.items()}
 
     boundary = args.prefix_frames if args.prefix_frames is not None else detect_prefix(drift)
     print(f"\nper-frame curves over {count} frames, averaged across panels (0-255 scale):")
@@ -358,28 +420,26 @@ def main() -> None:
     print(f"  prediction moved      {moved:.2f}")
     print(f"  error to target       {before:.2f} -> {after:.2f}  ({(after - before) / before * 100:+.1f}%)")
 
+    # The rate question, asked separately from the appearance question. `rate` is how fast the
+    # picture changes relative to the take: below 1 the prediction is sluggish, above 1 it churns.
+    # `phase` is whether it speeds up and slows down when the take does, which a prediction at the
+    # right average rate can still get wrong.
+    reference = motion["target"][judged]
+    # Phase is only answerable if the take's own rate varies. A clip shot at a constant speed has
+    # no accelerations to match, and correlating two near-constant curves reports noise.
+    phased = reference.std() > 0.05 * reference.mean() if reference.mean() else False
+    print(f"\nframe-to-frame motion over the same frames (target {reference.mean():.2f}):")
+    rates = {}
+    for name, label in (("left", "baseline "), ("right", "checkpoint")):
+        observed = motion[name][judged]
+        rates[name] = observed.mean() / reference.mean() if reference.mean() else float("nan")
+        phase = f"phase {correlation(observed, reference):+.2f}" if phased else "phase n/a"
+        print(f"  {label}            {observed.mean():.2f}   rate {rates[name]:.2f}x   {phase}")
+    if not phased:
+        print("  (the take's own rate barely varies over these frames, so there are no accelerations to match)")
+
     print()
-    # Two independent thresholds, because the failures they separate are unrelated. A drift under a
-    # quantisation step is not a small effect, it is no effect. A 2% error change is inside the gap
-    # between two samplings of the same checkpoint at different seeds.
-    if moved < 1.0:
-        print("The prediction barely moved, which is not a weak-training result -- training that did anything at\n"
-              "all perturbs a diffusion trajectory visibly. Suspect the adapter instead: check the resume's\n"
-              "'lora_B norm 0 -> ...' line, and that the step in these filenames is the step you asked for.")
-    elif after < before * 0.98:
-        print("The prediction moved and moved toward the target, so the LoRA is learning the task. Whether it has\n"
-              "learned enough is a question about how much further the error can fall, not about whether training\n"
-              "is working -- compare a third checkpoint to see if the trend is still going.")
-    elif after > before * 1.02:
-        print("The prediction moved *away* from the target. The adapter is training on something, and it is not\n"
-              "this. A conditioning signal the model reads differently at sampling time than at training time\n"
-              "does exactly this, so check that the sampled regime matches the cache's: given-frame count,\n"
-              "system prompt, proxy grid.")
-    else:
-        print("The prediction moved but not measurably toward the target. The adapter is reaching the model and\n"
-              "the optimiser is doing something, so this is not a plumbing failure -- it is the substantive\n"
-              "outcome that the run is not learning to track. Weight-space drift is the next thing to read:\n"
-              "compare_lora_checkpoints.py says whether the gradient has a consistent direction or is circling.")
+    print(verdict(moved=moved, before=before, after=after, rates=rates))
 
 
 if __name__ == "__main__":
