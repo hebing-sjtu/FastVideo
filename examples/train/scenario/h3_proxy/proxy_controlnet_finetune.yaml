@@ -204,7 +204,10 @@ callbacks:
   validation:
     _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
     pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
-    dataset_file: /data/binghe/h3_proxy/gta_v2_validation.json
+    # The same six clips the wn baseline was measured on, so the tracking numbers are about the
+    # same content. A validation set is mp4 paths and captions, so it carries no canvas of its own
+    # and is reusable across geometries -- the callback re-derives conditioning at the run's.
+    dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
     every_steps: 50
     run_at_start: true
     sampling_steps: [50]
