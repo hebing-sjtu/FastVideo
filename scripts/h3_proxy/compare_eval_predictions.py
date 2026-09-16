@@ -41,26 +41,34 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
 from compare_eval_outputs import compare_manifests, index_videos, load_manifest
 
-# The panel is composed at the prediction's height with this gutter between columns, and the width
-# of each column follows from the cache geometry. Both are `MiniMaxH3ProxyValidationCallback`
-# defaults; a run that overrode them needs them passed here too.
+# `MiniMaxH3ProxyValidationCallback` defaults; a run that overrode panel_separator_px needs it
+# passed here too.
 DEFAULT_SEPARATOR_PX = 4
 
-GEOMETRY_RE = {
-    "target_height": re.compile(r"--training\.data\.num_height\s+(\d+)"),
-    "target_width": re.compile(r"--training\.data\.num_width\s+(\d+)"),
-    "proxy_height": re.compile(r"--callbacks\.validation\.proxy_height\s+(\d+)"),
-    "proxy_width": re.compile(r"--callbacks\.validation\.proxy_width\s+(\d+)"),
-}
+# `compose_comparison_video` fills the gutters -- and any odd-dimension padding -- with this, and
+# fills them flat. Flatness is what makes a gutter findable: a column of real footage that is this
+# dark for all 384 rows of the canvas, to within compression error, essentially does not occur.
+GUTTER_VALUE = 24
+GUTTER_TOLERANCE = 14.0
+
+# The label band's background. It is a different value from the gutter, which is the only reason
+# the band's height can be read off the picture at all: the band spans the gutters, so both are
+# flat and dark there and any threshold wide enough to accept one accepts the other.
+LABEL_BACKGROUND_VALUE = 16
+
+# The panel's own columns cannot be derived from the cache geometry, which is why they are found
+# instead. `_read_panel` decodes the proxy and target clips from *disk at their native resolution*
+# and scales them to the panel height; the cache's proxy grid is the encoder's reference size and
+# says nothing about the mp4 the panel was built from. Nor are the columns equal: a 704x1280
+# prediction next to a proxy of any other aspect ratio gives three different widths.
+PANEL_ORDER = ("proxy", "prediction", "target")
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,31 +83,15 @@ def parse_args() -> argparse.Namespace:
                         type=int,
                         default=None,
                         help="Force the prefix boundary instead of detecting it from the drift curve.")
+    parser.add_argument("--columns",
+                        default=None,
+                        help="Name the panel's columns left to right, e.g. 'prediction,target', when the panel is "
+                        f"not the default {','.join(PANEL_ORDER)}.")
     parser.add_argument("--force",
                         action="store_true",
                         help="Compare even when the manifests disagree. The numbers are then about the videos only "
                         "and say nothing about the checkpoints.")
     return parser.parse_args()
-
-
-def parse_geometry(manifest: dict[str, Any] | None) -> dict[str, int]:
-    """The panel's column widths are a consequence of the cache geometry, which the manifest records.
-
-    Guessing the split from the file width instead would need the columns to be equally wide, and
-    they are only equally wide when the proxy's aspect ratio happens to match the target's. A
-    704x1280 target with a 192x336 proxy does not, so the arithmetic has to be done properly.
-    """
-    geometry = (manifest or {}).get("geometry") or ""
-    found: dict[str, int] = {}
-    for name, pattern in GEOMETRY_RE.items():
-        match = pattern.search(geometry)
-        if match:
-            found[name] = int(match.group(1))
-    missing = [name for name in GEOMETRY_RE if name not in found]
-    if missing:
-        raise SystemExit(f"The manifest's geometry string is missing {', '.join(missing)}, so the panel columns "
-                         f"cannot be located. Got: {geometry!r}")
-    return found
 
 
 @dataclass(frozen=True)
@@ -113,42 +105,96 @@ class PanelLayout:
         start, end = self.columns[name]
         return frame[self.band_height:, start:end]
 
+    def describe(self) -> str:
+        return ", ".join(f"{name} {start}:{end} ({end - start}px)" for name, (start, end) in self.columns.items())
 
-def solve_layout(frame_shape: tuple[int, ...], geometry: dict[str, int], separator_px: int) -> PanelLayout:
-    """Locate the columns by reconstructing the composition, then checking it against the file.
 
-    Searching the frame for dark gutter columns would be the obvious alternative and is worse: a
-    night-time clip has plenty of columns that are uniformly near the separator's colour, and H.264
-    has already moved every exact value. Reconstructing instead gives an answer that is either
-    provably right -- the reconstructed width matches the file's to the pixel -- or refused.
+def _flat_gutter_columns(frame: np.ndarray, band_probe: int) -> np.ndarray:
+    """Columns that are the gutter colour in *every* probed row, not merely on average.
+
+    The distinction carries the whole method. A mean would accept a column of dark footage with a
+    bright pixel in it; requiring every row to be within tolerance means one bright pixel
+    disqualifies the column, and a real column that is uniform to +-14 over hundreds of rows is
+    not something game footage produces.
     """
-    height, width = int(frame_shape[0]), int(frame_shape[1])
-    canvas = geometry["target_height"]
-    proxy_width = max(1, round(geometry["proxy_width"] * canvas / geometry["proxy_height"]))
-    target_width = geometry["target_width"]
+    probed = frame[band_probe:, :, :].astype(np.float64)
+    return np.abs(probed - GUTTER_VALUE).max(axis=(0, 2)) < GUTTER_TOLERANCE
 
-    # `compose_comparison_video` pads odd dimensions up by a pixel for H.264 4:2:0, and the label
-    # band is present unless the run turned it off, so both are candidates rather than givens.
-    for names, widths in (
-        (("proxy", "prediction", "target"), (proxy_width, target_width, target_width)),
-        (("prediction", "target"), (target_width, target_width)),
-        (("proxy", "prediction"), (proxy_width, target_width)),
-    ):
-        composed_width = sum(widths) + separator_px * (len(widths) - 1)
-        for band_height in (max(18, canvas // 22), 0):
-            composed_height = canvas + band_height
-            if (width - composed_width) in (0, 1) and (height - composed_height) in (0, 1):
-                columns: dict[str, tuple[int, int]] = {}
-                offset = 0
-                for name, column_width in zip(names, widths, strict=True):
-                    columns[name] = (offset, offset + column_width)
-                    offset += column_width + separator_px
-                return PanelLayout(band_height=band_height, columns=columns)
 
-    raise SystemExit(f"A {height}x{width} panel matches no layout of a {canvas}-tall canvas with a "
-                     f"{geometry['target_width']}px target column and a {proxy_width}px proxy column at "
-                     f"{separator_px}px separators. Pass --separator-px if the run overrode it; otherwise the "
-                     "manifest's geometry does not describe these videos.")
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous True spans of ``mask`` as half-open [start, end) intervals."""
+    padded = np.concatenate([[False], mask, [False]])
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(start), int(end)) for start, end in zip(edges[::2], edges[1::2], strict=True)]
+
+
+def _band_height(frame: np.ndarray, gutter: tuple[int, int]) -> int:
+    """How many rows the label band occupies, or 0 if the run drew no labels.
+
+    Measured down a gutter column, where the band's 16 sits directly above the gutter's 24 with no
+    picture in between. Classifying each row by which of the two it is nearer finds that boundary;
+    a darkness threshold cannot, because it accepts both.
+    """
+    column = frame[:, (gutter[0] + gutter[1]) // 2, :].astype(np.float64).mean(axis=1)
+    is_band = np.abs(column - LABEL_BACKGROUND_VALUE) < np.abs(column - GUTTER_VALUE)
+    # Four consecutive rows, so a label long enough to overflow its panel and cross the gutter
+    # costs a row of evidence rather than the whole measurement.
+    for row in range(is_band.size - 3):
+        if not is_band[row:row + 4].any():
+            return row
+    return 0
+
+
+def solve_layout(frame: np.ndarray, separator_px: int, names: list[str] | None = None) -> PanelLayout:
+    """Find the columns in the panel itself, because nothing else records them.
+
+    The obvious alternative -- reconstructing the composition from the cache geometry -- cannot
+    work: the proxy and target columns come from clips decoded off disk at whatever resolution they
+    were written at, while the geometry records the encoder's reference grid. Those are different
+    numbers, and a 402x2062 panel from a 704x1280 cache is what that mistake looks like.
+    """
+    height, width = frame.shape[0], frame.shape[1]
+    # Well below any plausible label band (``max(18, canvas // 22)``) and well above zero, so the
+    # probe sees canvas rows whether or not labels were drawn.
+    band_probe = max(1, height // 8)
+    gutters = [
+        (start, end) for start, end in _runs(_flat_gutter_columns(frame, band_probe))
+        # A gutter is exactly `separator_px` wide before encoding; compression bleeds its edges into
+        # the neighbouring image columns, so the core can come back narrower. The padding column
+        # `_pad_to_even` may add is 1px and is excluded here, then trimmed off the last panel below.
+        if 2 <= (end - start) <= separator_px + 2
+    ]
+    if not 1 <= len(gutters) <= 2:
+        raise SystemExit(f"Found {len(gutters)} separator columns in a {height}x{width} panel, expected 1 or 2 "
+                         f"(3 panels means 2 gutters). Pass --separator-px if the run overrode "
+                         f"panel_separator_px. Candidates at: {gutters}")
+
+    band_height = _band_height(frame, gutters[0])
+
+    bounds = [0]
+    for start, end in gutters:
+        bounds.extend((start, end))
+    bounds.append(width)
+    spans = [(bounds[index], bounds[index + 1]) for index in range(0, len(bounds), 2)]
+
+    # `_pad_to_even` grows an odd width by a gutter-coloured column, which belongs to no panel.
+    last_start, last_end = spans[-1]
+    flat = _flat_gutter_columns(frame, band_probe)
+    while last_end > last_start + 1 and flat[last_end - 1]:
+        last_end -= 1
+    spans[-1] = (last_start, last_end)
+
+    if names is None:
+        if len(spans) != len(PANEL_ORDER):
+            raise SystemExit(f"Found {len(spans)} panels, and only a {len(PANEL_ORDER)}-panel "
+                             f"{'|'.join(PANEL_ORDER)} layout can be named by position. Widths are "
+                             f"{[end - start for start, end in spans]}; pass --columns to say which is which.")
+        names = list(PANEL_ORDER)
+    elif len(names) != len(spans):
+        raise SystemExit(f"--columns names {len(names)} columns but {len(spans)} were found, with widths "
+                         f"{[end - start for start, end in spans]}.")
+
+    return PanelLayout(band_height=band_height, columns=dict(zip(names, spans, strict=True)))
 
 
 def read_frames(path: Path) -> list[np.ndarray]:
@@ -164,6 +210,22 @@ def read_frames(path: Path) -> list[np.ndarray]:
 def mean_abs_diff(left: np.ndarray, right: np.ndarray) -> float:
     """Mean absolute difference on the 0-255 scale, in float64 to keep uint8 from wrapping."""
     return float(np.abs(left.astype(np.float64) - right.astype(np.float64)).mean())
+
+
+def match_width(frame: np.ndarray, width: int) -> np.ndarray:
+    """Resample to ``width``, for scoring a target column against a prediction column.
+
+    The two are the same height and rarely the same width: the panel scales each source to the
+    panel height, and a clip captured at 1080x1920 does not land on the width a 704x1280 sampling
+    canvas does. Only the target is ever moved, so neither run's prediction is touched and the
+    resampling contributes the same blur to both sides of the comparison.
+    """
+    if frame.shape[1] == width:
+        return frame
+    from PIL import Image
+
+    return np.asarray(Image.fromarray(frame).resize((width, frame.shape[0]), Image.Resampling.LANCZOS),
+                      dtype=np.uint8)
 
 
 def detect_prefix(drift: np.ndarray) -> int | None:
@@ -211,7 +273,7 @@ def main() -> None:
     comparable = compare_manifests(left_manifest, right_manifest)
     if not comparable and not args.force:
         raise SystemExit(1)
-    geometry = parse_geometry(left_manifest or right_manifest)
+    names = [name.strip() for name in args.columns.split(",")] if args.columns else None
 
     # Only the panels: the standalone prediction mp4 carries no target to score against.
     left_videos = {key[0]: path for key, path in index_videos(left_dir).items() if key[1] == "_compare"}
@@ -224,25 +286,35 @@ def main() -> None:
     drifts: list[np.ndarray] = []
     left_errors: list[np.ndarray] = []
     right_errors: list[np.ndarray] = []
+    layout_note: str | None = None
     print(f"\n{len(shared)} panels in common:")
     for index in shared:
         left_frames, right_frames = read_frames(left_videos[index]), read_frames(right_videos[index])
         if not left_frames or not right_frames:
             print(f"  video_{index}: unreadable, skipped")
             continue
-        layout = solve_layout(left_frames[0].shape, geometry, args.separator_px)
-        if "target" not in layout.columns:
-            raise SystemExit("These panels have no target column, so there is nothing to measure error against. "
-                             "The run logged proxy and prediction only.")
+        layout = solve_layout(left_frames[0], args.separator_px, names)
+        if layout_note is None:
+            layout_note = layout.describe()
+            print(f"  panel columns: {layout_note}; label band {layout.band_height}px")
+        for required in ("prediction", "target"):
+            if required not in layout.columns:
+                raise SystemExit(f"No {required} column in the panel, so there is nothing to measure. Columns "
+                                 f"found: {layout.describe()}")
         # Truncated rather than padded: a held frame would score as the model diverging at the tail.
         count = min(len(left_frames), len(right_frames))
         drift = np.empty(count)
         left_error = np.empty(count)
         right_error = np.empty(count)
+        if left_frames[0].shape != right_frames[0].shape:
+            raise SystemExit(f"video_{index} is {left_frames[0].shape} on the left and {right_frames[0].shape} on "
+                             "the right, so one panel's columns cannot locate the other's. The runs composed at "
+                             "different panel_height or included different columns, which makes them "
+                             "incomparable however the checkpoints did.")
         for frame in range(count):
             left_prediction = layout.crop(left_frames[frame], "prediction")
             right_prediction = layout.crop(right_frames[frame], "prediction")
-            target = layout.crop(left_frames[frame], "target")
+            target = match_width(layout.crop(left_frames[frame], "target"), left_prediction.shape[1])
             drift[frame] = mean_abs_diff(left_prediction, right_prediction)
             left_error[frame] = mean_abs_diff(left_prediction, target)
             right_error[frame] = mean_abs_diff(right_prediction, target)

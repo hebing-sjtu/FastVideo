@@ -46,63 +46,76 @@ def _noise(frames: int, height: int, width: int, seed: int) -> list[np.ndarray]:
     return [rng.integers(0, 256, (height, width, 3), dtype=np.uint8) for _ in range(frames)]
 
 
-@pytest.mark.parametrize(
-    ("target", "proxy"),
-    [
-        ((704, 1280), (192, 336)),  # aspect ratios disagree: columns are unequal
-        ((768, 1344), (192, 336)),  # aspect ratios agree: columns happen to be equal
-    ],
-)
 @pytest.mark.parametrize("labels", [True, False])
-def test_the_split_recovers_the_exact_columns_the_callback_composed(target, proxy, labels):
-    compose_comparison_video = _load("video_panels", PANELS).compose_comparison_video
+@pytest.mark.parametrize("panel_height", [384, 704])
+def test_the_split_recovers_the_exact_columns_the_callback_composed(labels, panel_height):
+    """Three sources at three different aspect ratios, which is the case in practice.
 
+    The proxy and target columns come from clips decoded off disk, so their widths follow those
+    files rather than the cache. Nothing in the run records them, and they are not equal: any
+    method that assumes equal thirds, or derives a width from the cache's proxy grid, gets a
+    plausible-looking crop of the wrong pixels.
+    """
+    panels_module = _load("video_panels", PANELS)
     module = _load("compare_eval_predictions")
-    target_height, target_width = target
-    proxy_height, proxy_width = proxy
 
-    prediction = _noise(3, target_height, target_width, seed=1)
-    ground_truth = _noise(3, target_height, target_width, seed=2)
-    composed = compose_comparison_video(
-        [_noise(3, proxy_height, proxy_width, seed=3), prediction, ground_truth],
+    proxy = _noise(3, 192, 336, seed=3)  # 1.750
+    prediction = _noise(3, 704, 1280, seed=1)  # 1.818, the sampling canvas
+    ground_truth = _noise(3, 1080, 1920, seed=2)  # 1.778, the clip as captured
+    composed = panels_module.compose_comparison_video(
+        [proxy, prediction, ground_truth],
         labels=["proxy (src)", "prediction", "target (tgt)"] if labels else None,
         separator_px=4,
-        height=target_height,
+        height=panel_height,
     )
+    layout = module.solve_layout(composed[0], 4)
 
-    geometry = {
-        "target_height": target_height,
-        "target_width": target_width,
-        "proxy_height": proxy_height,
-        "proxy_width": proxy_width,
-    }
-    layout = module.solve_layout(composed[0].shape, geometry, 4)
-
-    # Exactness is the assertion, not closeness: these arrays went in uncompressed, so a crop that
-    # is right is bit-for-bit right, and anything less means the columns are misplaced.
-    assert np.array_equal(layout.crop(composed[0], "prediction"), prediction[0])
-    assert np.array_equal(layout.crop(composed[0], "target"), ground_truth[0])
+    # The panel scales each source to the panel height, so the crop is compared against the scaled
+    # source rather than the original -- and then exactly. These arrays went in uncompressed, so a
+    # crop that is right is bit-for-bit right and anything less means the columns are misplaced.
+    for name, source in (("prediction", prediction), ("target", ground_truth)):
+        expected = panels_module.resize_frames(source, panel_height)
+        assert np.array_equal(layout.crop(composed[0], name), expected[0]), name
 
 
-def test_a_panel_that_matches_no_layout_is_refused():
+def test_a_panel_with_no_findable_gutters_is_refused():
     """Better a refusal than a statistic over two arbitrary crops, which is what guessing gives."""
     module = _load("compare_eval_predictions")
-    geometry = {"target_height": 704, "target_width": 1280, "proxy_height": 192, "proxy_width": 336}
-    with pytest.raises(SystemExit, match="matches no layout"):
-        module.solve_layout((704, 999, 3), geometry, 4)
+    with pytest.raises(SystemExit, match="Found 0 separator columns"):
+        module.solve_layout(_noise(1, 402, 2062, seed=5)[0], 4)
 
 
-def test_geometry_must_come_from_the_manifest():
+def test_dark_footage_does_not_read_as_a_gutter():
+    """The failure mode of looking for dark columns, which is why flatness is what is required.
+
+    A night clip supplies plenty of columns as dark as the gutter. None of them is *uniform* down
+    the whole canvas, and demanding that every row be within tolerance is what separates them.
+    """
+    panels_module = _load("video_panels", PANELS)
     module = _load("compare_eval_predictions")
-    with pytest.raises(SystemExit, match="missing"):
-        module.parse_geometry({"geometry": "--training.data.num_height 704"})
 
-    parsed = module.parse_geometry({
-        "geometry": ("--training.data.num_height 704 --training.data.num_width 1280 "
-                     "--callbacks.validation.anchor_short_edge 768 "
-                     "--callbacks.validation.proxy_height 192 --callbacks.validation.proxy_width 336")
-    })
-    assert parsed == {"target_height": 704, "target_width": 1280, "proxy_height": 192, "proxy_width": 336}
+    rng = np.random.default_rng(11)
+    night = [rng.integers(0, 40, (200, 360, 3), dtype=np.uint8) for _ in range(2)]
+    composed = panels_module.compose_comparison_video([night, night, night], labels=None, separator_px=4, height=200)
+    layout = module.solve_layout(composed[0], 4)
+    assert len(layout.columns) == 3
+    assert np.array_equal(layout.crop(composed[0], "prediction"), night[0])
+
+
+def test_two_columns_must_be_named():
+    """A two-panel layout is genuinely ambiguous: proxy|prediction and prediction|target both occur."""
+    panels_module = _load("video_panels", PANELS)
+    module = _load("compare_eval_predictions")
+
+    prediction = _noise(2, 704, 1280, seed=1)
+    ground_truth = _noise(2, 1080, 1920, seed=2)
+    composed = panels_module.compose_comparison_video([prediction, ground_truth], separator_px=4, height=384)
+    with pytest.raises(SystemExit, match="pass --columns"):
+        module.solve_layout(composed[0], 4)
+
+    layout = module.solve_layout(composed[0], 4, ["prediction", "target"])
+    expected = panels_module.resize_frames(ground_truth, 384)
+    assert np.array_equal(layout.crop(composed[0], "target"), expected[0])
 
 
 def test_a_flat_drift_curve_has_no_prefix_boundary():
@@ -134,20 +147,31 @@ def _wn_panels(module, tmp_path, monkeypatch, *, improvement: float, reseed: boo
     """
     compose_comparison_video = _load("video_panels", PANELS).compose_comparison_video
     geometry = ("--training.data.num_height 704 --training.data.num_width 1280 "
-                "--callbacks.validation.anchor_short_edge 768 "
+                "--callbacks.validation.anchor_short_edge 2048 "
                 "--callbacks.validation.proxy_height 192 --callbacks.validation.proxy_width 336")
     frames, prefix = 60, 34
     rng = np.random.default_rng(7)
-    target = [rng.integers(0, 256, (704, 1280, 3), dtype=np.uint8) for _ in range(frames)]
+    # The real shapes: a 384-tall panel, a proxy and a target decoded off disk at their own
+    # resolutions, and a prediction on the sampling canvas. No two columns come out the same width,
+    # which is what the target-to-prediction scoring has to survive.
+    target = [rng.integers(0, 256, (1080, 1920, 3), dtype=np.uint8) for _ in range(frames)]
     proxy = [rng.integers(0, 256, (192, 336, 3), dtype=np.uint8) for _ in range(frames)]
     error = [rng.integers(0, 90, (704, 1280, 3), dtype=np.uint8) for _ in range(frames)]
     other = [rng.integers(0, 90, (704, 1280, 3), dtype=np.uint8) for _ in range(frames)]
+    # The prefix is the target resampled onto the prediction's canvas, which is what a decoded
+    # given-frame prefix is: the same pixels the target panel shows, at the sampling resolution.
+    from PIL import Image
+
+    given = [
+        np.asarray(Image.fromarray(frame).resize((1280, 704), Image.Resampling.LANCZOS), dtype=np.uint8)
+        for frame in target
+    ]
 
     def prediction(scale: float, deviation: list[np.ndarray]) -> list[np.ndarray]:
-        # The prefix is the target itself in both runs, which is what "already given" means.
+        # The prefix is the given footage in both runs, which is what "already given" means.
         return [
-            target[t] if t < prefix else np.clip(target[t].astype(np.int32) + deviation[t] * scale, 0,
-                                                 255).astype(np.uint8) for t in range(frames)
+            given[t] if t < prefix else np.clip(given[t].astype(np.int32) + deviation[t] * scale, 0,
+                                                255).astype(np.uint8) for t in range(frames)
         ]
 
     directories = []
@@ -168,7 +192,7 @@ def _wn_panels(module, tmp_path, monkeypatch, *, improvement: float, reseed: boo
         panel = compose_comparison_video([proxy, prediction(scale, deviation), target],
                                          labels=["proxy (src)", "prediction", "target (tgt)"],
                                          separator_px=4,
-                                         height=704)
+                                         height=384)
         directories.append((directory, panel))
 
     saved = {directory: panel for directory, panel in directories}
