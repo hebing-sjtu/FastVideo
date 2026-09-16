@@ -211,8 +211,11 @@ callbacks:
     # same content. A validation set is mp4 paths and captions, so it carries no canvas of its own
     # and is reusable across geometries -- the callback re-derives conditioning at the run's.
     dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
-    every_steps: 50
-    run_at_start: true
+    # Off for this run. In-loop sampling shares the FSDP-wrapped training transformer, and after a
+    # validation pass the first training backward has failed with cuda-grad-onto-cpu-param. Eval the
+    # checkpoints with eval_checkpoint.sh instead; the panels are the same ones.
+    every_steps: 0
+    run_at_start: false
     sampling_steps: [50]
     # H3 has no zero-embedding branch for text CFG, matching training_cfg_rate: 0.0 above.
     guidance_scale: 1.0
