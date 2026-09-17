@@ -170,6 +170,26 @@ if [[ -n "$CKPT" ]]; then
     fi
 fi
 
+# Everything below overrides `callbacks.validation.*`, and an override cannot bring a callback into
+# being -- on its own it would construct one out of whichever fields happened to be overridden. A
+# run that trained with the block deleted rather than merely switched off saves a config with no
+# validation at all, so the config is the one thing here that can be unusable while the checkpoint
+# is fine. Settle it before the GPUs, and name the way out.
+if ! python -c '
+import sys, yaml
+config = yaml.safe_load(open(sys.argv[1])) or {}
+sys.exit(0 if isinstance((config.get("callbacks") or {}).get("validation"), dict) else 1)
+' "$CONFIG" 2>/dev/null; then
+    echo "$CONFIG_SOURCE configures no validation callback, and this script samples by turning one" >&2
+    echo "on. Point it at a scenario that declares the block instead:" >&2
+    echo >&2
+    echo "  --config examples/train/scenario/h3_proxy/proxy_controlnet_finetune.yaml" >&2
+    echo >&2
+    echo "Geometry still comes from the cache, and probe_resume.py still checks the state-dict key" >&2
+    echo "names against whichever config is used, so this costs none of what the saved config gave." >&2
+    exit 2
+fi
+
 if [[ ! -d "$CACHE" ]]; then
     echo "cache directory not found: $CACHE${CACHE_FROM:+  (from $CACHE_FROM)}" >&2
     echo "Pass --cache. Caches on disk:" >&2
