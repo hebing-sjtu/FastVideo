@@ -34,6 +34,14 @@ none to match. It is chosen on information content:
 that run. Every difference is silent, so a cache built under one convention
 cannot be compared against a run under the other.
 
+The file format is a separate choice from the channel convention, and only one
+value of it is lossless: ``libx264rgb`` + ``rgb24`` + ``crf 0``, which is what
+DATA_F.md specifies for both semantic and DUV. ``crf 0`` alone is not enough --
+it losslessly codes whatever the encoder was handed, so a ``yuv444p`` stream fed
+rgb24 frames still pays for a colour matrix that 8 bits cannot invert. The
+gta_web_0902_v2 corpus was composed that way; ``--duv-codec libx264`` reproduces
+it. Every write is now verified by reading it back.
+
 Usage::
 
     # Look before writing: prints the decoded range, the palette and the R stats.
@@ -174,6 +182,16 @@ def parse_args() -> argparse.Namespace:
         "inverted log-z with near bright and invalid 0, G/B are CWM's twelve injective semantic "
         "codes. 'abot' reproduces the first cache (0.1-8000 m forward, sky 255, non-injective "
         "colours). Both differences are silent, so caches under the two cannot be compared.",
+    )
+    p.add_argument(
+        "--duv-codec",
+        choices=("libx264rgb", "libx264"),
+        default="libx264rgb",
+        help="How the DUV is written. 'libx264rgb' with pix_fmt rgb24 is DATA_F.md's convention and "
+        "the only bit-exact one; the output is verified by reading it back. 'libx264' with yuv444p "
+        "is what the gta_web_0902_v2 corpus and the gta_v2_* caches were composed with, kept only "
+        "for reproducing those bytes -- it pays for an RGB->YUV matrix that 8 bits cannot invert, "
+        "so its round-trip check is expected to fail.",
     )
     p.add_argument(
         "--source-near",
@@ -369,19 +387,31 @@ def semantic_ids(frame: np.ndarray) -> np.ndarray:
                      f"B={len(np.unique(frame[..., 2]))} maxB={int(blue.max())}")
 
 
-def write_duv(path: Path, frames: list[np.ndarray], fps: float) -> None:
-    """Lossless RGB mp4 via PyAV. stdin-to-ffmpeg died with EPIPE on this node."""
+def write_duv(path: Path, frames: list[np.ndarray], fps: float, *, codec: str = "libx264rgb") -> None:
+    """Write the DUV and prove the bytes survived, rather than trusting the codec name.
+
+    ``libx264rgb`` + ``rgb24`` + ``crf 0`` is DATA_F.md's convention for both semantic and DUV, and
+    it is the only one that is bit-exact: ``crf 0`` is lossless coding of *whatever the encoder is
+    handed*, so feeding rgb24 to a ``yuv444p`` stream still pays for an RGB->YUV matrix that 8 bits
+    cannot invert. A DUV is three integer code books, so that error is not a slightly softer image:
+    it moves depth codes, each of which is a fixed 2.68% ratio of distance.
+
+    Verified by reading a frame back, because this is exactly the kind of claim that is made in a
+    docstring and then quietly stops holding. stdin-to-ffmpeg died with EPIPE on this node, hence
+    PyAV.
+    """
     import av
 
     height, width = frames[0].shape[:2]
+    pixel_format = "rgb24" if codec == "libx264rgb" else "yuv444p"
     temporary = path.with_name(path.stem + ".tmp.mp4")
     temporary.unlink(missing_ok=True)
     container = av.open(str(temporary), mode="w", format="mp4")
     try:
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
+        stream = container.add_stream(codec, rate=Fraction(fps).limit_denominator(1000))
         stream.width = width
         stream.height = height
-        stream.pix_fmt = "yuv444p"
+        stream.pix_fmt = pixel_format
         stream.options = {"crf": "0", "preset": "fast", "tune": "fastdecode"}
         for array in frames:
             video_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(array), format="rgb24")
@@ -394,7 +424,31 @@ def write_duv(path: Path, frames: list[np.ndarray], fps: float) -> None:
     if not temporary.is_file() or temporary.stat().st_size == 0:
         temporary.unlink(missing_ok=True)
         raise RuntimeError(f"PyAV wrote no bytes to {temporary}")
+    verify_duv_roundtrip(temporary, frames, codec=codec)
     temporary.replace(path)
+
+
+def verify_duv_roundtrip(path: Path, frames: list[np.ndarray], *, codec: str) -> None:
+    """Decode the first and middle frames and require them back exactly.
+
+    Two frames rather than one: the first is an I-frame and the middle is not, and a colour
+    conversion shows up on both while a broken P-frame path shows up only on the second.
+    """
+    written = read_rgb_video(path)
+    if len(written) != len(frames):
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"{path} decoded {len(written)} frames, wrote {len(frames)}")
+    for index in dict.fromkeys((0, len(frames) // 2)):
+        expected, actual = frames[index], written[index]
+        if np.array_equal(expected, actual):
+            continue
+        worst = int(np.abs(actual.astype(np.int16) - expected.astype(np.int16)).max())
+        changed = float(np.mean(np.any(actual != expected, axis=-1)))
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"{codec} did not round-trip frame {index} of {path.name}: {changed:.1%} of pixels "
+                           f"changed, worst channel off by {worst}. A DUV is integer codes, so this is moved "
+                           "depths and relabelled boundaries rather than a softer picture. libx264rgb with "
+                           "pix_fmt rgb24 is the bit-exact combination; yuv444p is not, whatever crf says.")
 
 
 def probe_video_fps(path: Path) -> float:
@@ -519,7 +573,7 @@ def main() -> None:
                 top = trim // 2
                 bottom = composed[0].shape[0] - (trim - top)
                 composed = [frame[top:bottom] for frame in composed]
-            write_duv(duv_path, composed, probe_video_fps(depth_path))
+            write_duv(duv_path, composed, probe_video_fps(depth_path), codec=args.duv_codec)
             composed_names.append(seg.name)
             written += 1
             if written % 20 == 0:
