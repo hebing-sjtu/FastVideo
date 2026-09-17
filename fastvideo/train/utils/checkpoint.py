@@ -407,19 +407,40 @@ class _FullModelState(Stateful):
 
 
 class _CallbackStateWrapper:
-    """Wraps a CallbackDict for DCP save/load."""
+    """Wraps a CallbackDict for DCP save/load.
 
-    def __init__(self, callbacks: Any) -> None:
+    ``present_names`` narrows what is *requested* to the callbacks a particular save holds. DCP
+    builds its load plan from ``state_dict`` and raises on any key the save lacks, so a config whose
+    callbacks differ from the run's would otherwise be unresumable -- and callbacks are the part of a
+    config that legitimately differs between training a checkpoint and evaluating it.
+    """
+
+    def __init__(self, callbacks: Any, *, present_names: set[str] | None = None) -> None:
         self._callbacks = callbacks
+        self._present_names = present_names
 
     def state_dict(self) -> dict[str, Any]:
-        return self._callbacks.state_dict()
+        state = self._callbacks.state_dict()
+        if self._present_names is None:
+            return state  # type: ignore[no-any-return]
+        return {name: value for name, value in state.items() if name in self._present_names}
 
     def load_state_dict(
         self,
         state_dict: dict[str, Any],
     ) -> None:
         self._callbacks.load_state_dict(state_dict)
+
+
+def _saved_callback_names(dcp_dir: Path) -> set[str]:
+    """The callback names a save carries, read from its metadata rather than assumed."""
+    metadata = dcp.FileSystemReader(str(dcp_dir)).read_metadata()
+    names = set()
+    for full_name in metadata.state_dict_metadata:
+        parts = full_name.split(".")
+        if len(parts) > 2 and parts[0] == "callbacks":
+            names.add(parts[1])
+    return names
 
 
 @dataclass(slots=True)
@@ -453,7 +474,7 @@ class CheckpointManager:
         self._raw_config = raw_config
         self._last_saved_step: int | None = None
 
-    def _build_states(self) -> dict[str, Any]:
+    def _build_states(self, *, present_callbacks: set[str] | None = None) -> dict[str, Any]:
         states: dict[str, Any] = self.method.checkpoint_state()
 
         # Dataloader (optional but recommended for exact resume).
@@ -462,7 +483,10 @@ class CheckpointManager:
 
         # Callback state (e.g. EMA shadow weights, validation RNG).
         if self._callbacks is not None and _is_stateful(self._callbacks):
-            states["callbacks"] = _CallbackStateWrapper(self._callbacks, )
+            states["callbacks"] = _CallbackStateWrapper(
+                self._callbacks,
+                present_names=present_callbacks,
+            )
 
         return states
 
@@ -617,7 +641,11 @@ class CheckpointManager:
             return None
         step = _parse_step_from_dir(resolved)
 
-        states = self._build_states()
+        # Ask only for the callbacks this save holds. Evaluating a checkpoint declares a validation
+        # callback the training run may not have had, and requesting its state would fail the load
+        # over an RNG seed while every weight in the file is fine.
+        present_callbacks = _saved_callback_names(resolved / "dcp")
+        states = self._build_states(present_callbacks=present_callbacks)
         logger.info("Loading Phase 2 checkpoint from %s", resolved)
         dcp.load(states, checkpoint_id=str(resolved / "dcp"))
         _barrier()

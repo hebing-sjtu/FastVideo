@@ -18,10 +18,12 @@ import pytest
 from fastvideo.train.utils.checkpoint import (
     CheckpointConfig,
     CheckpointManager,
+    _CallbackStateWrapper,
     _find_latest_checkpoint,
     _is_stateful,
     _parse_step_from_dir,
     _resolve_resume_checkpoint,
+    _saved_callback_names,
 )
 
 # ---------------------------------------------------------------------------
@@ -88,6 +90,60 @@ class _MissingLoad:
 
 def test_is_stateful_true_for_full_object() -> None:
     assert _is_stateful(_Full()) is True
+
+
+# ---------------------------------------------------------------------------
+# A2. Callback state requested against a save that holds different callbacks
+# ---------------------------------------------------------------------------
+
+
+class _Callbacks:
+
+    def __init__(self) -> None:
+        self.loaded: dict[str, Any] | None = None
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"grad_clip": {}, "validation": {"validation_rng": b"seed"}}
+
+    def load_state_dict(self, sd: dict[str, Any]) -> None:
+        self.loaded = sd
+
+
+def test_saving_requests_every_callback() -> None:
+    assert sorted(_CallbackStateWrapper(_Callbacks()).state_dict()) == ["grad_clip", "validation"]
+
+
+def test_loading_requests_only_the_callbacks_the_save_holds() -> None:
+    # DCP plans the load from `state_dict` and raises on a key the save lacks, so evaluating a
+    # checkpoint trained without a validation callback would fail over an RNG seed.
+    wrapper = _CallbackStateWrapper(_Callbacks(), present_names={"grad_clip"})
+
+    assert sorted(wrapper.state_dict()) == ["grad_clip"]
+
+
+def test_callback_names_come_from_the_saves_own_metadata(monkeypatch, tmp_path: Path) -> None:
+    # Only `callbacks.<name>.<field>` counts: model, dataloader and optimizer entries share the
+    # flattened namespace, and a bare `callbacks` key carries no name to read.
+    class _Metadata:
+        state_dict_metadata = {
+            "roles.student.transformer.blocks.0.weight": None,
+            "callbacks.ema.shadow.0": None,
+            "callbacks.validation.validation_rng": None,
+            "dataloader.index": None,
+            "callbacks": None,
+        }
+
+    class _Reader:
+
+        def __init__(self, path: str) -> None:
+            del path
+
+        def read_metadata(self) -> _Metadata:
+            return _Metadata()
+
+    monkeypatch.setattr("fastvideo.train.utils.checkpoint.dcp.FileSystemReader", _Reader)
+
+    assert _saved_callback_names(tmp_path / "dcp") == {"ema", "validation"}
 
 
 def test_is_stateful_false_when_missing_state_dict() -> None:
