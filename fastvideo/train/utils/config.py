@@ -507,6 +507,16 @@ def _apply_overrides(
     """Apply dotted-key overrides to a nested dict."""
     for dotted_key, value in overrides.items():
         parts = dotted_key.split(".")
+        # Refuse to bring a callback into being. Missing levels are created below, which for
+        # `callbacks.<name>.<field>` means overriding one field of a callback the config does not
+        # declare builds the whole callback out of that one field -- and a name CallbackDict knows
+        # then supplies a `_target_`, so it is constructed rather than reported. That is a stale
+        # launch command or a typo every time; a declared callback is still overridable.
+        if len(parts) > 2 and parts[0] == "callbacks" and not isinstance(cfg.get("callbacks", {}).get(parts[1]), dict):
+            declared = sorted(cfg.get("callbacks", {})) or ["(none)"]
+            raise ValueError(f"--{dotted_key} overrides callback {parts[1]!r}, which this config does not configure. "
+                             f"It configures: {', '.join(declared)}. Add the callback to the YAML, or drop the "
+                             "override -- on its own it would construct the callback rather than adjust it.")
         d = cfg
         for part in parts[:-1]:
             if part not in d or not isinstance(d[part], dict):

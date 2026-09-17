@@ -330,6 +330,28 @@ def test_dotted_overrides_apply_with_type_coercion(tmp_path: Path) -> None:
     assert cfg.training.tracker.project_name == "overridden"
 
 
+def test_overriding_an_undeclared_callback_is_refused(tmp_path: Path) -> None:
+    # Missing levels are created, so one field of an unconfigured callback would build the whole
+    # callback -- and `validation` is a name CallbackDict supplies a `_target_` for, so it gets
+    # constructed from that one field instead of reported. Always a stale command or a typo.
+    path = _write_yaml(tmp_path, _minimal_yaml())
+
+    with pytest.raises(ValueError, match="does not configure"):
+        load_run_config(path, overrides=["--callbacks.validation.every_steps=0"])
+
+
+def test_overriding_a_declared_callback_still_works(tmp_path: Path) -> None:
+    data = _minimal_yaml()
+    data["callbacks"] = {"validation": {"_target_": "pkg.Mod", "every_steps": 50}}
+
+    cfg = load_run_config(
+        _write_yaml(tmp_path, data),
+        overrides=["--callbacks.validation.every_steps=0"],
+    )
+
+    assert cfg.callbacks["validation"]["every_steps"] == 0
+
+
 def test_dotted_overrides_accept_separate_value_token(tmp_path: Path) -> None:
     path = _write_yaml(tmp_path, _minimal_yaml())
     cfg = load_run_config(
