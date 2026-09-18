@@ -41,6 +41,19 @@
 #         -- --models.student.num_given_latent_frames 10 \
 #            --callbacks.validation.num_given_latent_frames 10 \
 #            --callbacks.validation.cwm_system_prompt wn
+#
+# Defaults to one node of 8 with `--standalone`. On a two-node allocation --standalone would start
+# two unrelated 8-GPU jobs writing one output directory, so pass `--nnodes 2` and run the same line
+# on both nodes; the rendezvous comes from PET_* (NODE_ENVIRONMENT.md) because this cluster assigns
+# it rather than letting the job choose:
+#
+#     scripts/h3_proxy/eval_checkpoint.sh --step 600 --nnodes 2 --sp-size 8 ...
+#
+# `--sp-size` defaults to one SP group per node. It is worth setting deliberately for two reasons:
+# `num_gpus / sp_size` SP groups each sample a share of the validation set, so a smaller value
+# finishes sooner; and a control trunk shards its heads across the SP group, so the value has to
+# divide `controlnet_num_heads`. The 16 a two-node world would suggest divides neither this
+# scenario's 8 heads nor anything useful, which is why sp_size is not simply the world size.
 
 set -euo pipefail
 
@@ -48,6 +61,13 @@ CONFIG=examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml
 CONFIG_GIVEN=""
 CONFIG_SOURCE="$CONFIG"
 NPROC=8
+# Two nodes cannot use --standalone, and on this cluster the rendezvous is handed to the job in
+# PET_* rather than chosen. See NODE_ENVIRONMENT.md.
+NNODES=1
+# Decoupled from the world size, because it is not a free knob: a control trunk shards its heads
+# across the SP group, so sp_size has to divide `controlnet_num_heads` -- 8 for this scenario, which
+# rules out the 16 a two-node world would otherwise suggest. Empty means "one SP group per node".
+SP_SIZE=""
 STEP=""
 RUN=""
 CACHE=""
@@ -72,6 +92,8 @@ while [[ $# -gt 0 ]]; do
         --tag) TAG="$2"; shift 2 ;;
         --config) CONFIG="$2"; CONFIG_GIVEN=1; CONFIG_SOURCE="$2"; shift 2 ;;
         --nproc) NPROC="$2"; shift 2 ;;
+        --nnodes) NNODES="$2"; shift 2 ;;
+        --sp-size) SP_SIZE="$2"; shift 2 ;;
         --list) LIST=1; shift ;;
         --runs-root) RUNS_ROOT="$2"; shift 2 ;;
         --) shift; EXTRA=("$@"); break ;;
@@ -242,6 +264,56 @@ fi
 
 EVERY=$(( STEP > 0 ? STEP : 1 ))
 
+# --- mesh ---------------------------------------------------------------------------------------
+#
+# `nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim`. sp_size is the one
+# of these that is not determined by the hardware, and it is not a pure throughput knob either:
+# `num_gpus / sp_size` SP groups each sample a share of the validation set, so lowering it finishes
+# sooner, while the trunk's head split puts a floor under how low it can go.
+WORLD=$(( NNODES * NPROC ))
+[[ -n "$SP_SIZE" ]] || SP_SIZE="$NPROC"
+if (( WORLD % SP_SIZE )); then
+    echo "--sp-size $SP_SIZE does not divide the $WORLD GPUs ($NNODES nodes x $NPROC)." >&2
+    exit 2
+fi
+
+# The trunk scatters its heads across the SP group, so a world size that divides the backbone's 56
+# heads can still leave the trunk unable to split its own -- and `sp_size: 16` on two nodes is
+# exactly that case for this scenario's 8. The model raises with a list of valid sizes, but only
+# after the snapshot is on the GPUs, so settle it against the config instead.
+CONTROL_HEADS="$(python -c '
+import sys, yaml
+student = ((yaml.safe_load(open(sys.argv[1])) or {}).get("models") or {}).get("student") or {}
+print(int(student.get("controlnet_num_heads", 8)) if student.get("enable_camera_controlnet") else 0)
+' "$CONFIG" 2>/dev/null || echo 0)"
+if [[ "$CONTROL_HEADS" -gt 0 ]] && (( CONTROL_HEADS % SP_SIZE )); then
+    echo "This checkpoint carries a control trunk with controlnet_num_heads=$CONTROL_HEADS, and the trunk" >&2
+    echo "shards its heads across the SP group, so --sp-size must divide $CONTROL_HEADS -- not $SP_SIZE." >&2
+    printf '  valid: ' >&2
+    for candidate in $(seq 1 "$CONTROL_HEADS"); do
+        (( CONTROL_HEADS % candidate )) || (( WORLD % candidate )) || printf '%s ' "$candidate" >&2
+    done
+    echo >&2
+    echo "  $WORLD GPUs / sp_size = the number of SP groups, each sampling a share of the validation set." >&2
+    exit 2
+fi
+
+# Both nodes run the same command and only PET_NODE_RANK differs; --standalone would instead start
+# two unrelated 8-GPU jobs writing one output directory.
+LAUNCH=(--standalone --nproc_per_node "$NPROC")
+if [[ "$NNODES" -gt 1 ]]; then
+    for variable in PET_MASTER_ADDR PET_MASTER_PORT PET_NODE_RANK; do
+        if [[ -z "${!variable:-}" ]]; then
+            echo "--nnodes $NNODES needs \$$variable, which this cluster sets per node and a login shell may not" >&2
+            echo "carry. Check: echo \$PET_MASTER_ADDR \$PET_MASTER_PORT \$PET_NODE_RANK   (see NODE_ENVIRONMENT.md)" >&2
+            exit 2
+        fi
+    done
+    LAUNCH=(--nnodes "$NNODES" --nproc_per_node "$NPROC"
+            --node_rank "$PET_NODE_RANK"
+            --master_addr "$PET_MASTER_ADDR" --master_port "$PET_MASTER_PORT")
+fi
+
 GEOM="$(python scripts/h3_proxy/describe_cache.py "$CACHE" --emit-flags)"
 
 # A resume whose key names disagree with this config loads nothing and says nothing, so settle that
@@ -261,6 +333,7 @@ echo "  geometry        $GEOM"
 echo "  validation set  $VAL_JSON"
 echo "  output          $OUT"
 echo "  every_steps     $EVERY   (must divide $STEP)"
+echo "  mesh            $NNODES node(s) x $NPROC = $WORLD GPUs, sp_size $SP_SIZE -> $(( WORLD / SP_SIZE )) SP group(s)"
 echo
 echo "  Watch for 'lora_B norm 0 -> <nonzero>' from the resume; that line is the proof the"
 echo "  checkpoint's weights reached the model that samples. It raises rather than logs if the"
@@ -278,13 +351,15 @@ fi
 # step-0/step-138 comparison meaningless in the first place.
 mkdir -p "$OUT"
 # Values travel as argv rather than interpolated into the source, so a path holding a quote writes
-# a manifest instead of a syntax error.
+# a manifest instead of a syntax error. Only the rendezvous leader writes: on two nodes both run
+# this same line, and two processes truncating one file is a race whose loser leaves it empty.
+if [[ "${PET_NODE_RANK:-0}" -eq 0 ]]; then
 python - "$OUT/eval_manifest.json" \
-    "$STEP" "$CKPT" "$CONFIG_SOURCE" "$CACHE" "$GEOM" "$VAL_JSON" "$EVERY" "$NPROC" \
+    "$STEP" "$CKPT" "$CONFIG_SOURCE" "$CACHE" "$GEOM" "$VAL_JSON" "$EVERY" "$NPROC" "$NNODES" "$SP_SIZE" \
     ${EXTRA[@]+"${EXTRA[@]}"} <<'PY'
 import json, sys
 
-out, step, ckpt, config_source, cache, geometry, val_json, every, nproc = sys.argv[1:10]
+out, step, ckpt, config_source, cache, geometry, val_json, every, nproc, nnodes, sp_size = sys.argv[1:12]
 with open(out, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -296,24 +371,30 @@ with open(out, "w", encoding="utf-8") as handle:
             "val_json": val_json,
             "every_steps": int(every),
             "nproc": int(nproc),
+            "nnodes": int(nnodes),
+            # Recorded for the same reason as the geometry: sequence parallelism changes where the
+            # attention is split, so two evals at different sp_size are not bit-comparable -- and
+            # compare_eval_predictions.py reads pixels.
+            "sp_size": int(sp_size),
             # Recorded because they change what was sampled. A wn baseline and a w0 baseline are
             # both "step 0" and are not the same picture, and the mp4 does not say which it is.
-            "extra_overrides": sys.argv[10:],
+            "extra_overrides": sys.argv[12:],
         },
         handle,
         indent=2,
         sort_keys=True,
     )
 PY
+fi
 
 set -x
-torchrun --standalone --nproc_per_node "$NPROC" \
+torchrun "${LAUNCH[@]}" \
     -m fastvideo.train.entrypoint.train \
     --config "$CONFIG" \
     --training.data.data_path "$CACHE" \
-    --training.distributed.num_gpus "$NPROC" \
-    --training.distributed.sp_size "$NPROC" \
-    --training.distributed.hsdp_shard_dim "$NPROC" \
+    --training.distributed.num_gpus "$WORLD" \
+    --training.distributed.sp_size "$SP_SIZE" \
+    --training.distributed.hsdp_shard_dim "$WORLD" \
     "${RESUME[@]}" \
     --training.loop.max_train_steps "$STEP" \
     --callbacks.validation.dataset_file "$VAL_JSON" \
