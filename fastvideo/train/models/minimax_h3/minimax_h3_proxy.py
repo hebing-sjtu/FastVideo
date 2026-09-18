@@ -7,10 +7,15 @@ match what each signal is:
 
 **The proxy rides the Ref2VA reference slots.** It is content — the layout, occlusion and motion the
 output must agree with — and H3 already knows how to read content it is shown: the released Ref2VA
-checkpoint packs ordered references as prefix rows of the video stream, at their own resolution and
-their own rotary coordinates, held at a near-clean timestep while the target denoises. Feeding the
-proxy there needs no architectural change at all. A single RGB anchor frame goes in the slot ahead
-of it to fix appearance, which the proxy by construction cannot supply.
+checkpoint packs ordered references as prefix rows of the video stream, at their own resolution,
+held at a near-clean timestep while the target denoises. Feeding the proxy there needs no
+architectural change at all. A single RGB anchor frame goes in the slot ahead of it to fix
+appearance, which the proxy by construction cannot supply.
+
+By default those prefix rows sit on the sequential Ref2VA clock, a whole clip earlier than the
+target -- fine for exemplars, wrong for a frame-aligned proxy. ``align_proxy_reference_time``
+writes the proxy's frames at the target's own rotary origin instead, so frame k shares an instant
+with the frame it steers; the clock still advances, so the target's coordinates stay unchanged.
 
 **Some leading target latent frames are a given, not a target.** The reference prefix is read once
 for the whole clip and sits at its own rotary coordinates, so it says what the scene looks like but
@@ -124,6 +129,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         camera_dropout: float = 0.1,
         # --- reference conditioning ---
         enable_anchor: bool = True,
+        align_proxy_reference_time: bool = False,
         num_given_latent_frames: int = 1,
         lock_first_frame: bool | None = None,
         supervise_audio: bool = False,
@@ -140,6 +146,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         self._freeze_backbone = bool(freeze_backbone)
         self._camera_dropout = float(camera_dropout)
         self._enable_anchor = bool(enable_anchor)
+        self._align_proxy_reference_time = bool(align_proxy_reference_time)
         self._supervise_audio = bool(supervise_audio)
 
         if lock_first_frame is not None:
@@ -368,6 +375,9 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
                     num_latent_frames=int(latents.shape[2]),
                     latent_height=int(latents.shape[3]),
                     latent_width=int(latents.shape[4]),
+                    # Only the proxy. The anchor is the appearance dictionary for the whole take and
+                    # occupies a single rotary instant, so it has no timeline to align.
+                    time_aligned=media_type == "video" and self._align_proxy_reference_time,
                 ))
             rows.append(patchify_video_latents(latents, patch_size))
         return references, rows

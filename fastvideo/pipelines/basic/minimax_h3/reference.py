@@ -44,10 +44,15 @@ class MiniMaxH3Reference:
     sample_rate: int | None = None
     short_edge: int | None = None
     size: tuple[int, int] | None = None
+    # Put this reference's frames on the target's own rotary timeline instead of ahead of it. Only
+    # a video reference has frames to align; see `build_ref2va_packed_sequence` for what it costs.
+    time_aligned: bool = False
 
     def __post_init__(self) -> None:
         if self.source is None:
             raise ValueError("A MiniMax-H3 reference requires a media source.")
+        if self.time_aligned and self.media_type != "video":
+            raise ValueError("Reference `time_aligned` is only valid for video references.")
         if self.media_type not in ("image", "video", "audio"):
             raise ValueError(f"Unsupported MiniMax-H3 reference type: {self.media_type!r}.")
         if self.soundtrack is not None and self.media_type != "video":
@@ -89,6 +94,9 @@ class MiniMaxH3PreparedReference:
     latent_height: int = 0
     latent_width: int = 0
     num_audio_latents: int = 0
+    # Write this reference's frames at the target's rotary origin rather than at the Ref2VA cursor.
+    # See `build_ref2va_packed_sequence`; video references only.
+    time_aligned: bool = False
 
 
 def validate_references(references: list[Any]) -> list[MiniMaxH3Reference]:
@@ -362,7 +370,7 @@ def prepare_reference(
     target_sample_rate: int,
 ) -> MiniMaxH3PreparedReference:
     """Decode and normalize one deferred Ref2VA medium."""
-    prepared = MiniMaxH3PreparedReference(media_type=reference.media_type)
+    prepared = MiniMaxH3PreparedReference(media_type=reference.media_type, time_aligned=reference.time_aligned)
     if reference.media_type == "image":
         image = load_reference_image(reference.source)
         height, width = resolve_reference_image_size(*image.size, short_edge=reference.short_edge)

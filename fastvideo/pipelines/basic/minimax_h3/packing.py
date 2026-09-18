@@ -323,6 +323,23 @@ def _reference_temporal_span(num_latent_frames: int) -> float:
                for index in range(num_latent_frames))
 
 
+def _reference_clock_advance(reference: MiniMaxH3PreparedReference) -> float:
+    """How far this reference moves the Ref2VA clock for whatever follows it.
+
+    Separate from the fill loop because the target's rotary origin has to be known *before* the
+    references are written when any of them is time-aligned, and computing it a second way would be
+    a second definition of the layout.
+    """
+    if reference.media_type == "image":
+        return 1.0
+    if reference.media_type == "audio":
+        return float(reference.num_audio_latents)
+    return max(
+        float(reference.num_audio_latents if reference.has_audio else 0),
+        _reference_temporal_span(reference.num_latent_frames),
+    )
+
+
 def _frame_position_grid(
     latent_height: int,
     latent_width: int,
@@ -398,6 +415,24 @@ def build_ref2va_packed_sequence(
         if reference.has_audio and reference.num_audio_latents <= 0:
             raise ValueError("An audio-bearing reference has no resolved audio latents.")
 
+    for reference in references:
+        if not reference.time_aligned:
+            continue
+        # The switch means one thing: this reference's frames sit at the target's own rotary times.
+        # An image has no frames to align, and an audio reference's clock is its latent count, so
+        # neither can express it -- and silently ignoring the flag would report an experiment that
+        # did not run.
+        if reference.media_type != "video":
+            raise ValueError(f"time_aligned is only meaningful for a video reference, not "
+                             f"{reference.media_type!r}: an image occupies a single rotary instant and an "
+                             "audio reference is clocked by its latent count.")
+        if reference.num_latent_frames != num_latent_frames:
+            raise ValueError(
+                f"a time-aligned reference must have the target's latent frame count: reference has "
+                f"{reference.num_latent_frames}, target has {num_latent_frames}. A shorter one would land on "
+                "a prefix of the target's timeline and leave the rest unconstrained, which is not the "
+                "alignment this flag claims.")
+
     num_text_tokens = int(text_token_tags.shape[0])
     num_target_video_rows = (num_latent_frames // patch_t) * (latent_height // patch_h) * (latent_width // patch_w)
     num_target_audio_rows = num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS
@@ -414,6 +449,15 @@ def build_ref2va_packed_sequence(
     video_indices: list[torch.Tensor] = []
     audio_indices: list[torch.Tensor] = []
     cursor = num_text_tokens
+    # Where the target's own clock starts, computed by running the same sequential accumulation the
+    # fill loop below runs. Sequential rather than `sum(...)` because the clock's float error is part
+    # of the reference coordinate arithmetic, and a time-aligned reference has to land on the
+    # target's times exactly rather than to within an ulp.
+    rotary_time = float(num_text_tokens)
+    for reference in references:
+        rotary_time += _reference_clock_advance(reference)
+    target_rotary_time = rotary_time
+
     rotary_time = float(num_text_tokens)
     for reference, visual_row_count in zip(references, visual_row_counts, strict=True):
         if reference.media_type == "image":
@@ -459,16 +503,34 @@ def build_ref2va_packed_sequence(
                     rotary_time,
                     width_grid,
                 )
-            frame_time = temporal_position_grid(reference.num_latent_frames, rotary_time)
+            # A time-aligned reference is written at the target's origin instead of the cursor, so
+            # its frame k shares a rotary instant with target frame k. H3 packs references ahead of
+            # the target and clocks them sequentially, which puts the proxy a whole clip earlier --
+            # 206.667 units against the target's own 200 at 124 frames -- so no proxy frame shares a
+            # temporal position with the frame it is meant to steer, and attention has no
+            # frame-to-frame registration to read. Spatially the two already agree: the grid is
+            # normalised by sqrt(area), so a 192x336 proxy and a 768x1344 target span the same
+            # interval and the proxy's point i lands exactly on the target's point 4i.
+            #
+            # The clock still advances by the full span, so the target's own positions are
+            # unchanged. That is the point: the only thing this moves is the proxy.
+            frame_time = temporal_position_grid(reference.num_latent_frames,
+                                                target_rotary_time if reference.time_aligned else rotary_time)
             rows_per_frame = frame_grid.shape[0]
             position_ids[video_rows, 0] = frame_time.repeat_interleave(rows_per_frame)
             position_ids[video_rows, 1:] = frame_grid.repeat(reference.num_latent_frames // patch_t, 1)
-            rotary_time += max(
-                float(reference.num_audio_latents if reference.has_audio else 0),
-                _reference_temporal_span(reference.num_latent_frames),
-            )
+            rotary_time += _reference_clock_advance(reference)
         else:
             raise ValueError(f"Unsupported prepared reference type: {reference.media_type!r}.")
+
+    # The prepass and the loop above are two statements of the same clock, and a time-aligned
+    # reference is written from the first while the target is written from the second. Exact
+    # equality rather than a tolerance: both run the identical sequence of additions, so any
+    # difference means someone changed one and not the other, which would silently place the proxy
+    # off the target's timeline -- the one thing this is all for.
+    if rotary_time != target_rotary_time:
+        raise AssertionError(f"Ref2VA clock disagrees with its prepass ({rotary_time} vs {target_rotary_time}): "
+                             "_reference_clock_advance has drifted from the reference fill loop.")
 
     audio_start = cursor
     video_start = audio_start + num_target_audio_rows

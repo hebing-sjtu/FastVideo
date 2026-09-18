@@ -49,6 +49,7 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         anchor_short_edge: int = 2048,
         proxy_height: int = 192,
         proxy_width: int = 336,
+        align_proxy_reference_time: bool = False,
         cwm_system_prompt: str = "w0",
         num_given_latent_frames: int = 1,
         lock_first_frame: bool | None = None,
@@ -110,6 +111,10 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         # reference rows instead of 2442, from LANCZOS-upsampled frames. For a DUV proxy that
         # resampling is not merely off-distribution, it averages unrelated depth codes.
         self.proxy_size = (int(proxy_height), int(proxy_width))
+        # Must equal `models.student.align_proxy_reference_time`. Sampling a time-aligned run
+        # without it presents the proxy a clip earlier than training ever did, which reads as a bad
+        # checkpoint rather than as a mismatch.
+        self.align_proxy_reference_time = bool(align_proxy_reference_time)
         if min(self.proxy_size) <= 0:
             raise ValueError(f"proxy_height and proxy_width must be positive, got {self.proxy_size}.")
         # Must match how the training cache's text embedding was wrapped. ABot clips are window 0.
@@ -160,7 +165,10 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
                 media_type="image",
                 short_edge=self.anchor_short_edge,
             ),
-            MiniMaxH3Reference(source=proxy_path, media_type="video", size=self.proxy_size),
+            MiniMaxH3Reference(source=proxy_path,
+                               media_type="video",
+                               size=self.proxy_size,
+                               time_aligned=self.align_proxy_reference_time),
         ]
 
         camera = self._record_path(validation_batch, CAMERA_PATH_KEY)
