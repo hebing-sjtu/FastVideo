@@ -29,7 +29,11 @@ from pathlib import Path
 from typing import Any
 
 # Everything a run records except the two things that are *supposed* to differ.
-MUST_MATCH = ("cache", "geometry", "val_json", "nproc")
+#
+# `sp_size` belongs here for the same reason `geometry` does: sequence parallelism moves where
+# attention is split, so two evals at different values are not bit-comparable -- and the caller is
+# about to read a pixel difference and attribute all of it to the checkpoint.
+MUST_MATCH = ("cache", "geometry", "val_json", "nproc", "nnodes", "sp_size")
 
 VIDEO_RE = re.compile(r"validation_step_(\d+)_inference_steps_(\d+)_rank_(\d+)_video_(\d+)(_compare)?\.mp4$")
 
@@ -50,7 +54,15 @@ def load_manifest(directory: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     with open(path, encoding="utf-8") as handle:
-        return json.load(handle)  # type: ignore[no-any-return]
+        manifest: dict[str, Any] = json.load(handle)
+    # Manifests written before the mesh became configurable record only `nproc`, and the script that
+    # wrote them had no way to express anything else: it launched --standalone and set
+    # num_gpus == sp_size == nproc. So these are recovered values, not assumed ones, and filling
+    # them keeps an old eval comparable against a new one that happens to agree instead of
+    # reporting `None != 8` at it.
+    manifest.setdefault("nnodes", 1)
+    manifest.setdefault("sp_size", manifest.get("nproc"))
+    return manifest
 
 
 def digest(path: Path) -> str:
