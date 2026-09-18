@@ -11,6 +11,38 @@ A 16-GPU smoke (`max_train_steps=2`) completed on 2026-09-07: both nodes reached
 `https://wandb.ai/hbin/fastvideo_h3_proxy/runs/pjagwm6a` (`finetune_loss ≈ 0.16`,
 `step_time_sec ≈ 30`). That is the known-good baseline this page describes.
 
+## Start of every session: one line
+
+```bash
+. /workspace/FastVideo/scripts/session_env.sh
+```
+
+Sourced, not run — a child process sets variables that die with it. It is idempotent, so sourcing
+it again after any environment surprise is the cheapest thing to try.
+
+It restores the image venv, applies the launch environment below, and then *checks* rather than
+assumes: which `python` is on PATH, that `torch` imports from `/opt/venv`, that `fastvideo` is this
+checkout, that `libibverbs.so.1` is present whenever `NCCL_NET=gIB` is forced, and whether the
+`PET_*` rendezvous is in the shell. Output ends in `ok.` or in a count of problems.
+
+Three things it exists to undo, none of which announce itself:
+
+- **Another venv is active.** `uv run`, `uv venv` or a hand-rolled venv prepends its own `bin` to
+  PATH and sets `VIRTUAL_ENV`. Activating `/opt/venv` on top does not undo either: the second
+  `activate` clobbers the `_OLD_VIRTUAL_PATH` the first one saved, so `deactivate` can no longer
+  unwind it. What you get is a shell where `python` is right and a subprocess is not — and the tell
+  is two tracebacks from one session quoting different interpreters, e.g. `/opt/venv/lib/python3.12`
+  in one and `~/.local/share/uv/python/cpython-3.12.14-.../lib/python3.12` in the next.
+- **A stale NCCL override.** `NCCL_NET_PLUGIN=none` left in the shell sends a 16-rank job over TCP
+  sockets at a fraction of the bandwidth, with no error. `NCCL_P2P_DISABLE=1` silently gives up
+  NVLink. Both are on the `unset` list for that reason.
+- **The second checkout.** `/FastVideo` exists on the image, and a run importing it ignores every
+  local edit while reporting nothing unusual.
+
+`uv run` is the one case the script can only warn about: it prefers a project `.venv` over anything
+active, so inside the checkout it will rebuild its own environment regardless. Use plain `python`
+and `torchrun`, or `uv run --no-project`.
+
 ## Filesystem: what survives the node and what does not
 
 | Path | Lifetime | What belongs there |
@@ -114,7 +146,8 @@ All three were tried here. Each one looks right from the error message alone.
 
 ## The launch environment
 
-Same for one node and for two, once libibverbs is installed:
+`scripts/session_env.sh` applies all of this; the block is kept here because it is what the script
+is accountable to. Same for one node and for two, once libibverbs is installed:
 
 ```bash
 cd /workspace/FastVideo
@@ -231,12 +264,12 @@ On **both** nodes, in order:
 
 1. `apt-get install -y libibverbs1 ibverbs-providers ibverbs-utils && ldconfig`
 2. `ibv_devinfo | grep -E "hca_id|state"` — `mlx5_0..7`, `PORT_ACTIVE`
-3. `python -c "import fastvideo; print(fastvideo.__file__)"` — `/workspace/FastVideo/...`
-4. Source the launch environment (section above) and `unset` the stale NCCL overrides
-5. Confirm rendezvous: `echo $PET_MASTER_ADDR $PET_MASTER_PORT $PET_NODE_RANK`
-6. Warm the snapshot (section above)
-7. `nvidia-smi` — empty
-8. Launch. `tee` to `/tmp`, not `/data`
+3. `. /workspace/FastVideo/scripts/session_env.sh` — covers steps 3 to 5 of the older list (venv,
+   the launch environment and its `unset`s, the `fastvideo` import path, libibverbs, rendezvous) and
+   ends in `ok.` or a problem count
+4. Warm the snapshot (section above)
+5. `nvidia-smi` — empty
+6. Launch. `tee` to `/tmp`, not `/data`
 
 ## Launch recipes
 
