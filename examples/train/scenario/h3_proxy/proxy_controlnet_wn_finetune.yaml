@@ -1,0 +1,218 @@
+# MiniMax-H3 proxy-to-video: the proxy on a ControlNet trunk, with a real footage prefix.
+#
+# This is `proxy_controlnet_finetune.yaml` with one axis moved. That file held
+# `num_given_latent_frames: 1` on purpose, and said why: the `wn` regime was the *other* live
+# hypothesis for the rate problem, and turning both on at once produces a result that cannot be
+# attributed to either. The w0 trunk run has now been read, so wn is attributable against it, and
+# this file is the second of the pair rather than a fresh guess.
+#
+# --- what wn changes, and why it is the easier task ----------------------------------------------
+#
+# w0 hands the model one latent frame -- the anchor, at the target's own coordinates. That fixes
+# where the camera starts but says nothing about how fast anything moves, which is what the
+# reference slot cannot supply either: it sits a whole clip earlier in RoPE time and gives the
+# target no frame-to-frame registration. Rate therefore had to be inferred, and the LoRA runs got
+# it wrong in exactly that way -- turning the right way at the wrong speed.
+#
+# wn hands over 10 of 37 latent frames: CWM's `VIDEO_PREFIX_LATENTS`, 34 pixel frames, 1.4167
+# seconds of the actual take at the actual coordinates. Rate stops being something to infer, and
+# the question narrows to whether the trunk can carry the proxy's *direction* once the speed is
+# given. That is the simpler task, and a trunk that cannot do it is not going to do the harder one.
+#
+# --- the cache is a --text-only copy, not a re-encode --------------------------------------------
+#
+# w0 and wn differ only in which CWM system prompt the cached Qwen rows were wrapped in. The three
+# latents are byte-identical, so `--text-only` rewrites `text_embedding`, `text_token_tags` and
+# `info["cwm_system"]` on an existing set without loading the VAE:
+#
+#   cp -r /data/binghe/h3_proxy/cache/gta_v2_ctrl /data/binghe/h3_proxy/cache/gta_v2_ctrl_wn
+#   python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
+#       --manifest /data/binghe/h3_proxy/gta_v2_cwm_encode.jsonl \
+#       --root /data/binghe/datasets/gta_web_0902_v2/gta_web_0902 \
+#       --output /data/binghe/h3_proxy/cache/gta_v2_ctrl_wn \
+#       --model-path /data/models/MiniMax-H3 \
+#       --num-frames 124 --height 768 --width 1344 \
+#       --proxy-height 192 --proxy-width 336 \
+#       --anchor-short-edge 2048 --text-only --cwm-system wn
+#
+# Copying rather than rewriting in place is the point: `--text-only` reads the `.pt` out of
+# `--output` and writes it back, so pointing it at `gta_v2_ctrl` would convert the w0 cache and take
+# the run this one is supposed to be read against with it. The geometry flags have to be repeated
+# exactly, because the refresh still renders the anchor and the proxy preview that Qwen is shown.
+#
+# The pairing is checked rather than trusted. `_check_given_frames_against_cache` reads
+# `info["cwm_system"]` out of the batch and refuses a wn cache with `num_given_latent_frames <= 1`,
+# and a w0 cache with anything but 1 -- because the config can be wrong in the same direction twice
+# while the cache records what was actually encoded.
+#
+# --- what is not comparable to the w0 run --------------------------------------------------------
+#
+# **The loss magnitude.** Given rows carry a flow target of exactly zero and a zeroed prediction, so
+# they contribute `given/37` of the loss mean as zeros. w0 blanks 1 of 37 rows, wn blanks 10, which
+# scales this run's loss by roughly 27/36 -- about 25% lower from the arithmetic alone, before any
+# learning. Reading that drop as progress is the mistake this paragraph exists to prevent.
+#
+# **The eval videos, directly.** `compare_eval_predictions.py` measures pixels, and its manifest
+# check requires `cache` to agree, so it will refuse a w0-vs-wn pair rather than produce a number.
+# That is correct: compare step 0 against step 600 *within* this run, and then compare the two runs'
+# tracking gains against their own step-0 baselines.
+#
+# Also read the drift curve's shape here, not just its mean. wn's prefix is the same clean target
+# pixels in both checkpoints and cannot differ no matter how well training went, so the flat opening
+# ~34 frames are identical by construction and dilute any average taken over the whole clip.
+# `compare_eval_predictions.py` detects that boundary from the curve; a boundary that lands near 34
+# doubles as proof the prefix is genuinely being handed over.
+#
+# Everything else -- trunk width, injection stride, learning rate, schedule, geometry, the six
+# validation clips -- is held at the w0 run's values so that this one axis is the only one moved.
+#
+# Then launch (2 nodes of 8), the same command on both nodes:
+#   torchrun --nnodes 2 --nproc_per_node 8 \
+#       --node_rank "$PET_NODE_RANK" \
+#       --master_addr "$PET_MASTER_ADDR" --master_port "$PET_MASTER_PORT" \
+#       -m fastvideo.train.entrypoint.train \
+#       --config examples/train/scenario/h3_proxy/proxy_controlnet_wn_finetune.yaml
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
+    init_from: /data/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    # --- control trunk ---
+    # Identical to the w0 run. Changing a trunk dimension here would put two variables in flight and
+    # cost the attribution this run exists to get.
+    enable_camera_controlnet: true
+    enable_control_proxy: true
+    enable_control_camera: false
+    controlnet_dim: 1024
+    controlnet_ffn_dim: 4096
+    controlnet_num_heads: 8
+    controlnet_layer_stride: 2
+    camera_dropout: 0.0
+    freeze_backbone: true
+
+    # --- reference conditioning ---
+    enable_anchor: true
+    # CWM's VIDEO_PREFIX_LATENTS: 10 of 37 latent frames, 34 pixel frames. This is the whole
+    # difference from proxy_controlnet_finetune.yaml, and it must agree with the cache's
+    # `info["cwm_system"]` and with `callbacks.validation.num_given_latent_frames` below.
+    num_given_latent_frames: 10
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    # nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim.
+    num_gpus: 16
+    # sp_size must divide controlnet_num_heads: the trunk shards its heads across the SP group, so
+    # 16 is not available here however many GPUs there are.
+    sp_size: 2
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 16
+    pin_cpu_memory: true
+
+  data:
+    # The wn text refresh of gta_v2_ctrl. Same latents, same 768x1344 over a 192x336 proxy, so the
+    # trunk's 4x replication still divides exactly.
+    data_path: /data/binghe/h3_proxy/cache/gta_v2_ctrl_wn
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_frames: 124
+    num_latent_t: 37
+    num_height: 768
+    num_width: 1344
+
+  optimizer:
+    learning_rate: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    lr_scheduler: constant_with_warmup
+    lr_warmup_steps: 25
+
+  loop:
+    max_train_steps: 600
+    # global batch = (num_gpus / sp_size) * train_batch_size * this = 8 * 1 * 4 = 32.
+    gradient_accumulation_steps: 4
+
+  checkpoint:
+    output_dir: /data/binghe/h3_proxy/runs/gta_v2_ctrl_wn/checkpoints
+    training_state_checkpointing_steps: 25
+    checkpoints_total_limit: 20
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: gta_v2_proxy_controlnet_wn
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+  # Declared but never scheduled, exactly as in the w0 run: `every_steps: 0` returns from
+  # `on_validation_begin` on its first line. In-loop sampling hands the FSDP-wrapped training
+  # transformer to an inference pipeline holding a second text encoder and VAE, which is not worth
+  # the interaction while reading a from-scratch trunk.
+  #
+  # The block stays declared because the offline path overrides these rather than supplying them,
+  # and an override cannot bring a callback into being. Deleting it would take the validation set
+  # and the four re-derived conditioning values with it -- and would make the saved config
+  # unusable for eval, which is the failure the w0 run hit at step 600:
+  #
+  #   scripts/h3_proxy/eval_checkpoint.sh --step <N> \
+  #       --nnodes 2 --nproc 8 --sp-size 8 \
+  #       --config examples/train/scenario/h3_proxy/proxy_controlnet_wn_finetune.yaml \
+  #       --run /data/binghe/h3_proxy/runs/gta_v2_ctrl_wn/checkpoints \
+  #       --cache /data/binghe/h3_proxy/cache/gta_v2_ctrl_wn \
+  #       --val-json /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json \
+  #       --tag ctrl_wn
+  validation:
+    _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3ProxyCameraPipeline
+    # The same six clips the w0 trunk run and the wn LoRA baseline were measured on, so the tracking
+    # numbers are about the same content. A validation set is mp4 paths and captions, so it carries
+    # no canvas of its own and is reusable across geometries and regimes.
+    dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
+    every_steps: 0
+    run_at_start: false
+    sampling_steps: [50]
+    guidance_scale: 1.0
+    num_frames: 124
+    num_videos_per_prompt: 1
+    use_validation_media_conditioning: false
+    # Must equal the encoder's --anchor-short-edge.
+    anchor_short_edge: 2048
+    # Must equal the encoder's --proxy-height/--proxy-width. These also set the grid the trunk
+    # replicates from, so a mismatch changes the control signal and not just the reference.
+    proxy_height: 192
+    proxy_width: 336
+    # Must match the cache's --cwm-system, which for gta_v2_ctrl_wn is wn.
+    cwm_system_prompt: wn
+    # Must match `models.student.num_given_latent_frames` and `cwm_system_prompt`. Sampling fills
+    # these rows from real footage; a callback left at 1 against a wn cache would sample the regime
+    # the run was not trained for and read as a bad checkpoint.
+    num_given_latent_frames: 10
+    panel_height: 384
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+    text_encoder_cpu_offload: true
+    vae_cpu_offload: true
+
+pipeline: {}
