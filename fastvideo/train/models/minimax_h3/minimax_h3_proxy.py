@@ -220,19 +220,37 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             enable_gradient_checkpointing_type=enable_gradient_checkpointing_type,
             transformer_override_safetensor=transformer_override_safetensor,
         )
-        if not (trainable and self._freeze_backbone and self._enable_camera_controlnet):
-            return transformer
-        kept = 0
-        for name, param in transformer.named_parameters():
-            train = name.startswith("camera_controlnet.")
-            param.requires_grad_(train)
-            if train:
-                kept += param.numel()
-        if not kept:
-            raise RuntimeError("freeze_backbone=true but no camera_controlnet.* parameters were found to keep "
-                               "trainable after load.")
-        logger.info("Froze the backbone; %.1fM control-trunk parameters remain trainable", kept / 1e6)
-        self._check_trainable_parameters_are_on_one_device(transformer)
+        if trainable and self._freeze_backbone and self._enable_camera_controlnet:
+            kept = 0
+            for name, param in transformer.named_parameters():
+                train = name.startswith("camera_controlnet.")
+                param.requires_grad_(train)
+                if train:
+                    kept += param.numel()
+            if not kept:
+                raise RuntimeError("freeze_backbone=true but no camera_controlnet.* parameters were found to keep "
+                                   "trainable after load.")
+            logger.info("Froze the backbone; %.1fM control-trunk parameters remain trainable", kept / 1e6)
+            self._check_trainable_parameters_are_on_one_device(transformer)
+
+        # `supervise_audio=false` returns a video-only prediction, so the audio output head never
+        # receives a gradient. Leaving it `requires_grad` puts it in Adam's param group anyway;
+        # Adam only materialises `step`/`exp_avg` on the first real update, so a full-FT save then
+        # has no `audio_proj_out` optimizer entries. Eval resumes by seeding empty Adam state for
+        # every requires_grad parameter and DCP refuses the missing keys -- which is how a LoRA
+        # run (audio head already frozen) never hit this and a full-FT run does. Freezing the head
+        # here matches the loss contract and makes the optimizer surface agree with what a save
+        # actually holds. `audio_proj_in` stays trainable: silent audio rows still attend into
+        # video tokens, so that projection does get video-loss gradients.
+        if trainable and not self._supervise_audio:
+            frozen = 0
+            for name, param in transformer.named_parameters():
+                if "audio_proj_out" in name:
+                    param.requires_grad_(False)
+                    frozen += param.numel()
+            if frozen:
+                logger.info("supervise_audio=false: froze %.1fM audio_proj_out parameters", frozen / 1e6)
+
         return transformer
 
     @staticmethod
