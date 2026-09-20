@@ -1,0 +1,283 @@
+# MiniMax-H3 proxy-to-video, FULL fine-tune of the backbone, `wn` regime, proxy time-aligned.
+#
+# The reference route with the adapter removed. Held against `proxy_bd_wn_aligned_finetune.yaml`,
+# which is the same run at rank 128, this changes exactly one thing: capacity. That is the question
+# it exists to answer, and the honest prior is that it will not be enough.
+#
+# What the LoRA run showed. The adapter reached the model -- tracking +0.095 against an off-time
+# floor of -0.006 says the conditioning was read, not ignored -- and the prediction moved. What did
+# not move was registration: on large camera rotations the output does not turn with the proxy, and
+# thousands of steps barely changed that. Two readings, and this config tests the first:
+#
+#   * capacity. rank 128 constrains the update to a 128-dimensional subspace of matrices whose full
+#     rank is 5376, and CWM's 200-module set is attention-only, so the SwiGLU -- 231M of each
+#     block's 385M -- never moved at all. Removing both limits is what this file does.
+#   * route. Ref2VA references are read by attention as context, with no per-token binding to the
+#     row they describe. If that is the ceiling, capacity cannot lift it: a larger update makes the
+#     model better at using an unbound summary, not bound to it. The ControlNet run is the other
+#     arm of this, and it binds per token -- which is why it instead inherits the proxy's geometric
+#     bias wholesale and shrinks its subjects.
+#
+# Read the outcome against the LoRA run at a matched step count. If tracking moves, it was
+# capacity; if it sits at +0.095 again with 60x the trainable parameters, the reference slot is the
+# ceiling and the next move is the injection route, not a bigger optimiser.
+#
+# Cost, on one node of 8 H200. 19.3B parameters: bf16 weights 38.6 GB, bf16 gradients 38.6 GB,
+# AdamW fp32 moments plus master weights ~230 GB. Sharded eight ways that is ~39 GB per GPU against
+# 141 GB, so activations at ~41.5k tokens have room. Disk is the binding constraint, not memory --
+# see `checkpoints_total_limit` below.
+#
+# --- inherited from proxy_bd_wn_aligned_finetune.yaml -------------------------------------------
+#
+# A rerun of the `gta_v2_wn` backbone LoRA with one thing changed: `align_proxy_reference_time`.
+# That run reached 525 steps and its prediction moved without tracking the proxy any better than
+# the released model did -- appearance error, rate and tracking (+0.100 -> +0.095) all sat still,
+# against an off-time floor of -0.006 that says the conditioning was reaching the model. So the
+# adapter had capacity and gradient, and what it was not learning was registration.
+#
+# This is the reading of why. H3 packs `[text | references | target]` and clocks the references
+# sequentially, so the proxy occupies rotary times *before* the target: at 124 frames the proxy
+# spans 206.667 units and the target starts after all of it. No proxy frame shares a temporal
+# position with the frame it describes, and the offset is larger than the target's own span, so
+# there is no frame-to-frame registration in the positions for attention to pick up -- the model
+# can only use the proxy as an undated summary of the clip. That is not a bug in H3: Ref2VA
+# references are exemplars, unrelated in time to what is being generated, and the sequential clock
+# is what keeps them from colliding. It is the wrong contract for a proxy, which *is* the target,
+# frame for frame, at lower resolution.
+#
+# Space needed little. The rotary grid is normalised by sqrt(area), so a 192x336 proxy and a
+# 768x1344 target already occupy a shared spatial interval -- the remaining mismatch is the
+# proxy's one-column latent pad (22 vs 21), not a missing sparse-sampling rule.
+#
+# `align_proxy_reference_time` writes the proxy's frames at the target's own rotary origin, so
+# proxy frame k and target frame k share an instant. The clock still advances by the proxy's full
+# span, so the target's positions are bit-identical to the run above; the proxy is the only thing
+# that moves. Attention is dense over the packed sequence with no reference/target mask, so this
+# changes what the model can actually read.
+#
+# What this costs: the released Ref2VA weights have never seen a reference overlapping the target
+# in time. Time-aligned references are off-distribution for the frozen backbone, and the LoRA has
+# to absorb that as well as learn the task. If the first few hundred steps are worse than the
+# baseline's, that is this and not a broken run -- read it at the same step count as the 525 above
+# rather than against the first checkpoint.
+#
+# Compare against /data/binghe/h3_proxy/runs/gta_v2_wn at matched steps, with
+# scripts/h3_proxy/compare_eval_predictions.py; `tracking` against its own off-time score is the
+# number this run exists to move.
+#
+# --- inherited from proxy_bd_finetune.yaml ------------------------------------------------------
+#
+# Hyperparameters follow the CWM H3 recipe: rank-128 LoRA across all 50 transformer blocks starting
+# from the official Ref2VA checkpoint, video loss only, AdamW with weight decay 0.01, grad-norm clip
+# 1.0, BF16, gradient checkpointing, global batch size 8, 100-step warmup then cosine decay from
+# 2e-5 to 1e-6.
+#
+# One deliberate departure: FlashAttention-3 is not requested. The H3 plugin requires TORCH_SDPA,
+# which is dense and numerically equivalent, just slower.
+#
+# The LoRA module set used to include the SwiGLU, reasoning backwards from the paper's ~596M
+# trainable-parameter figure, which no clean subset of this repo's module decomposition reproduces.
+# The release settles it without the arithmetic: `EXPECTED_LORA_MODULES = 200` in
+# `cwm_h3_inference/constants.py`, and `strict_merge_lora` refuses any other count. 200 is exactly
+# the 4 attention projections across 50 blocks, which lands at ~321M here.
+#
+# Step count is for CWM's corpus. Three epochs at global batch 8 over the 950-clip KOF train split
+# is 357 steps, not 3534 -- leaving 3534 here would be ~30 epochs on that data. Set
+# `max_train_steps` to `3 * ceil(num_clips / 8)` for the dataset actually in `data_path`, and note
+# that a 100-step warmup is then a quarter of the run; scale it down too.
+#
+# Sequence length at the settings below: 37296 target rows (37 latent frames x 24 x 42 after the
+# 2x2 patch) + 2442 proxy + 1008 anchor + 414 audio + text, so ~41.5k tokens.
+#
+# Smoke first anyway. Resolution is fixed when the cache is written, not here -- this plugin reads
+# the shape off the cached latent -- so smoke by encoding a handful of clips small and pointing
+# `data_path` at them:
+#   --num-frames 39 --height 384 --width 672   (39 = 17*2+5, giving 12 latent frames, 3024 rows)
+# then set num_frames/num_latent_t/num_height/num_width below to match.
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
+    init_from: /data/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    lora:
+      # Off: every backbone parameter trains. `trainable: true` above plus `freeze_backbone: false`
+      # below is what makes that a full fine-tune -- the plugin's freeze path only engages when a
+      # control trunk exists, and there is none here.
+      enable: false
+      rank: 128
+      # alpha defaults to rank, giving scale 1.0. CWM does not state alpha.
+      alpha: 128
+      # Substring-matched against the full parameter path. The two text-refiner blocks, the timestep
+      # MLP (also fc_in/fc_out after param_names_mapping) and the control trunk share these leaf
+      # names and are held out by the arch config's exclude_lora_layers.
+      #
+      # Attention only: 4 modules x 50 blocks = 200, the count CWM's loader hard-asserts.
+      target_modules: [to_q, to_k, to_v, to_out]
+
+    # No trajectory in the KOF data, so there is nothing for the control trunk to read. With the
+    # branch off the DiT is the released model unchanged.
+    enable_camera_controlnet: false
+    enable_control_proxy: false
+    # Nothing frozen. With no control trunk the plugin's freeze path is inert anyway, but leaving
+    # this false states the intent rather than relying on that.
+    freeze_backbone: false
+    camera_dropout: 0.0
+
+    # --- reference conditioning ---
+    # Anchor first, proxy second: the cached text embedding was tokenized around `<Picture 1>` then
+    # `<Video 1>`, so this has to match how the data was encoded.
+    enable_anchor: true
+    # The variable under test. Writes the proxy's frames at the target's rotary origin instead of
+    # ahead of it, so proxy frame k and target frame k share a temporal position. Applies to the
+    # proxy only -- the anchor is a single rotary instant and has no timeline to align. Must match
+    # `callbacks.validation.align_proxy_reference_time` below: sampling this run without it would
+    # present the proxy a clip earlier than training ever did, which reads as a bad checkpoint.
+    align_proxy_reference_time: true
+    # `wn`: CWM hands the model 10 clean latent frames (34 video frames) of prefix. Must agree with
+    # the cache's `info["cwm_system"]`, which the plugin checks, and with the validation block.
+    num_given_latent_frames: 10
+    # "the audio loss is disabled" -- returning a video-only prediction is what tells the finetune
+    # loss to leave the audio head alone rather than train it against placeholder silence.
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    # Sized for one node of 8. `hsdp_replicate_dim * hsdp_shard_dim` is passed straight to
+    # `init_device_mesh`, which rejects a mesh larger than the actual world size -- so these three
+    # numbers are not free tuning knobs, they have to agree with torchrun's process count:
+    #   nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim
+    # For 2 nodes, set num_gpus and hsdp_shard_dim to 16 and gradient_accumulation_steps to 4.
+    num_gpus: 8
+    # One document per data-parallel replica. sp_size is set by sequence length, not dataset size.
+    # 8 is a conservative first choice at ~41.5k tokens; lowering it trades memory headroom for
+    # more data-parallel replicas, which reaches global batch 8 with less gradient accumulation and
+    # so fewer forward passes per optimizer step. CWM used sp_size 1 on eight GPUs.
+    sp_size: 8
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 8
+    pin_cpu_memory: true
+
+  data:
+    # The same wn cache the 525-step baseline trained on. Reusing it rather than re-encoding is
+    # what makes this a one-variable comparison: the rows are identical, only their rotary times
+    # differ, and that difference is made at pack time rather than at encode time.
+    data_path: /data/binghe/h3_proxy/cache/gta_v2_cwm_wn
+    # Unused by this plugin's cached-sample loader, but the shared data config still validates it.
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    # Both are contracts, not tuning knobs: packed row indices carry no batch offset, and H3 has no
+    # zero-embedding branch for text CFG.
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_frames: 124
+    num_latent_t: 37
+    num_height: 768
+    num_width: 1344
+
+  optimizer:
+    # A quarter of the LoRA run's 2e-5, which is the single most important change on this page.
+    # 2e-5 is a rate for a low-rank update on a frozen base: the adapter starts at zero and the
+    # released weights are held. Applied to all 19.3B it walks the pretrained distribution off in a
+    # few hundred steps, and image quality -- the one thing this route currently has over the
+    # ControlNet arm -- is what goes first. If the loss is still falling and samples look intact at
+    # 500 steps, raising it is cheap; recovering a washed-out backbone is not.
+    learning_rate: 5.0e-6
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    lr_scheduler: cosine_with_min_lr
+    # Matters more here than under LoRA: the first steps are applied to weights that are already a
+    # good solution, and an un-warmed Adam moment estimate is exactly when they get damaged.
+    lr_warmup_steps: 100
+    # 1e-6 / 2e-5. The scheduler floors the cosine at this ratio rather than decaying to zero.
+    min_lr_ratio: 0.05
+
+  loop:
+    # 3 epochs over CWM's corpus. Recompute for yours: 3 * ceil(num_clips / global_batch_size).
+    max_train_steps: 3534
+    # global batch = (num_gpus / sp_size) * train_batch_size * this = 1 * 1 * 8 = 8.
+    # sp_size equals num_gpus here, so there is a single data-parallel replica and accumulation is
+    # the only thing supplying the batch. Learning rate 2e-5 is stated for global batch 8.
+    gradient_accumulation_steps: 8
+
+  checkpoint:
+    # Absolute and on the data disk: a relative path resolves against the launch directory, and the
+    # checkpoints and the validation mp4s both live under here.
+    output_dir: /data/binghe/h3_proxy/runs/gta_v2_wn_aligned_fullft/checkpoints
+    # A LoRA save is the adapter; this one is the model plus AdamW's two fp32 moments, so a single
+    # checkpoint is ~200 GB rather than ~1 GB. At 250 steps and a limit of 3 that is 600 GB resident
+    # and a save every few minutes of a job whose steps are already slow. Check `df -h /data` before
+    # launching, and raise the interval rather than the limit if space is short -- two is already
+    # the minimum that survives a save being interrupted.
+    training_state_checkpointing_steps: 500
+    checkpoints_total_limit: 2
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: gta_v2_wn_aligned_fullft
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+  # Logs a proxy | prediction | target panel per held-out clip, under the tracker key
+  # `validation_videos_50_steps_compare`. The prediction alone is also logged, as
+  # `validation_videos_50_steps`. Build `dataset_file` with:
+  #   scripts/h3_proxy/prepare_data/seg_dir_to_validation_json.py --root <data> --split val --limit 6
+  #
+  # Cost is the thing to watch. Each record is a full 50-step trajectory at ~41.5k tokens, so six
+  # clips every 250 steps is a few percent of wall clock; every 20 steps would dominate the run.
+  validation:
+    _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
+    dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
+    # Must match `models.student.align_proxy_reference_time`, `num_given_latent_frames` and the
+    # prompt the cache was wrapped in. Sampling is where a mismatch is invisible: the run trains
+    # fine and the samples just look bad.
+    align_proxy_reference_time: true
+    num_given_latent_frames: 10
+    cwm_system_prompt: wn
+    # Declared so `eval_checkpoint.sh` can override it offline; inert during the training loop.
+    # In-loop validation previously fought FSDP, and this run's readout is
+    # `compare_eval_predictions.py` against the unaligned `gta_v2_wn` baseline anyway.
+    every_steps: 0
+    run_at_start: false
+    sampling_steps: [50]
+    # H3 has no zero-embedding branch for text CFG, matching training_cfg_rate: 0.0 above.
+    guidance_scale: 1.0
+    num_frames: 124
+    # H3 packs one document per request.
+    num_videos_per_prompt: 1
+    # Required: this callback conditions through an ordered reference list, and image_path would
+    # present the proxy a second time. The callback rejects true rather than silently doubling it.
+    use_validation_media_conditioning: false
+    # Must equal the --anchor-short-edge used by encode_proxy_samples.py, whose default is this.
+    anchor_short_edge: 2048
+    # Panel canvas height. Three 768-tall panels is a ~4000x800 artifact per clip; 384 halves each
+    # edge and still shows whether the output tracks the proxy. Unset uses the full height.
+    panel_height: 384
+    # A validation pipeline holds a second text encoder and VAE alongside the training state.
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+    text_encoder_cpu_offload: true
+    vae_cpu_offload: true
+
+pipeline: {}
