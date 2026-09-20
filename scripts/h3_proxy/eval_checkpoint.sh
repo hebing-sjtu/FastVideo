@@ -301,6 +301,15 @@ fi
 # Both nodes run the same command and only PET_NODE_RANK differs; --standalone would instead start
 # two unrelated 8-GPU jobs writing one output directory.
 LAUNCH=(--standalone --nproc_per_node "$NPROC")
+if [[ "$NNODES" -eq 1 ]]; then
+    # torchrun reads PET_NNODES as the default for --nnodes, and --standalone rewrites only the
+    # rendezvous backend and endpoint -- not nnodes. On a two-node allocation that leaves a
+    # single-node job waiting on localhost for a second node that will never arrive, forever, with
+    # no output past torchrun's OMP_NUM_THREADS banner. Unset here rather than in the caller's
+    # shell: this only reaches torchrun and its children, and the two-node branch below passes the
+    # rendezvous explicitly anyway.
+    unset PET_NNODES PET_NPROC_PER_NODE
+fi
 if [[ "$NNODES" -gt 1 ]]; then
     for variable in PET_MASTER_ADDR PET_MASTER_PORT PET_NODE_RANK; do
         if [[ -z "${!variable:-}" ]]; then
