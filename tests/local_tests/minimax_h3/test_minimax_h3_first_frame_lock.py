@@ -156,6 +156,63 @@ def test_a_multi_frame_prefix_requires_the_wn_prompt():
         MiniMaxH3ProxyValidationCallback(num_given_latent_frames=10, cwm_system_prompt="w0")
 
 
+def _resolve(config, cwm_system):
+    """``MiniMaxH3ProxyModel._resolve_given_latent_frames`` without building a 14-shard model.
+
+    It reads two attributes and a dataloader batch, so a stand-in carries everything it needs.
+    """
+    from types import SimpleNamespace
+
+    from fastvideo.train.models.minimax_h3.minimax_h3_proxy import (
+        MiniMaxH3ProxyModel,
+        _parse_given_latent_frames,
+    )
+
+    by_role, scalar = _parse_given_latent_frames(config)
+    model = SimpleNamespace(_given_by_role=by_role, _num_given_latent_frames=scalar)
+    info = {} if cwm_system is None else {"cwm_system": cwm_system}
+    return MiniMaxH3ProxyModel._resolve_given_latent_frames(model, {"info_list": [info]})
+
+
+@pytest.mark.parametrize(("cwm_system", "expected"), [("w0", 1), ("wn", 10)])
+def test_a_mapping_takes_the_count_from_the_prompt_the_sample_was_encoded_with(cwm_system, expected):
+    """One adapter serves both CWM windows, so one corpus has to be able to hold both contracts."""
+    assert _resolve({"w0": 1, "wn": 10}, cwm_system) == expected
+
+
+def test_a_mapping_refuses_a_sample_that_records_no_regime():
+    # Silently picking either count would train half the corpus against the wrong promise.
+    with pytest.raises(ValueError, match="records no `cwm_system`"):
+        _resolve({"w0": 1, "wn": 10}, None)
+    with pytest.raises(ValueError, match="records no `cwm_system`"):
+        _resolve({"w0": 1, "wn": 10}, "none")
+
+
+def test_a_mapping_refuses_a_regime_it_does_not_cover():
+    with pytest.raises(ValueError, match="does not map"):
+        _resolve({"wn": 10}, "w0")
+
+
+def test_a_mapping_holds_each_regime_to_its_own_prompt():
+    from fastvideo.train.models.minimax_h3.minimax_h3_proxy import _parse_given_latent_frames
+
+    with pytest.raises(ValueError, match="its count is 1"):
+        _parse_given_latent_frames({"w0": 10, "wn": 10})
+    with pytest.raises(ValueError, match="ALREADY GIVEN"):
+        _parse_given_latent_frames({"w0": 1, "wn": 1})
+    with pytest.raises(ValueError, match="not roles a cache can record"):
+        _parse_given_latent_frames({"w0": 1, "w1": 10})
+
+
+def test_a_scalar_still_checks_itself_against_the_cache():
+    assert _resolve(10, "wn") == 10
+    assert _resolve(1, "w0") == 1
+    # An unlabelled cache has no contract to disagree with, so the config stands.
+    assert _resolve(4, None) == 4
+    with pytest.raises(ValueError, match="ALREADY GIVEN"):
+        _resolve(1, "wn")
+
+
 @pytest.mark.parametrize("given", [0, 1])
 def test_the_wn_prompt_requires_a_multi_frame_prefix(given):
     """The direction a step-0 baseline falls into: a wn cache sampled by a w0 config.

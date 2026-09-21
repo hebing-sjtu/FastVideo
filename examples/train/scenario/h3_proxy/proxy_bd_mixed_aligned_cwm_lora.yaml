@@ -1,0 +1,169 @@
+# MiniMax-H3 proxy-to-video, CWM LoRA recipe, *both* CWM regimes in one run, proxy time- and
+# space-aligned.
+#
+# Held against `proxy_bd_wn_aligned_cwm_lora.yaml`, which is the same recipe on wn alone. One thing
+# changes, and it is the thing that made every wn-trained checkpoint so far collapse when asked for
+# w0: the corpus.
+#
+# The release renders a take as a chain of windows from a single adapter. `Ref2VAEngine` wraps
+# window 0's prompt in `system_w0.txt` -- "this clip is the very beginning of the take", one latent
+# frame given, locked to the anchor -- and every later window in `system_wn.txt` -- "The first 34
+# frames (1.4167 seconds) of this clip are ALREADY GIVEN", ten latent frames given. Same weights,
+# different system prompt. A run trained on one of them meets the other's prompt for the first time
+# at inference, against text embeddings it has never been optimized under, and there is nothing in
+# the packed document that lets it generalize across: the prompt is 5120-dim conditioning, not a
+# flag. That is the whole of "the wn model is bad at w0".
+#
+# So train both. `num_given_latent_frames` is a mapping here rather than a count, and the plugin
+# resolves it per sample from `info["cwm_system"]` -- the role the cache recorded at encode time,
+# not a second copy of the config that can be wrong in the same direction. `data_path` mixes the
+# two caches 1:1; they hold the same clips, so each clip is seen once per epoch under each
+# contract and the epoch is twice as long.
+#
+# Two consequences worth knowing before reading the curves:
+#
+#   * the blanked prefix is not the same fraction of the loss in both. Given rows carry a zero
+#     target and still sit in the mean, so a wn sample's real gradient covers 27/37 of the clip
+#     against a w0 sample's 36/37 -- about 0.75x the weight, per sample, on wn. This is not new
+#     (the wn-only run had it too, as a constant); mixing is what makes it a ratio between two
+#     kinds of document. If w0 ends up dominating, the lever is the repeat count in `data_path`.
+#   * the two regimes ask for different things. w0 has to infer motion *rate* from a proxy that
+#     gives no frame-to-frame registration; wn is handed the rate and only has to steer. Expect w0
+#     to stay the harder half and read it separately at eval -- one run now produces a checkpoint
+#     that has to be scored under both prompts.
+#
+# Eval either regime by overriding the scalar on the command line, which is what
+# `scripts/h3_proxy/eval_checkpoint.sh` already passes:
+#   -- --models.student.num_given_latent_frames 10 --callbacks.validation.num_given_latent_frames 10
+#      --callbacks.validation.cwm_system_prompt wn
+# and the same with 1 / w0 against the w0 cache. Score both; a checkpoint that only moved one of
+# them has not learned the thing this file exists to teach.
+#
+# Everything else -- module set, rank, LR, schedule, alignment -- is `proxy_bd_wn_aligned_cwm_lora`
+# unchanged, and the comments there explain why each number is what it is.
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
+    init_from: /data/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    lora:
+      enable: true
+      rank: 128
+      alpha: 128
+      # CWM's 200 Musubi modules are fused-QKV + out + SwiGLU. Split QKV makes it 300 here.
+      target_modules: [to_q, to_k, to_v, to_out, fc_in, fc_out]
+
+    enable_camera_controlnet: false
+    enable_control_proxy: false
+    freeze_backbone: false
+    camera_dropout: 0.0
+
+    # --- reference conditioning ---
+    enable_anchor: true
+    # Proxy frame k shares the target's rotary time, and proxy token (i, j) shares the target's
+    # rotary (h, w) at stride 4. Must match `callbacks.validation.align_proxy_reference_time`.
+    align_proxy_reference_time: true
+    # A mapping, not a count: each sample's prefix length comes from the CWM prompt its text was
+    # encoded under. 1 is w0's anchor-locked first frame; 10 is wn's VIDEO_PREFIX_LATENTS, the 34
+    # video frames its prompt promises. A sample whose cache records no role is an error here
+    # rather than a guess.
+    num_given_latent_frames:
+      w0: 1
+      wn: 10
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    # CWM's route: 8 data-parallel replicas, batch 1, no accumulation -> global batch 8, which is
+    # what 2e-5 is stated for. nnodes * nproc_per_node == num_gpus == replicate * shard.
+    num_gpus: 8
+    sp_size: 1
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 8
+    pin_cpu_memory: true
+
+  data:
+    # The same clips twice, once under each contract. Equal weights because the release gives the
+    # two prompts equal standing; raise wn's repeat if a take is many windows long and w0 is the
+    # rarer event in deployment.
+    data_path:
+      /data/binghe/h3_proxy/cache/gta_v2_cwm: 1
+      /data/binghe/h3_proxy/cache/gta_v2_cwm_wn: 1
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_frames: 124
+    num_latent_t: 37
+    num_height: 768
+    num_width: 1344
+
+  optimizer:
+    learning_rate: 2.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    lr_scheduler: cosine_with_min_lr
+    lr_warmup_steps: 100
+    min_lr_ratio: 0.05
+
+  loop:
+    # CWM's 3 epochs over a corpus that is now twice as long: 3 * ceil(2 * num_clips / 8).
+    max_train_steps: 7068
+    gradient_accumulation_steps: 1
+
+  checkpoint:
+    output_dir: /data/binghe/h3_proxy/runs/gta_v2_mixed_aligned_cwm/checkpoints
+    training_state_checkpointing_steps: 50
+    checkpoints_total_limit: 4
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: gta_v2_mixed_aligned_cwm
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+  validation:
+    _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
+    dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
+    align_proxy_reference_time: true
+    # Sampling is one regime at a time -- a panel is rendered under one prompt. This block is the
+    # in-training default and is off anyway; eval scores both regimes from the command line.
+    num_given_latent_frames: 10
+    cwm_system_prompt: wn
+    every_steps: 0
+    run_at_start: false
+    sampling_steps: [50]
+    guidance_scale: 1.0
+    num_frames: 124
+    num_videos_per_prompt: 1
+    use_validation_media_conditioning: false
+    anchor_short_edge: 2048
+    panel_height: 384
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+    text_encoder_cpu_offload: true
+    vae_cpu_offload: true
+
+pipeline: {}

@@ -26,7 +26,7 @@ the contract the model is being held to:
 
 ``1`` is the ``w0`` contract -- "this clip is the very beginning of the take", with "the first frame
 of the target locked to this exact image ... camera framing and layout". It fixes the starting pose
-    20|the proxy's motion is relative to, but leaves the *rate* of that motion to be inferred from a
+the proxy's motion is relative to, but leaves the *rate* of that motion to be inferred from a
 reference the layout gives no frame-to-frame registration with.
 
 ``10`` is the ``wn`` contract -- "The first 34 frames (1.4167 seconds) of this clip are ALREADY
@@ -39,6 +39,14 @@ rather than also having to set the clock.
 Given rows are held at the reference prefix's noise amount, excluded from the loss here, and
 excluded from every scheduler step at sampling time -- the same mask CWM applies as
 ``video_mask[:, :, :VIDEO_PREFIX_LATENTS] = False``.
+
+One set of weights answers to both contracts in the release: ``Ref2VAEngine`` loads a single LoRA
+and renders window 0 under ``system_w0.txt`` and every later window under ``system_wn.txt``, so a
+model trained on only one of them meets the other prompt for the first time at inference. Passing
+``num_given_latent_frames`` a mapping -- ``{w0: 1, wn: 10}`` -- makes the count a property of the
+document rather than of the run, which is what lets one corpus hold both kinds and one run train
+against both. Mix the two caches through ``data.data_path``; each sample then brings its own
+contract, read from the prompt it was actually encoded with.
 
 **The camera rides a ControlNet.** A trajectory is not content; it is a per-token constraint, and it
 has to bind tightly enough that the same proxy under two trajectories yields two different videos. A
@@ -94,6 +102,49 @@ logger = init_logger(__name__)
 _VIDEO_LATENT_CHANNELS = 24
 _AUDIO_LATENT_CHANNELS = 32
 
+# What each CWM system prompt promises the model, in latent frames. Only the roles a cache can
+# record: `encode_proxy_samples.py --cwm-system` writes w0, wn or none.
+_CWM_ROLES = ("w0", "wn")
+
+
+def _parse_given_latent_frames(value: Any) -> tuple[dict[str, int] | None, int | None]:
+    """Read ``num_given_latent_frames`` as one count, or one count per CWM regime.
+
+    A scalar is a single-regime run: every sample gets that many given frames and the cache's
+    recorded role has to agree. A mapping is a mixed-regime run, which is what the release does --
+    `Ref2VAEngine` merges one LoRA and serves window 0 under `system_w0.txt` and every later
+    window under `system_wn.txt`, so the weights have to satisfy both contracts. Training that
+    needs both kinds of document in one corpus, and the count is then a property of the document
+    rather than of the run::
+
+        num_given_latent_frames: {w0: 1, wn: 10}
+
+    Returns ``(by_role, scalar)`` with exactly one of them set.
+    """
+    if isinstance(value, dict):
+        unknown = sorted(set(value) - set(_CWM_ROLES))
+        if unknown:
+            raise ValueError(f"num_given_latent_frames maps CWM system-prompt roles to counts, and {unknown} are not "
+                             f"roles a cache can record. Valid keys: {list(_CWM_ROLES)}.")
+        if not value:
+            raise ValueError("num_given_latent_frames is an empty mapping, so no sample can resolve a count. "
+                             "Give a scalar for a single-regime run, or {w0: 1, wn: 10} for a mixed one.")
+        by_role = {role: int(count) for role, count in value.items()}
+        for role, count in by_role.items():
+            if count < 0:
+                raise ValueError(f"num_given_latent_frames[{role!r}] must be non-negative, got {count}")
+        if by_role.get("w0", 1) != 1:
+            raise ValueError(f"the w0 prompt locks the first target frame to the anchor and nothing else, so its "
+                             f"count is 1, not {by_role['w0']}.")
+        if "wn" in by_role and by_role["wn"] <= 1:
+            raise ValueError(f"the wn prompt says the first 34 frames are ALREADY GIVEN, so its count has to hand "
+                             f"the model more than one, not {by_role['wn']}. CWM uses 10.")
+        return by_role, None
+    scalar = int(value)
+    if scalar < 0:
+        raise ValueError(f"num_given_latent_frames must be non-negative, got {value!r}")
+    return None, scalar
+
 
 class MiniMaxH3ProxyModel(MiniMaxH3Model):
     """H3 Ref2VA fine-tuning on cached proxy/target pairs, with a camera ControlNet."""
@@ -130,7 +181,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         # --- reference conditioning ---
         enable_anchor: bool = True,
         align_proxy_reference_time: bool = False,
-        num_given_latent_frames: int = 1,
+        num_given_latent_frames: int | dict[str, int] = 1,
         lock_first_frame: bool | None = None,
         supervise_audio: bool = False,
         lora: Any = None,
@@ -156,10 +207,8 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
                              f"frames are given rather than whether any are: pass num_given_latent_frames="
                              f"{1 if lock_first_frame else 0} for the old lock_first_frame={lock_first_frame} "
                              "behaviour, or 10 to train CWM's wn regime.")
-        self._num_given_latent_frames = int(num_given_latent_frames)
-        if self._num_given_latent_frames < 0:
-            raise ValueError(f"num_given_latent_frames must be non-negative, got {num_given_latent_frames!r}")
-        if self._num_given_latent_frames and not self._enable_anchor:
+        self._given_by_role, self._num_given_latent_frames = _parse_given_latent_frames(num_given_latent_frames)
+        if any(self._given_latent_frame_counts()) and not self._enable_anchor:
             raise ValueError("num_given_latent_frames>0 needs enable_anchor=true: sampling fills the first given "
                              "frame from the anchor, and has nothing else to put there.")
         if self._enable_control_proxy and not self._enable_camera_controlnet:
@@ -400,8 +449,14 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             rows.append(patchify_video_latents(latents, patch_size))
         return references, rows
 
-    def _check_given_frames_against_cache(self, raw_batch: dict[str, Any]) -> None:
-        """Hold the given-frame count against the prompt the cache's text was actually wrapped in.
+    def _given_latent_frame_counts(self) -> tuple[int, ...]:
+        """Every given-frame count this run can produce, however it was configured."""
+        if self._given_by_role is not None:
+            return tuple(self._given_by_role.values())
+        return (int(self._num_given_latent_frames or 0), )
+
+    def _resolve_given_latent_frames(self, raw_batch: dict[str, Any]) -> int:
+        """How many leading target frames *this sample* is given, per the prompt it was encoded with.
 
         The CWM system prompt is baked into ``text_embedding`` at encode time, and it states the
         contract the model is held to: w0 says this clip is the very beginning of the take with its
@@ -409,24 +464,38 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         a hint the model can weigh against the rows it receives -- if the two disagree, the prompt
         wins and the rows are noise against it.
 
-        Checking against ``info["cwm_system"]`` rather than against a second config field is the
-        point: the config can be wrong in the same direction twice, whereas the cache records what
-        was encoded. A run that pairs a wn cache with a single given frame trains the model to
-        continue footage it was never shown, and nothing else in the stack notices.
+        Reading ``info["cwm_system"]`` rather than a second config field is the point: the config
+        can be wrong in the same direction twice, whereas the cache records what was encoded. A run
+        that pairs a wn cache with a single given frame trains the model to continue footage it was
+        never shown, and nothing else in the stack notices.
         """
         role = ((raw_batch.get("info_list") or [{}])[0] or {}).get("cwm_system")
+
+        if self._given_by_role is not None:
+            if not role or role == "none":
+                raise ValueError("num_given_latent_frames is a per-regime mapping, so every sample has to say which "
+                                 "regime it was encoded under -- and this one's cache records no `cwm_system`. "
+                                 "Re-encode with `--cwm-system w0|wn`, or configure a scalar count.")
+            if role not in self._given_by_role:
+                raise ValueError(f"a sample was encoded under CWM's {role!r} prompt, which num_given_latent_frames "
+                                 f"does not map. Configured roles: {sorted(self._given_by_role)}.")
+            return self._given_by_role[role]
+
+        given = int(self._num_given_latent_frames or 0)
         if not role or role == "none":
-            return
-        given = self._num_given_latent_frames
+            return given
         if role == "wn" and given <= 1:
             raise ValueError(f"the cache's text was wrapped in CWM's wn prompt -- 'The first 34 frames (1.4167 "
                              f"seconds) of this clip are ALREADY GIVEN' -- but num_given_latent_frames={given} hands "
                              "the model none of them. Set num_given_latent_frames=10 (CWM's VIDEO_PREFIX_LATENTS), "
-                             "or point the run at a cache encoded with --cwm-system w0.")
+                             "point the run at a cache encoded with --cwm-system w0, or configure a per-regime "
+                             "mapping {w0: 1, wn: 10} to train both at once.")
         if role == "w0" and given != 1:
             raise ValueError(f"the cache's text was wrapped in CWM's w0 prompt -- the first frame of the target is "
-                             f"locked to the anchor image -- but num_given_latent_frames={given}. Set it to 1, or "
-                             "point the run at a cache encoded with --cwm-system wn.")
+                             f"locked to the anchor image -- but num_given_latent_frames={given}. Set it to 1, "
+                             "point the run at a cache encoded with --cwm-system wn, or configure a per-regime "
+                             "mapping {w0: 1, wn: 10} to train both at once.")
+        return given
 
     def _camera_rows(
         self,
@@ -507,11 +576,11 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             raise ValueError(f"vae_latent must have shape [1, {_VIDEO_LATENT_CHANNELS}, frames, height, width], "
                              f"got {tuple(video_latents.shape)}")
         _, _, num_latent_frames, latent_height, latent_width = video_latents.shape
-        if self._num_given_latent_frames >= num_latent_frames:
-            raise ValueError(f"num_given_latent_frames={self._num_given_latent_frames} leaves nothing to denoise in a "
+        given = self._resolve_given_latent_frames(raw_batch)
+        if given >= num_latent_frames:
+            raise ValueError(f"num_given_latent_frames={given} leaves nothing to denoise in a "
                              f"{num_latent_frames}-latent-frame clip. CWM's wn regime gives 10 of 37; a cache with "
                              "fewer latent frames needs a proportionally smaller prefix.")
-        self._check_given_frames_against_cache(raw_batch)
 
         data_config = self.training_config.data
         num_audio_latents = audio_latent_num_frames(int(data_config.num_frames))
@@ -552,7 +621,6 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
                           (1.0 - MINIMAX_H3_KEYFRAME_NOISE_AUG) * condition_noise)
 
         noisy_video = (1.0 - video_sigmas) * video_latents + video_sigmas * video_noise
-        given = self._num_given_latent_frames
         if given:
             # The leading target latent frames are a given, not a target. Sampling hands the model
             # real footage there and never denoises it, so training has to present those rows the
@@ -593,6 +661,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         training_batch.audio_timesteps = 1.0 - audio_noise_amount
         training_batch.minimax_h3_layout = layout
         training_batch.minimax_h3_control = control
+        training_batch.minimax_h3_num_given_latent_frames = given
         training_batch.attn_metadata = None
         training_batch.attn_metadata_vsa = None
         return training_batch
@@ -627,6 +696,9 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             raise RuntimeError("prepare_batch() must set audio and text transformer inputs")
         if batch.timesteps is None or batch.audio_timesteps is None:
             raise RuntimeError("prepare_batch() must set video and audio timesteps")
+        given = batch.minimax_h3_num_given_latent_frames
+        if given is None:
+            raise RuntimeError("prepare_batch() must set TrainingBatch.minimax_h3_num_given_latent_frames")
 
         dtype = torch.bfloat16
         device = self.device
@@ -641,8 +713,7 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
         num_audio_latents = audio_latents.shape[-1]
         audio_rows = audio_latents.permute(0, 1, 3, 2).reshape(-1, _AUDIO_LATENT_CHANNELS)
 
-        num_fixed_video_rows = (self._num_given_latent_frames *
-                                target_rows_per_latent_frame(layout, self.transformer.patch_size))
+        num_fixed_video_rows = given * target_rows_per_latent_frame(layout, self.transformer.patch_size)
         video_timestep = float(batch.timesteps[0])
         unique_timesteps, timestep_indices = build_row_timesteps(
             layout,
@@ -691,7 +762,6 @@ class MiniMaxH3ProxyModel(MiniMaxH3Model):
             _VIDEO_LATENT_CHANNELS,
             self.transformer.patch_size,
         ).permute(0, 2, 1, 3, 4)
-        given = self._num_given_latent_frames
         if given:
             # The given frames' flow target was blanked in `prepare_batch`; blanking the prediction
             # here is the other half, and keeps those rows from pulling the adapters towards

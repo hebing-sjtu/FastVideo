@@ -39,6 +39,28 @@ VAE's group structure only admits 2, 7, 12, … latent frames, so 10 is not some
 34-frame encode can produce, and slicing a full encode is exactly what training does to the cached
 target latents.
 
+**One adapter answers to both prompts.** `Ref2VAEngine` renders a take as a chain of windows from a
+single LoRA: window 0 under `system_w0.txt`, every later window under `system_wn.txt`. A run trained
+on one regime meets the other's prompt for the first time at inference, against text embeddings it
+was never optimized under, and nothing in the packed document lets it generalize across — the prompt
+is 5120-dim conditioning, not a flag. Training both means holding both kinds of document in one
+corpus, so `num_given_latent_frames` also takes a mapping, and the count becomes a property of the
+sample rather than of the run:
+
+```yaml
+num_given_latent_frames: {w0: 1, wn: 10}   # resolved per sample from info["cwm_system"]
+data_path:
+  /data/binghe/h3_proxy/cache/gta_v2_cwm: 1      # same clips, w0 prompt
+  /data/binghe/h3_proxy/cache/gta_v2_cwm_wn: 1   # same clips, wn prompt
+```
+
+`proxy_bd_mixed_aligned_cwm_lora.yaml` is that run. A sample whose cache recorded no role is an
+error under a mapping rather than a guess, and the scalar form keeps its existing check. Note that
+the two are not weighted equally by construction: given rows carry a zero target and still sit in
+the loss mean, so a wn sample's gradient covers 27/37 of its clip against a w0 sample's 36/37.
+Evaluate the checkpoint under *both* prompts — one that only moved one of them has not learned the
+thing the mixture exists to teach.
+
 **The camera is a per-token constraint**, not content. Token `(t, h, w)` must show whatever the world
 puts along one specific ray, and the binding has to be tight enough that the same proxy under two
 trajectories yields two different videos. A reference sitting in the prefix is read once for the

@@ -333,6 +333,10 @@ class TrainingBatch:
     # depth rows its ControlNet reads. Kept as one dict because the set varies
     # with which branches a run enables.
     minimax_h3_control: dict[str, Any] | None = None
+    # How many leading target latent frames this sample hands the model rather
+    # than denoises. Per-sample rather than per-run because one H3 model serves
+    # both CWM regimes, and a mixed cache carries w0 and wn documents together.
+    minimax_h3_num_given_latent_frames: int | None = None
 
     attn_metadata_vsa: AttentionMetadata | None = None
     attn_metadata: AttentionMetadata | None = None
