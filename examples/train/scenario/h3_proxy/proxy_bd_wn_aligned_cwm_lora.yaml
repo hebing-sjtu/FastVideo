@@ -20,9 +20,31 @@
 # Do not eval a checkpoint from `gta_v2_wn_aligned` or `gta_v2_*_aligned_fullft` with this code
 # and call it the same run: those trained against the unregistered spatial grid.
 #
-# Hyperparameters otherwise follow CWM: rank 128, alpha 128, video loss only, AdamW 2e-5, warmup
-# 100, cosine to 1e-6, grad-norm 1.0, BF16, global batch 8. FlashAttention-3 is not requested;
-# the plugin requires TORCH_SDPA.
+# Everything below is read off the released adapter's safetensors `__metadata__` rather than
+# inferred (the header is a range request, no download):
+#
+#   ss_minimax_h3_target_modules  attn.qkv_proj,attn.out_proj,mlp.fc1,mlp.fc2   -> 200, 596.4M
+#   ss_network_dim / _alpha       128 / 128.0
+#   ss_learning_rate              2e-05        ss_lr_scheduler  cosine_with_min_lr
+#   ss_optimizer                  AdamW(betas=(0.9,0.999), eps=1e-08, weight_decay=0.01)
+#   ss_max_grad_norm              1.0          ss_mixed_precision  bf16
+#   ss_gradient_checkpointing     True         ss_network_dropout  0.0
+#   ss_timestep_sampling          uniform      ss_weighting_scheme none
+#   ss_minimax_h3_shift_video     12.0         _shift_audio        3.0
+#   ss_minimax_h3_visual_cond_clean 0.999      _audio_loss_weight  0.0
+#   ss_num_train_items 9420 / ss_num_batches_per_epoch 1178 -> global batch 8
+#   ss_gradient_accumulation_steps 1, batch_size_per_device 1 -> 8 data-parallel processes
+#   ss_num_epochs 3 -> ss_max_train_steps 3534      modelspec.resolution 1344x768
+#
+# The plugin already matches the last five: `_VIDEO_SCHEDULER_SHIFT`, `_AUDIO_SCHEDULER_SHIFT`,
+# `MINIMAX_H3_KEYFRAME_NOISE_AUG`, a `torch.rand` noise amount with no weighting, and
+# `supervise_audio: false`. FlashAttention-3 is the one departure: the plugin requires TORCH_SDPA,
+# which is dense and numerically equivalent, just slower.
+#
+# `ss_lr_warmup_steps` records 800, which is 100 x 8 processes -- Musubi scales it before writing
+# the metadata, and the run's own name says warmup100. 100 optimizer steps is the intent.
+#
+# `max_train_steps` is CWM's corpus. Recompute for yours: 3 * ceil(num_clips / 8).
 #
 # Sequence length is unchanged (~41.5k). Compare at matched steps against the attention-only
 # aligned LoRA with scripts/h3_proxy/compare_eval_predictions.py.
@@ -76,13 +98,21 @@ method:
 
 training:
   distributed:
-    # Sized for one node of 8. `hsdp_replicate_dim * hsdp_shard_dim` is passed straight to
-    # `init_device_mesh`, which rejects a mesh larger than the actual world size -- so these three
-    # numbers are not free tuning knobs, they have to agree with torchrun's process count:
+    # CWM's exact route, not merely its global batch: `ss_gradient_accumulation_steps 1` with
+    # `batch_size_per_device 1` over 8 processes is 8 data-parallel replicas and no accumulation.
+    # sp_size 8 plus accumulation 8 reaches the same global batch by a different path -- one
+    # replica seeing eight sequential microbatches -- and gives a different gradient-noise profile
+    # at the same nominal batch size.
+    #
+    # `hsdp_replicate_dim * hsdp_shard_dim` is passed straight to `init_device_mesh`, which rejects
+    # a mesh larger than the world size, so these have to agree with torchrun's process count:
     #   nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim
-    # For 2 nodes, set num_gpus and hsdp_shard_dim to 16. CWM used sp_size 1; LoRA fits that.
+    #
+    # Do NOT scale this to 16 GPUs without dropping something else: 16 replicas at accumulation 1
+    # is global batch 16, and 2e-5 is stated for 8. One node also leaves the second free for eval.
     num_gpus: 8
-    sp_size: 8
+    # Each rank holds a whole ~41.5k-token document. Fine for LoRA; full FT needed the shard.
+    sp_size: 1
     tp_size: 1
     hsdp_replicate_dim: 1
     hsdp_shard_dim: 8
@@ -111,8 +141,9 @@ training:
 
   loop:
     max_train_steps: 3534
-    # global batch = (num_gpus / sp_size) * train_batch_size * this. CWM states 2e-5 at global 8.
-    gradient_accumulation_steps: 8
+    # global batch = (num_gpus / sp_size) * train_batch_size * this = 8 * 1 * 1 = 8, which is
+    # CWM's `ss_gradient_accumulation_steps 1`. 2e-5 is stated for this batch.
+    gradient_accumulation_steps: 1
 
   checkpoint:
     output_dir: /data/binghe/h3_proxy/runs/gta_v2_wn_aligned_cwm/checkpoints
