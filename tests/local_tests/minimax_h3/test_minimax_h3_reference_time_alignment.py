@@ -3,8 +3,9 @@
 
 H3 packs references ahead of the target and clocks them sequentially, so the proxy sits a whole
 clip earlier in rotary time than the frames it is meant to steer. These tests pin the alternative:
-the proxy's frame k at the target's frame k, with everything else -- including the target's own
-coordinates -- byte-identical to the default layout.
+the proxy's frame k at the target's frame k, and proxy token (i, j) on the same rotary (h, w) as
+target token (stride*i, stride*j). Everything else -- including the target's own coordinates --
+is byte-identical to the default layout.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import torch
 from fastvideo.pipelines.basic.minimax_h3.packing import (
     MINIMAX_H3_TEXT_TAG,
     build_ref2va_packed_sequence,
+    strided_sample_indices,
 )
 from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
 
@@ -86,11 +88,42 @@ def test_aligning_leaves_the_target_and_the_anchor_untouched():
     assert not torch.equal(default.position_ids[proxy_rows], aligned.position_ids[proxy_rows])
 
 
-def test_alignment_does_not_touch_the_spatial_grid():
-    """Spatially the two already agreed; this flag is about time only."""
+def test_strided_sample_is_every_fourth_token_on_the_released_geometry():
+    # 24/6 = 4 and round(42/11) = 4: the 21-to-22 pad must not change the VAE's 4x correspondence.
+    assert torch.equal(strided_sample_indices(24, 6), torch.arange(6) * 4)
+    assert torch.equal(strided_sample_indices(42, 11), torch.arange(11) * 4)
+
+
+def test_aligning_puts_the_proxy_on_a_strided_sample_of_the_target_grid():
+    """Proxy token (i, j) shares rotary (h, w) with target token (4i, 4j)."""
+    layout = _layout(aligned=True)
+    proxy_rows, target_rows = _proxy_and_target_indices(layout)
+    proxy = layout.position_ids[proxy_rows, 1:].view(PROXY["num_latent_frames"], 6, 11, 2)
+    target = layout.position_ids[target_rows, 1:].view(TARGET["num_latent_frames"], 24, 42, 2)
+    # One frame is enough: the spatial grid is repeated across time.
+    sampled = target[0, 0::4, 0::4]
+    assert sampled.shape == (6, 11, 2)
+    assert torch.equal(proxy[0], sampled)
+    # And every frame, not just the first.
+    assert torch.equal(proxy, sampled.expand_as(proxy))
+
+
+def test_unaligned_proxy_is_not_on_the_target_grid():
+    """The bug: own-sqrt(area) after the 21-to-22 pad misses every target token."""
+    layout = _layout(aligned=False)
+    proxy_rows, target_rows = _proxy_and_target_indices(layout)
+    proxy = layout.position_ids[proxy_rows, 1:].view(PROXY["num_latent_frames"], 6, 11, 2)[0]
+    target = layout.position_ids[target_rows, 1:].view(TARGET["num_latent_frames"], 24, 42, 2)[0]
+    sampled = target[0::4, 0::4]
+    assert not torch.equal(proxy, sampled)
+    # Top-left is the closest corner and still not coincident.
+    assert not torch.equal(proxy[0, 0], target[0, 0])
+
+
+def test_aligning_leaves_the_unaligned_spatial_grid_behind():
     default, aligned = _layout(aligned=False), _layout(aligned=True)
     proxy_rows, _ = _proxy_and_target_indices(default)
-    assert torch.equal(default.position_ids[proxy_rows, 1:], aligned.position_ids[proxy_rows, 1:])
+    assert not torch.equal(default.position_ids[proxy_rows, 1:], aligned.position_ids[proxy_rows, 1:])
 
 
 def test_aligning_an_image_reference_is_refused():

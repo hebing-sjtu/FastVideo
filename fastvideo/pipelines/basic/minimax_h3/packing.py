@@ -11,8 +11,12 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
+from fastvideo.logger import init_logger
+
 if TYPE_CHECKING:
     from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_VIDEO_TAG = 0
 MINIMAX_H3_TEXT_TAG = 1
@@ -353,6 +357,65 @@ def _frame_position_grid(
     return torch.stack([grid.reshape(-1) for grid in grids], dim=-1), width_grid
 
 
+def strided_sample_indices(n_target: int, n_reference: int) -> torch.Tensor:
+    """Token indices of a sparse sampling of ``n_target`` by ``n_reference`` points.
+
+    A 4x latent downsample is 24 vs 6 height tokens and, after the 21-to-22 pad, 42 vs 11 width
+    tokens. ``round(n_target / n_reference)`` is 4 in both axes, so the proxy lands on every 4th
+    target token -- the VAE's own 4x cell correspondence -- rather than a 3.818 non-integer stride
+    that attention has to resolve from content and noise. Clamped so a pad column cannot walk off
+    the target's last token.
+    """
+    if n_target <= 0 or n_reference <= 0:
+        raise ValueError(f"strided sample needs positive token counts, got {n_target} / {n_reference}.")
+    if n_reference == 1:
+        return torch.zeros(1, dtype=torch.int64)
+    stride = max(1, int(round(n_target / n_reference)))
+    indices = torch.arange(n_reference, dtype=torch.int64) * stride
+    last = int(indices[-1])
+    if last > n_target - 1:
+        logger.warning(
+            "time-aligned spatial stride %d over %d reference tokens overshoots a %d-token target axis; "
+            "clamping the last %d tokens onto the far edge.",
+            stride,
+            n_reference,
+            n_target,
+            int((indices > n_target - 1).sum()),
+        )
+    return torch.clamp(indices, max=n_target - 1)
+
+
+def time_aligned_frame_grid(
+    reference_latent_height: int,
+    reference_latent_width: int,
+    latent_height: int,
+    latent_width: int,
+    patch_h: int,
+    patch_w: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A time-aligned reference occupies a strided sample of the *target's* spatial grid.
+
+    ``spatial_position_grid`` normalises each tensor by its own ``sqrt(area)``, so a padded proxy
+    (12 x 21 latents -> 12 x 22) does not span the same interval as a 48 x 84 target even though the
+    *unpadded* aspect ratios match. Copying the target's coordinates at an integer stride puts
+    proxy token (i, j) on the same rotary (h, w) as target token (stride*i, stride*j), which is the
+    sparse sampling a 4x-smaller render actually is. The unaligned path still uses the reference's
+    own grid: Ref2VA references are exemplars, not a downsample of the target.
+    """
+    target_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+    ref_h = reference_latent_height // patch_h
+    ref_w = reference_latent_width // patch_w
+    tgt_h = latent_height // patch_h
+    tgt_w = latent_width // patch_w
+    if ref_h <= 0 or ref_w <= 0:
+        raise ValueError(f"time-aligned reference token grid is empty: {reference_latent_height}x"
+                         f"{reference_latent_width} with patch {(patch_h, patch_w)}.")
+    h_idx = strided_sample_indices(tgt_h, ref_h)
+    w_idx = strided_sample_indices(tgt_w, ref_w)
+    sampled = target_grid.view(tgt_h, tgt_w, 2).index_select(0, h_idx).index_select(1, w_idx)
+    return sampled.reshape(-1, 2).contiguous(), target_width_grid.index_select(0, w_idx)
+
+
 def _fill_audio_positions(
     position_ids: torch.Tensor,
     rows: slice,
@@ -489,12 +552,28 @@ def build_ref2va_packed_sequence(
                 audio_indices.append(torch.arange(audio_rows.start, audio_rows.stop))
             video_indices.append(torch.arange(video_rows.start, video_rows.stop))
 
-            frame_grid, width_grid = _frame_position_grid(
-                reference.latent_height,
-                reference.latent_width,
-                patch_h,
-                patch_w,
-            )
+            # A time-aligned reference is the target at lower resolution, so it takes both the
+            # target's rotary times *and* a strided sample of the target's spatial grid. The
+            # unaligned path keeps the reference's own sqrt(area) grid: Ref2VA exemplars are not a
+            # downsample of the target, and their sequential clock is what keeps them from colliding
+            # with it. The clock still advances by the full span either way, so the target's own
+            # positions are unchanged -- the only thing this moves is the proxy.
+            if reference.time_aligned:
+                frame_grid, width_grid = time_aligned_frame_grid(
+                    reference.latent_height,
+                    reference.latent_width,
+                    latent_height,
+                    latent_width,
+                    patch_h,
+                    patch_w,
+                )
+            else:
+                frame_grid, width_grid = _frame_position_grid(
+                    reference.latent_height,
+                    reference.latent_width,
+                    patch_h,
+                    patch_w,
+                )
             if audio_count:
                 _fill_audio_positions(
                     position_ids,
@@ -503,17 +582,6 @@ def build_ref2va_packed_sequence(
                     rotary_time,
                     width_grid,
                 )
-            # A time-aligned reference is written at the target's origin instead of the cursor, so
-            # its frame k shares a rotary instant with target frame k. H3 packs references ahead of
-            # the target and clocks them sequentially, which puts the proxy a whole clip earlier --
-            # 206.667 units against the target's own 200 at 124 frames -- so no proxy frame shares a
-            # temporal position with the frame it is meant to steer, and attention has no
-            # frame-to-frame registration to read. Spatially the two already agree: the grid is
-            # normalised by sqrt(area), so a 192x336 proxy and a 768x1344 target span the same
-            # interval and the proxy's point i lands exactly on the target's point 4i.
-            #
-            # The clock still advances by the full span, so the target's own positions are
-            # unchanged. That is the point: the only thing this moves is the proxy.
             frame_time = temporal_position_grid(reference.num_latent_frames,
                                                 target_rotary_time if reference.time_aligned else rotary_time)
             rows_per_frame = frame_grid.shape[0]

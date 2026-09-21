@@ -1,0 +1,160 @@
+# MiniMax-H3 proxy-to-video, CWM LoRA recipe, `wn` regime, proxy time- and space-aligned.
+#
+# Held against `proxy_bd_wn_aligned_finetune.yaml`. Two things were wrong there, and this file
+# changes both:
+#
+#   * module set. CWM's released adapter is 200 Musubi modules: fused `qkv_proj`, `out_proj`,
+#     `mlp.fc1`, `mlp.fc2` across 50 blocks, ~596M at rank 128 (the paper figure, and the byte
+#     count of `minimax-h3-cwm.safetensors`). FastVideo splits QKV, so the matching set is
+#     `[to_q, to_k, to_v, to_out, fc_in, fc_out]` -- 300 modules, ~665M, because three A matrices
+#     replace one fused one. The earlier run's `[to_q, to_k, to_v, to_out]` is also 200 modules,
+#     but a different 200: attention only, SwiGLU frozen. That is why pred sat on "reasonable
+#     game RGB" and would not retexture. `token_refiner` / `time_embedder` / `camera_controlnet`
+#     still share those leaf names and stay in `exclude_lora_layers`.
+#   * space. `align_proxy_reference_time` now also puts proxy token (i, j) on the same rotary
+#     (h, w) as target token (4i, 4j). The 192x336 proxy pads 21 latent columns to 22, which
+#     used to rescale its own sqrt(area) grid and leave a 3.818 non-integer width stride --
+#     copy-the-proxy then shimmered and missed three corners. Packing samples the target's
+#     grid at integer stride 4 instead; the cache does not need re-encoding.
+#
+# Do not eval a checkpoint from `gta_v2_wn_aligned` or `gta_v2_*_aligned_fullft` with this code
+# and call it the same run: those trained against the unregistered spatial grid.
+#
+# Hyperparameters otherwise follow CWM: rank 128, alpha 128, video loss only, AdamW 2e-5, warmup
+# 100, cosine to 1e-6, grad-norm 1.0, BF16, global batch 8. FlashAttention-3 is not requested;
+# the plugin requires TORCH_SDPA.
+#
+# Sequence length is unchanged (~41.5k). Compare at matched steps against the attention-only
+# aligned LoRA with scripts/h3_proxy/compare_eval_predictions.py.
+
+models:
+  student:
+    _target_: fastvideo.train.models.minimax_h3.MiniMaxH3ProxyModel
+    # Must contain transformer_ref/: this plugin loads the Ref2VA partition, not the T2VA one.
+    init_from: /data/models/MiniMax-H3
+    trainable: true
+    enable_gradient_checkpointing_type: full
+    attention_backend: TORCH_SDPA
+
+    lora:
+      enable: true
+      rank: 128
+      # alpha defaults to rank, giving scale 1.0. CWM does not state alpha.
+      alpha: 128
+      # Substring-matched against the full parameter path. The two text-refiner blocks, the timestep
+      # MLP (also fc_in/fc_out after param_names_mapping) and the control trunk share these leaf
+      # names and are held out by the arch config's exclude_lora_layers.
+      #
+      # CWM's 200 is fused-QKV + out + SwiGLU. Split QKV makes it 300 here.
+      target_modules: [to_q, to_k, to_v, to_out, fc_in, fc_out]
+
+    # No trajectory in the KOF data, so there is nothing for the control trunk to read. With the
+    # branch off the DiT is the released model unchanged.
+    enable_camera_controlnet: false
+    enable_control_proxy: false
+    # LoRA *is* how this stage trains the backbone, so freezing it would leave nothing to optimize.
+    # The plugin rejects freeze_backbone=true together with lora.enable=true.
+    freeze_backbone: false
+    camera_dropout: 0.0
+
+    # --- reference conditioning ---
+    # Anchor first, proxy second: the cached text embedding was tokenized around `<Picture 1>` then
+    # `<Video 1>`, so this has to match how the data was encoded.
+    enable_anchor: true
+    # Proxy frame k shares the target's rotary time, and proxy token (i, j) shares the target's
+    # rotary (h, w) at stride 4. Must match `callbacks.validation.align_proxy_reference_time`.
+    align_proxy_reference_time: true
+    # `wn`: CWM hands the model 10 clean latent frames (34 video frames) of prefix. Must agree with
+    # the cache's `info["cwm_system"]`, which the plugin checks, and with the validation block.
+    num_given_latent_frames: 10
+    # "the audio loss is disabled" -- returning a video-only prediction is what tells the finetune
+    # loss to leave the audio head alone rather than train it against placeholder silence.
+    supervise_audio: false
+
+method:
+  _target_: fastvideo.train.methods.fine_tuning.finetune.FineTuneMethod
+
+training:
+  distributed:
+    # Sized for one node of 8. `hsdp_replicate_dim * hsdp_shard_dim` is passed straight to
+    # `init_device_mesh`, which rejects a mesh larger than the actual world size -- so these three
+    # numbers are not free tuning knobs, they have to agree with torchrun's process count:
+    #   nnodes * nproc_per_node == num_gpus == hsdp_replicate_dim * hsdp_shard_dim
+    # For 2 nodes, set num_gpus and hsdp_shard_dim to 16. CWM used sp_size 1; LoRA fits that.
+    num_gpus: 8
+    sp_size: 8
+    tp_size: 1
+    hsdp_replicate_dim: 1
+    hsdp_shard_dim: 8
+    pin_cpu_memory: true
+
+  data:
+    # Same wn cache as the attention-only aligned run. Registration is decided at pack time.
+    data_path: /data/binghe/h3_proxy/cache/gta_v2_cwm_wn
+    preprocessed_data_type: t2va
+    dataloader_num_workers: 2
+    train_batch_size: 1
+    training_cfg_rate: 0.0
+    seed: 42
+    num_frames: 124
+    num_latent_t: 37
+    num_height: 768
+    num_width: 1344
+
+  optimizer:
+    learning_rate: 2.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    lr_scheduler: cosine_with_min_lr
+    lr_warmup_steps: 100
+    min_lr_ratio: 0.05
+
+  loop:
+    max_train_steps: 3534
+    # global batch = (num_gpus / sp_size) * train_batch_size * this. CWM states 2e-5 at global 8.
+    gradient_accumulation_steps: 8
+
+  checkpoint:
+    output_dir: /data/binghe/h3_proxy/runs/gta_v2_wn_aligned_cwm/checkpoints
+    training_state_checkpointing_steps: 50
+    checkpoints_total_limit: 4
+    resume_from_checkpoint: ""
+
+  tracker:
+    trackers: [wandb]
+    project_name: fastvideo_h3_proxy
+    run_name: gta_v2_wn_aligned_cwm
+
+  model:
+    precondition_outputs: false
+    enable_gradient_checkpointing_type: full
+
+  dit_precision: bf16
+
+callbacks:
+  grad_clip:
+    _target_: fastvideo.train.callbacks.grad_clip.GradNormClipCallback
+    max_grad_norm: 1.0
+
+  validation:
+    _target_: fastvideo.train.callbacks.minimax_h3_proxy_validation.MiniMaxH3ProxyValidationCallback
+    pipeline_target: fastvideo.pipelines.basic.minimax_h3.minimax_h3_pipeline.MiniMaxH3RefPipeline
+    dataset_file: /data/binghe/h3_proxy/gta_v2_cwm_validation_val6.json
+    align_proxy_reference_time: true
+    num_given_latent_frames: 10
+    cwm_system_prompt: wn
+    every_steps: 0
+    run_at_start: false
+    sampling_steps: [50]
+    guidance_scale: 1.0
+    num_frames: 124
+    num_videos_per_prompt: 1
+    use_validation_media_conditioning: false
+    anchor_short_edge: 2048
+    panel_height: 384
+    offload_training_state: true
+    unload_pipeline_after_validation: true
+    text_encoder_cpu_offload: true
+    vae_cpu_offload: true
+
+pipeline: {}

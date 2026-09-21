@@ -301,11 +301,14 @@ parallel group through the same Ulysses all-to-all the backbone uses.
 
 ### LoRA
 
-Stage 1 adapts the backbone with LoRA rather than a full finetune, following CWM. The module set is
-the 4 attention projections across all 50 blocks, which is 200 adapted modules — the count
-`cwm_h3_inference/constants.py` pins as `EXPECTED_LORA_MODULES` and `strict_merge_lora` refuses to
-deviate from. That lands at ~321M trainable at rank 128. Adding the SwiGLU (`fc_in`/`fc_out`) would
-make it 300 modules and a differently-shaped adapter than the released one.
+Stage 1 adapts the backbone with LoRA rather than a full finetune, following CWM. Musubi's native
+H3 pattern is `attn.(qkv_proj|out_proj)|mlp.(fc1|fc2)` across all 50 blocks: 200 modules, ~596M at
+rank 128, which is also the size of the released CWM adapter. FastVideo splits the fused `qkv_proj`
+into `to_q`/`to_k`/`to_v`, so the matching set is `[to_q, to_k, to_v, to_out, fc_in, fc_out]` — 300
+modules, ~665M, because three independent A matrices replace one fused one. Attention-only (the
+earlier `gta_v2_wn_aligned` run) is 200 modules here but a different 200 from CWM's, and leaves the
+SwiGLU frozen. `strict_merge_lora` still asserts 200 because it loads CWM's fused-QKV file, not
+this adapter.
 
 Two things about how LoRA interacts with this plugin:
 
