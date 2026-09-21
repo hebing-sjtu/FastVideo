@@ -24,6 +24,7 @@ needed to rebuild it.
 | Target canvas | `--height` / `--width` | `training.data.num_height` / `num_width` | 768 x 1344 |
 | Proxy grid | `--proxy-height` / `--proxy-width` | `callbacks.validation.proxy_height` / `proxy_width` | 192 x 336 |
 | Anchor short edge | `--anchor-short-edge` | `callbacks.validation.anchor_short_edge` | 2048 |
+| Qwen proxy rate | `--qwen-video-fps` | `callbacks.validation.qwen_video_fps` | 24 fps |
 
 Both shipped YAMLs already set `anchor_short_edge: 2048`, so the usual mistake is not forgetting it
 but *overriding* it on the command line to match a cache that was itself built wrong.
@@ -61,7 +62,7 @@ to clip — 224 and 232 in the same cache is normal. Only the short edge has to 
 | `anchor_latent` | `(24, 1, h, w)` | appearance dictionary for the whole take, not a first frame |
 | `text_embedding` | `(tokens, 5120)` | Qwen3-VL, already wrapped in the CWM chat |
 | `text_token_tags` | `(tokens,)` | per-token modality tags |
-| `info` | dict | `num_frames`, `pixel_size`, `prompt`, `cwm_system` |
+| `info` | dict | `num_frames`, `pixel_size`, `prompt`, `cwm_system`, `qwen_video_fps` |
 | `camera_extrinsics` / `camera_intrinsics` | `(F, 4, 4)` / `(F, 3, 3)` | only when the trunk reads a trajectory |
 
 The proxy ControlNet variant (`enable_control_proxy`) adds **nothing** to this format. It replicates
@@ -78,9 +79,10 @@ being 768x1344 already.
 `info["pixel_size"]` is the one geometry the encoder records explicitly. The proxy grid and anchor
 short edge are not recorded and have to be recovered from the shapes.
 
-Because the text embedding is baked in, **changing the prompt text or the chat wrap requires
-re-encoding the text rows**. `--text-only` rewrites `text_embedding` and `text_token_tags` on
-existing `.pt` files without touching the latents or loading the VAE.
+Because the text embedding is baked in, **changing the prompt text, chat wrap, or Qwen proxy frame
+rate requires re-encoding the text rows**. `--text-only` rewrites `text_embedding` and
+`text_token_tags` on existing `.pt` files without touching the latents or loading the VAE. A cache
+without `info["qwen_video_fps"]` used the legacy hard-coded 2-fps presentation.
 
 ## Caches built so far
 
@@ -115,6 +117,7 @@ what the encoder was told, and none of them is checked against the cache.
 | --- | --- |
 | `anchor_short_edge` | the encoder's `--anchor-short-edge` |
 | `proxy_height` / `proxy_width` | the encoder's `--proxy-height` / `--proxy-width` |
+| `qwen_video_fps` | the encoder's `--qwen-video-fps` |
 | `cwm_system_prompt` | the encoder's `--cwm-system` |
 | `num_given_latent_frames` | `models.student.num_given_latent_frames`, and the regime `--cwm-system` names: 1 for `w0`, 10 for `wn` |
 

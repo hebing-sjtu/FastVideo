@@ -96,15 +96,34 @@ def test_reference_video_resize_and_truncate_matches_pinned_diffusers(monkeypatc
     assert np.shares_memory(expected, canvas_frames)
 
 
-def test_qwen_two_fps_sampling_and_timestamps_match_pinned_diffusers() -> None:
+def test_qwen_legacy_two_fps_sampling_and_timestamps_match_pinned_diffusers() -> None:
     frames = np.arange(25, dtype=np.uint8).reshape(-1, 1, 1, 1) * np.ones((1, 2, 2, 3), dtype=np.uint8)
 
-    sampled, timestamps = actual.sample_reference_video_frames(frames)
+    sampled, timestamps = actual.sample_reference_video_frames(frames, sample_fps=2.0)
     expected_sampled, expected_timestamps = reference.sample_reference_video_frames(frames)
 
     np.testing.assert_array_equal(np.stack(sampled), np.stack(expected_sampled))
     assert [int(frame[0, 0, 0]) for frame in sampled] == [0, 12, 24]
     assert timestamps == expected_timestamps == [0.25, 1.0]
+
+
+def test_qwen_reference_video_defaults_to_the_full_24_fps_timeline() -> None:
+    frames = np.arange(25, dtype=np.uint8).reshape(-1, 1, 1, 1) * np.ones((1, 2, 2, 3), dtype=np.uint8)
+
+    sampled, timestamps = actual.sample_reference_video_frames(frames)
+
+    assert [int(frame[0, 0, 0]) for frame in sampled] == list(range(25))
+    # Qwen's temporal patch is two frames. The odd final frame is padded into a thirteenth block.
+    assert len(timestamps) == 13
+    assert timestamps[0] == pytest.approx(1 / 48)
+    assert timestamps[-1] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("sample_fps", [0.0, -1.0, 24.1])
+def test_qwen_reference_video_rejects_an_invalid_sample_rate(sample_fps: float) -> None:
+    frames = np.zeros((2, 1, 1, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match=r"must be in \(0, 24\]"):
+        actual.sample_reference_video_frames(frames, sample_fps=sample_fps)
 
 
 @pytest.mark.parametrize("channels", [1, 2], ids=["mono", "stereo"])

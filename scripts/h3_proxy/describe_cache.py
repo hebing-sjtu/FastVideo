@@ -72,6 +72,9 @@ def geometry(sample: dict[str, Any]) -> dict[str, Any]:
             found["num_frames"] = int(info["num_frames"])
         if info.get("cwm_system") is not None:
             found["cwm_system"] = str(info["cwm_system"])
+        # Caches made before this field was added used the only implementation then available:
+        # a hard-coded 2-fps Qwen presentation.
+        found["qwen_video_fps"] = float(info.get("qwen_video_fps", 2.0))
     target = sample.get("vae_latent")
     if target is not None and "target" not in found:
         found["target"] = (target.shape[-2] * LATENT_TO_PIXEL, target.shape[-1] * LATENT_TO_PIXEL)
@@ -151,7 +154,7 @@ def describe(directory: Path, args: argparse.Namespace, *, quiet: bool = False) 
 
     if not quiet:
         for key in ("num_frames", "latent_frames", "target", "proxy", "anchor_canvas", "anchor_short_edge",
-                    "cwm_system", "camera"):
+                    "qwen_video_fps", "cwm_system", "camera"):
             if key in collected:
                 print(render(key, collected[key]))
 
@@ -165,15 +168,17 @@ def emit_flags(collected: dict[str, Any] | None, directory: Path) -> None:
     target = (collected or {}).get("target")
     anchor = (collected or {}).get("anchor_short_edge")
     proxy = (collected or {}).get("proxy")
-    if not target or not anchor or not proxy:
+    qwen_video_fps = (collected or {}).get("qwen_video_fps")
+    if not target or not anchor or not proxy or not qwen_video_fps:
         raise SystemExit(f"{directory}: cannot read the geometry, so there are no flags to emit.")
-    if len(target) > 1 or len(anchor) > 1 or len(proxy) > 1:
+    if len(target) > 1 or len(anchor) > 1 or len(proxy) > 1 or len(qwen_video_fps) > 1:
         raise SystemExit(f"{directory}: the cache is mixed, so no single set of flags consumes it.")
     height, width = next(iter(target))
     proxy_h, proxy_w = next(iter(proxy))
     print(f"--training.data.num_height {height} --training.data.num_width {width} "
           f"--callbacks.validation.anchor_short_edge {next(iter(anchor))} "
-          f"--callbacks.validation.proxy_height {proxy_h} --callbacks.validation.proxy_width {proxy_w}")
+          f"--callbacks.validation.proxy_height {proxy_h} --callbacks.validation.proxy_width {proxy_w} "
+          f"--callbacks.validation.qwen_video_fps {next(iter(qwen_video_fps))}")
 
 
 def print_flags(collected: dict[str, Any]) -> None:
@@ -192,12 +197,14 @@ def print_flags(collected: dict[str, Any]) -> None:
 
     proxy = collected.get("proxy")
     frames = collected.get("num_frames")
-    if proxy and frames and len(proxy) == 1 and len(frames) == 1:
+    qwen_video_fps = collected.get("qwen_video_fps")
+    if proxy and frames and qwen_video_fps and len(proxy) == 1 and len(frames) == 1 and len(qwen_video_fps) == 1:
         proxy_h, proxy_w = next(iter(proxy))
         print("\n  reproduce it with:")
         print(f"    --num-frames {next(iter(frames))} --height {height} --width {width} \\")
         print(f"    --proxy-height {proxy_h} --proxy-width {proxy_w} \\")
-        print(f"    --anchor-short-edge {next(iter(anchor))}")
+        print(f"    --anchor-short-edge {next(iter(anchor))} "
+              f"--qwen-video-fps {next(iter(qwen_video_fps))}")
 
 
 def main() -> None:

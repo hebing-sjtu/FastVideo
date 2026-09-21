@@ -25,7 +25,9 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
 )
 
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
-MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
+# Ref2VA's proxy is motion conditioning, not a generic video thumbnail. Keep its full H3
+# timeline by default; callers reproducing the legacy cache can still request 2 fps explicitly.
+MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = float(MINIMAX_H3_FPS)
 MINIMAX_H3_QWEN_TEMPORAL_PATCH = 2
 MINIMAX_H3_MAX_REFERENCE_IMAGES = 9
 MINIMAX_H3_MAX_REFERENCE_VIDEOS = 3
@@ -292,18 +294,27 @@ def prepare_reference_frames(
         [np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames])
 
 
-def sample_reference_video_frames(frames: np.ndarray) -> tuple[list[np.ndarray], list[float]]:
-    """Sample the released 2-fps Qwen presentation and its block timestamps."""
+def sample_reference_video_frames(
+    frames: np.ndarray,
+    sample_fps: float = MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+) -> tuple[list[np.ndarray], list[float]]:
+    """Sample a 24-fps reference for Qwen and return temporal-patch timestamps.
+
+    Proxy motion can change substantially between adjacent frames, so the default preserves every
+    frame. ``sample_fps=2`` remains available to reproduce caches made before the full-rate path.
+    """
     if frames.ndim != 4 or frames.shape[0] == 0:
         raise ValueError("A prepared reference video must contain frames.")
-    stride = MINIMAX_H3_FPS / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS
+    if not 0 < sample_fps <= MINIMAX_H3_FPS:
+        raise ValueError(f"Qwen video sample fps must be in (0, {MINIMAX_H3_FPS}], got {sample_fps}.")
+    stride = MINIMAX_H3_FPS / sample_fps
     indices: list[int] = []
     cursor = 0.0
     while round(cursor) < frames.shape[0]:
         if not indices or round(cursor) > indices[-1]:
             indices.append(round(cursor))
         cursor += stride
-    timestamps = [index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(len(indices))]
+    timestamps = [index / sample_fps for index in range(len(indices))]
     timestamps += [timestamps[-1]] * (-len(timestamps) % MINIMAX_H3_QWEN_TEMPORAL_PATCH)
     block_timestamps = [(timestamps[index] + timestamps[index + MINIMAX_H3_QWEN_TEMPORAL_PATCH - 1]) / 2
                         for index in range(0, len(timestamps), MINIMAX_H3_QWEN_TEMPORAL_PATCH)]

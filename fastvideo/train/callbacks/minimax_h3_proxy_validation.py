@@ -49,6 +49,8 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         anchor_short_edge: int = 2048,
         proxy_height: int = 192,
         proxy_width: int = 336,
+        # Keep old run configs reproducible. New full-rate caches set this explicitly to 24.
+        qwen_video_fps: float = 2.0,
         align_proxy_reference_time: bool = False,
         cwm_system_prompt: str = "w0",
         num_given_latent_frames: int = 1,
@@ -111,6 +113,9 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         # reference rows instead of 2442, from LANCZOS-upsampled frames. For a DUV proxy that
         # resampling is not merely off-distribution, it averages unrelated depth codes.
         self.proxy_size = (int(proxy_height), int(proxy_width))
+        self.qwen_video_fps = float(qwen_video_fps)
+        if not 0 < self.qwen_video_fps <= 24:
+            raise ValueError(f"qwen_video_fps must be in (0, 24], got {qwen_video_fps!r}.")
         # Must equal `models.student.align_proxy_reference_time`. Sampling a time-aligned run
         # without it presents the proxy a clip earlier than training ever did, which reads as a bad
         # checkpoint rather than as a mismatch.
@@ -181,6 +186,11 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
 
         if self.cwm_system_prompt and self.cwm_system_prompt != "none":
             batch.extra[CWM_SYSTEM_PROMPT_KEY] = self.cwm_system_prompt
+
+        from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_conditioning import (
+            MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY, )
+
+        batch.extra[MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY] = self.qwen_video_fps
 
         if self.num_given_latent_frames:
             from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import (

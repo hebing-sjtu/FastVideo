@@ -148,6 +148,14 @@ python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \
     --model-path /data/models/MiniMax-H3
 ```
 
+`--qwen-video-fps` controls only the `<Video 1>` frames presented to Qwen while producing
+`text_embedding`; it defaults to 24, so a 124-frame proxy contributes all 124 frames. The proxy VAE
+path always encodes the full clip independently. Caches made before this option existed used a
+hard-coded 2 fps. Do not overwrite one with the other: copy the old cache to a new directory and
+run `--text-only --qwen-video-fps 24`, which preserves every latent and rewrites only
+`text_embedding`, `text_token_tags`, and their metadata. `describe_cache.py` reports the rate and
+`eval_checkpoint.sh` forwards it to validation.
+
 That is one process on one GPU. For a set of any size, fan it across the node instead — the wrapper
 takes the same arguments and adds `--shard-index` / `--num-shards` per process:
 

@@ -28,7 +28,11 @@ from fastvideo.pipelines.basic.minimax_h3.cwm_presentation import (
     resolve_cwm_system_role,
     wrap_ref2va_chat,
 )
-from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference, sample_reference_video_frames
+from fastvideo.pipelines.basic.minimax_h3.reference import (
+    MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+    MiniMaxH3PreparedReference,
+    sample_reference_video_frames,
+)
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation import MINIMAX_H3_KEYFRAMES_KEY
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
@@ -36,6 +40,7 @@ from fastvideo.pipelines.stages.validators import StageValidators as V
 from fastvideo.pipelines.stages.validators import VerificationResult
 
 MINIMAX_H3_TEXT_TOKEN_TAGS_KEY = "minimax_h3_text_token_tags"
+MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY = "minimax_h3_qwen_video_sample_fps"
 
 
 def _token_ids(tokenized: Any) -> list[int]:
@@ -258,7 +263,11 @@ class MiniMaxH3ConditioningStage(PipelineStage):
         if videos:
             if any(reference.frames is None for reference in videos):
                 raise ValueError("MiniMax-H3 reference videos must be prepared before conditioning.")
-            sampled = [sample_reference_video_frames(reference.frames) for reference in videos]
+            qwen_video_fps = float(
+                batch.extra.get(MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY, MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS))
+            sampled = [
+                sample_reference_video_frames(reference.frames, sample_fps=qwen_video_fps) for reference in videos
+            ]
             for reference, (_, timestamps) in zip(videos, sampled, strict=True):
                 reference.block_timestamps = timestamps
             vision = self.processor.video_processor(

@@ -87,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     # costs ~1/16 the tokens of a full-resolution one. 336x192 is the released CWM geometry.
     parser.add_argument("--proxy-height", type=int, default=192)
     parser.add_argument("--proxy-width", type=int, default=336)
+    parser.add_argument(
+        "--qwen-video-fps",
+        type=float,
+        default=24.0,
+        help="Frame rate presented to Qwen for <Video 1>. The proxy VAE always encodes all 24-fps frames. "
+        "Use 2 only to reproduce a legacy text cache.",
+    )
     # The released short edge, which CWM also uses. It costs ~7x the anchor tokens of a 768 canvas
     # -- both as Qwen vision tokens and as Ref2VA reference rows -- and buys detail the target
     # canvas cannot show. That trade only looks bad if the anchor is treated as a picture of the
@@ -115,6 +122,8 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(f"--num-frames must satisfy n %% 17 == 5 for the H3 causal VAE, got {args.num_frames}")
     if not 0 <= args.shard_index < args.num_shards:
         raise SystemExit("--shard-index must be in [0, --num-shards)")
+    if not 0 < args.qwen_video_fps <= 24:
+        raise SystemExit(f"--qwen-video-fps must be in (0, 24], got {args.qwen_video_fps}")
     return args
 
 
@@ -232,7 +241,15 @@ class Encoders:
     encoder per clip would dominate the run.
     """
 
-    def __init__(self, model_path: Path, device: str, *, text_only: bool = False, cwm_system: str = "w0") -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        device: str,
+        *,
+        text_only: bool = False,
+        cwm_system: str = "w0",
+        qwen_video_fps: float = 24.0,
+    ) -> None:
         from fastvideo.configs.pipelines.minimax_h3 import MiniMaxH3PipelineConfig
         from fastvideo.fastvideo_args import FastVideoArgs
         from fastvideo.models.loader.component_loader import PipelineComponentLoader
@@ -242,6 +259,7 @@ class Encoders:
         self.device = torch.device(device)
         self.model_path = model_path
         self.cwm_system = "" if cwm_system == "none" else cwm_system
+        self.qwen_video_fps = float(qwen_video_fps)
         self.model_index = verify_model_config_and_directory(str(model_path))
         self.fastvideo_args = FastVideoArgs(
             model_path=str(model_path),
@@ -315,6 +333,7 @@ class Encoders:
         from fastvideo.pipelines import ForwardBatch
         from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
         from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_conditioning import (
+            MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY,
             MINIMAX_H3_TEXT_TOKEN_TAGS_KEY, )
 
         from fastvideo.pipelines.basic.minimax_h3.cwm_presentation import CWM_SYSTEM_PROMPT_KEY
@@ -323,6 +342,7 @@ class Encoders:
         role = self.cwm_system if cwm_system is None else ("" if cwm_system == "none" else cwm_system)
         if role:
             batch.extra[CWM_SYSTEM_PROMPT_KEY] = role
+        batch.extra[MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY] = self.qwen_video_fps
         batch.references = [
             MiniMaxH3PreparedReference(media_type="image", image=anchor),
             MiniMaxH3PreparedReference(media_type="video", frames=proxy_preview),
@@ -407,6 +427,7 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
         "info": {
             "num_frames": int(args.num_frames),
             "pixel_size": (int(args.height), int(args.width)),
+            "qwen_video_fps": float(args.qwen_video_fps),
             "prompt": str(entry["prompt"]),
             "cwm_system": role,
         },
@@ -461,6 +482,7 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
     info = dict(sample.get("info") or {})
     info["prompt"] = str(entry["prompt"])
     info["cwm_system"] = role
+    info["qwen_video_fps"] = float(args.qwen_video_fps)
     sample["info"] = info
     return sample
 
@@ -515,6 +537,7 @@ def main() -> None:
         device=args.device,
         text_only=args.text_only,
         cwm_system=args.cwm_system,
+        qwen_video_fps=args.qwen_video_fps,
     )
 
     written = skipped = failed = 0
