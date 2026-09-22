@@ -154,7 +154,30 @@ def vertex_credentials() -> tuple[Any, str, str]:
         path = Path(json_path).expanduser().resolve()
         if not path.is_file():
             raise SystemExit(f"Vertex service-account JSON does not exist: {path}")
-        credentials = service_account.Credentials.from_service_account_file(str(path), scopes=[scope])
+        try:
+            raw_info = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            size = path.stat().st_size
+            raise SystemExit(
+                f"Vertex service-account file is not valid JSON: {path} ({size} bytes; "
+                f"{error.msg} at line {error.lineno}, column {error.colno}). "
+                "Use the downloaded Google service-account JSON, not a .env file or placeholder. "
+                "If credentials are stored as VERTEX_PROJECT/VERTEX_CLIENT_EMAIL/"
+                "VERTEX_PRIVATE_KEY variables, unset VERTEX_SA_JSON instead."
+            ) from error
+        if not isinstance(raw_info, dict):
+            raise SystemExit(f"Vertex service-account JSON must hold one object: {path}")
+        missing = [
+            key
+            for key in ("project_id", "client_email", "private_key")
+            if not str(raw_info.get(key) or "").strip()
+        ]
+        if missing:
+            raise SystemExit(
+                f"Vertex service-account JSON is missing {', '.join(missing)}: {path}. "
+                "This is not a Google service-account key file."
+            )
+        credentials = service_account.Credentials.from_service_account_info(raw_info, scopes=[scope])
         project = os.environ.get("VERTEX_PROJECT") or os.environ.get("VERTEX_PROJECT_ID")
         project = project or credentials.project_id
         return credentials, str(project), location
