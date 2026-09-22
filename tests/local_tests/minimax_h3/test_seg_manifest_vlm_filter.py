@@ -158,13 +158,14 @@ N/A"""
 
     result = builder.adapt_native_h3_prompt(source)
 
-    assert result.startswith("subject_definitions:\n<Video 1> is the colored proxy/src")
+    assert result.startswith("subject_definitions:\n<Video 1> is the packed DUV proxy")
     assert "<Picture 2>" not in result
     assert "<Subject 1> is A man wearing a teal jacket, matching <Picture 1>." in result
     assert "<Subject 1>: fully_preserved - appearance from <Picture 1> and placement." in result
     assert "[Shot 1] The camera orbits left while <Subject 1> walks away." in result
     assert "Old instructions" not in result
-    assert "Never copy the proxy false-color look." in result
+    assert "Never copy the DUV false-color look." in result
+    assert "- R: inverse-log depth over 0.3-256 m; near is bright" in result
 
 
 def test_native_h3_prompt_keeps_an_unlabelled_legacy_detailed_description() -> None:
@@ -198,6 +199,41 @@ N/A"""
     assert "The camera follows the man" in result
     assert "<Picture 2>" not in result
     assert "ending with the lighting shown by <Picture 1>" in result
+
+
+def test_low_high_raw_observation_is_preferred_and_legacy_pipeline_locks_are_not_copied(
+    tmp_path: Path,
+) -> None:
+    builder = _load("build_native_h3_proxy_captions")
+    motion_dir = tmp_path / "high_motion"
+    motion_dir.mkdir()
+    (motion_dir / "seg_0000.txt").write_text(
+        "[Shot 1] A tracking camera follows <Subject 1> through the city.\n\n"
+        "BODY UPGRADE: stale generation-side instruction."
+    )
+    (motion_dir / "seg_0000_subject.txt").write_text(
+        "<Subject 1> is a man in a teal jacket and white sneakers.\n"
+    )
+
+    result, source = builder.caption_for_clip(tmp_path, "seg_0000")
+
+    assert source == "low_high high_motion"
+    assert "<Subject 1> is a man in a teal jacket and white sneakers." in result
+    assert "A tracking camera follows <Subject 1> through the city." in result
+    assert "stale generation-side instruction" not in result
+    assert "RGB target motion/layout narration" in result
+
+
+def test_packed_low_high_prompt_extracts_the_generated_shot_after_its_marker() -> None:
+    builder = _load("build_native_h3_proxy_captions")
+    detail = """Old DUV wording.
+
+RGB HIGH-src motion/layout narration (Gemini watched color.mp4):
+[Shot 1] The camera arcs left around <Subject 1>.
+
+FACE LOCK: old generation-only lock."""
+
+    assert builder.shot_narration(detail) == "[Shot 1] The camera arcs left around <Subject 1>."
 
 
 def test_the_semantic_code_indexes_u_fastest_like_cwm_does() -> None:
