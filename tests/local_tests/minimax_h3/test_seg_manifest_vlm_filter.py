@@ -127,6 +127,46 @@ def test_the_teacher_edit_instruction_needs_an_explicit_opt_in(tmp_path: Path) -
     assert text.startswith("<Video 1>")
 
 
+def test_native_h3_prompt_is_adapted_to_duv_and_one_picture_without_losing_the_vlm_observation() -> None:
+    builder = _load("build_native_h3_proxy_captions")
+    source = """subject_definitions:
+<Video 1> is the ordinary source video.
+<Picture 1> is the opening keyframe.
+<Picture 2> is the closing keyframe.
+<Subject 1> is A man wearing a teal jacket.
+
+summary:
+[video editing + keyframe completion] Old contract.
+
+retention_analysis:
+<Video 1>: partially_preserved - old source.
+<Picture 1>: partially_preserved - opening.
+<Picture 2>: partially_preserved - closing.
+<Subject 1>: fully_preserved - appearance and placement.
+
+detailed_description:
+Old instructions involving <Picture 2>.
+
+TGT RGB motion/layout narration (Gemini watched the photoreal target):
+[Shot 1] The camera orbits left while <Subject 1> walks away.
+
+overall_soundscape:
+N/A
+
+non_diegetic_music:
+N/A"""
+
+    result = builder.adapt_native_h3_prompt(source)
+
+    assert result.startswith("subject_definitions:\n<Video 1> is the colored proxy/src")
+    assert "<Picture 2>" not in result
+    assert "<Subject 1> is A man wearing a teal jacket." in result
+    assert "<Subject 1>: fully_preserved - appearance and placement." in result
+    assert "[Shot 1] The camera orbits left while <Subject 1> walks away." in result
+    assert "Old instructions" not in result
+    assert "Never copy the proxy false-color look." in result
+
+
 def test_the_semantic_code_indexes_u_fastest_like_cwm_does() -> None:
     """``(U[label % 4], V[label // 4])``, not the cartesian product in the other order.
 
