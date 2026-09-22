@@ -133,7 +133,7 @@ def test_native_h3_prompt_is_adapted_to_duv_and_one_picture_without_losing_the_v
 <Video 1> is the ordinary source video.
 <Picture 1> is the opening keyframe.
 <Picture 2> is the closing keyframe.
-<Subject 1> is A man wearing a teal jacket.
+<Subject 1> is A man wearing a teal jacket, matching <Picture 2>.
 
 summary:
 [video editing + keyframe completion] Old contract.
@@ -142,7 +142,7 @@ retention_analysis:
 <Video 1>: partially_preserved - old source.
 <Picture 1>: partially_preserved - opening.
 <Picture 2>: partially_preserved - closing.
-<Subject 1>: fully_preserved - appearance and placement.
+<Subject 1>: fully_preserved - appearance from <Picture 2> and placement.
 
 detailed_description:
 Old instructions involving <Picture 2>.
@@ -160,8 +160,8 @@ N/A"""
 
     assert result.startswith("subject_definitions:\n<Video 1> is the colored proxy/src")
     assert "<Picture 2>" not in result
-    assert "<Subject 1> is A man wearing a teal jacket." in result
-    assert "<Subject 1>: fully_preserved - appearance and placement." in result
+    assert "<Subject 1> is A man wearing a teal jacket, matching <Picture 1>." in result
+    assert "<Subject 1>: fully_preserved - appearance from <Picture 1> and placement." in result
     assert "[Shot 1] The camera orbits left while <Subject 1> walks away." in result
     assert "Old instructions" not in result
     assert "Never copy the proxy false-color look." in result

@@ -147,7 +147,10 @@ def adapt_native_h3_prompt(text: str) -> str:
         "non_diegetic_music:",
         sections.get("non_diegetic_music") or "N/A",
     ]
-    result = "\n".join(output).strip()
+    # Subject definitions and retention blocks are preserved from the VLM prompt, and some legacy
+    # prompts mention the closing keyframe inside those blocks too. This pipeline presents one
+    # appearance anchor, so every such reference names that anchor consistently.
+    result = "\n".join(output).strip().replace("<Picture 2>", "<Picture 1>")
     if "<Picture 2>" in result:
         raise AssertionError("adapted prompt still refers to an input the pipeline does not present")
     return result
