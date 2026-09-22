@@ -224,6 +224,30 @@ def test_low_high_raw_observation_is_preferred_and_legacy_pipeline_locks_are_not
     assert "RGB target motion/layout narration" in result
 
 
+def test_colleague_prompt_style_uses_visual_proxy_language_without_numeric_channel_lecture(
+    tmp_path: Path,
+) -> None:
+    builder = _load("build_native_h3_proxy_captions")
+    motion_dir = tmp_path / "high_motion"
+    motion_dir.mkdir()
+    (motion_dir / "seg_0000.txt").write_text(
+        "[Shot 1] The camera tracks <Subject 1> walking away."
+    )
+    (motion_dir / "seg_0000_subject.txt").write_text("A man in a teal jacket.")
+
+    result, _ = builder.caption_for_clip(
+        tmp_path,
+        "seg_0000",
+        prompt_style="colleague",
+    )
+
+    assert "colored proxy/src of this same shot" in result
+    assert "magenta/purple road" in result
+    assert "Decode <Video 1> as a colored semantic/layout proxy" in result
+    assert "(G,B) classes:" not in result
+    assert "inverse-log depth" not in result
+
+
 def test_packed_low_high_prompt_extracts_the_generated_shot_after_its_marker() -> None:
     builder = _load("build_native_h3_proxy_captions")
     detail = """Old DUV wording.

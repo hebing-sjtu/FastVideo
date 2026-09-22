@@ -34,7 +34,7 @@ You write MiniMax-H3 detailed_description motion bodies.
 Return JSON only: {"detailed_description": "...", "subject_one_line": "..."}.
 No markdown fences."""
 
-USER = """\
+DETAILED_USER = """\
 The attached video is the HIGH-FIDELITY RGB target gameplay clip: 124 frames at 24 fps,
 approximately 5.17 seconds. It is the motion twin of a packed DUV proxy that will be labeled
 <Video 1> in MiniMax-H3. Watch this HIGH RGB video, not the DUV proxy.
@@ -52,6 +52,28 @@ type, hair, wardrobe, carried objects, and other stable appearance cues. Do not 
 
 Return JSON only."""
 
+COLLEAGUE_USER = """\
+The attached video is the photoreal RGB target clip: 124 frames at 24 fps, approximately
+5.17 seconds. It is the motion twin of a colored semantic/layout proxy labeled <Video 1>.
+Watch this RGB target to name what happens; <Video 1> remains the authority for geometry and timing.
+
+Write:
+1) detailed_description -- start with "[Shot 1]" and describe one continuous take in 100-180 words.
+Concentrate on camera path and framing, <Subject 1> screen-space facing/yaw, path, action order and
+gait, plus only other movers that materially interact with the shot. Use concrete natural visual
+language. Do not inventory static scenery, explain channels or prompt mechanics, or add events.
+Do not use timestamps. Mention <Video 1> once as the motion/layout authority; do not repeat the
+contract in every sentence.
+2) subject_one_line -- one concise sentence defining <Subject 1> from visible stable appearance:
+person or vehicle type, hair, wardrobe, carried objects, and other identity cues.
+
+Return JSON only."""
+
+NARRATION_STYLES = {
+    "detailed": DETAILED_USER,
+    "colleague": COLLEAGUE_USER,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -59,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", required=True, help="Writes <out-root>/high_motion/.")
     parser.add_argument("--backend", choices=("vertex", "developer"), default="vertex")
     parser.add_argument("--model", default=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"))
+    parser.add_argument(
+        "--narration-style",
+        choices=tuple(NARRATION_STYLES),
+        default="detailed",
+        help="'colleague' writes the shorter motion-focused prose used by the successful prompt.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=3.0)
     return parser.parse_args()
@@ -111,7 +139,13 @@ def wait_until_ready(client: Any, uploaded: Any, poll_seconds: float) -> Any:
         uploaded = client.files.get(name=uploaded.name)
 
 
-def generate_developer(client: Any, model: str, video: Path, poll_seconds: float) -> tuple[str, str]:
+def generate_developer(
+    client: Any,
+    model: str,
+    video: Path,
+    poll_seconds: float,
+    instruction: str,
+) -> tuple[str, str]:
     from google.genai import types
 
     uploaded = wait_until_ready(client, client.files.upload(file=str(video)), poll_seconds)
@@ -122,7 +156,7 @@ def generate_developer(client: Any, model: str, video: Path, poll_seconds: float
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part.from_text(text=USER),
+                        types.Part.from_text(text=instruction),
                         types.Part.from_uri(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
                     ],
                 )
@@ -214,7 +248,13 @@ def vertex_credentials() -> tuple[Any, str, str]:
     return credentials, str(project), location
 
 
-def generate_vertex(client: Any, model: str, video: Path, clip_id: str) -> tuple[str, str]:
+def generate_vertex(
+    client: Any,
+    model: str,
+    video: Path,
+    clip_id: str,
+    instruction: str,
+) -> tuple[str, str]:
     from google.genai import types
 
     config: dict[str, Any] = {
@@ -238,7 +278,7 @@ def generate_vertex(client: Any, model: str, video: Path, clip_id: str) -> tuple
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part.from_text(text=USER),
+                        types.Part.from_text(text=instruction),
                         types.Part.from_bytes(data=video.read_bytes(), mime_type="video/mp4"),
                     ],
                 )
@@ -280,6 +320,7 @@ def main() -> None:
     out_dir = Path(args.out_root).expanduser() / "high_motion"
     out_dir.mkdir(parents=True, exist_ok=True)
     client = build_client(args.backend)
+    instruction = NARRATION_STYLES[args.narration_style]
     generated = reused = 0
     for record in records:
         clip_id = str(record.get("id") or "")
@@ -292,11 +333,20 @@ def main() -> None:
             reused += 1
             continue
         video = target_video(record)
-        print(f"{clip_id}: Vertex Gemini {args.model} <- {video}", flush=True)
+        print(
+            f"{clip_id}: Vertex Gemini {args.model} ({args.narration_style}) <- {video}",
+            flush=True,
+        )
         if args.backend == "vertex":
-            detail, subject = generate_vertex(client, args.model, video, clip_id)
+            detail, subject = generate_vertex(client, args.model, video, clip_id, instruction)
         else:
-            detail, subject = generate_developer(client, args.model, video, args.poll_seconds)
+            detail, subject = generate_developer(
+                client,
+                args.model,
+                video,
+                args.poll_seconds,
+                instruction,
+            )
         detail_path.write_text(detail + "\n", encoding="utf-8")
         subject_path.write_text(subject + "\n", encoding="utf-8")
         generated += 1
