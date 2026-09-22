@@ -115,9 +115,12 @@ def adapt_native_h3_prompt(text: str) -> str:
 
     detail = sections["detailed_description"]
     marker = detail.find(NARRATION_MARKER)
-    if marker < 0:
-        raise ValueError(f"native H3 detailed_description has no {NARRATION_MARKER!r}")
-    narration = detail[marker:].strip()
+    # The colleague's newer prompt labels this subsection explicitly. The GTA v2 prompts predate
+    # that label and put the same VLM-written shot narration directly under detailed_description.
+    # Both are useful observations; the marker is formatting, not evidence. A legacy mention of the
+    # closing keyframe is redirected to the sole appearance anchor rather than leaving the model a
+    # reference token that is absent from the presentation.
+    narration = (detail[marker:] if marker >= 0 else detail).replace("<Picture 2>", "<Picture 1>").strip()
 
     output = [
         "subject_definitions:",

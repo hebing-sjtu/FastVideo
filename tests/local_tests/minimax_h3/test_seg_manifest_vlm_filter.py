@@ -167,6 +167,39 @@ N/A"""
     assert "Never copy the proxy false-color look." in result
 
 
+def test_native_h3_prompt_keeps_an_unlabelled_legacy_detailed_description() -> None:
+    builder = _load("build_native_h3_proxy_captions")
+    source = """subject_definitions:
+<Video 1> old
+<Picture 1> old
+<Picture 2> old
+<Subject 1> is A man.
+
+summary:
+old
+
+retention_analysis:
+<Video 1>: old
+<Picture 1>: old
+<Picture 2>: old
+<Subject 1>: fully_preserved - same man.
+
+detailed_description:
+[Shot 1] The camera follows the man, ending with the lighting shown by <Picture 2>.
+
+overall_soundscape:
+N/A
+
+non_diegetic_music:
+N/A"""
+
+    result = builder.adapt_native_h3_prompt(source)
+
+    assert "The camera follows the man" in result
+    assert "<Picture 2>" not in result
+    assert "ending with the lighting shown by <Picture 1>" in result
+
+
 def test_the_semantic_code_indexes_u_fastest_like_cwm_does() -> None:
     """``(U[label % 4], V[label // 4])``, not the cartesian product in the other order.
 
