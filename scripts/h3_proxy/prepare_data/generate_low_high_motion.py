@@ -214,28 +214,49 @@ def vertex_credentials() -> tuple[Any, str, str]:
     return credentials, str(project), location
 
 
-def generate_vertex(client: Any, model: str, video: Path) -> tuple[str, str]:
+def generate_vertex(client: Any, model: str, video: Path, clip_id: str) -> tuple[str, str]:
     from google.genai import types
 
-    response = client.models.generate_content(
-        model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(text=USER),
-                    types.Part.from_bytes(data=video.read_bytes(), mime_type="video/mp4"),
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM,
-            response_mime_type="application/json",
-            temperature=0.2,
-            max_output_tokens=4000,
-        ),
-    )
-    return parse_response(str(response.text or ""), video.stem)
+    config: dict[str, Any] = {
+        "system_instruction": SYSTEM,
+        "response_mime_type": "application/json",
+        "max_output_tokens": 4000,
+    }
+    # This is the same exception low_high_pipeline's VertexClient applies. Gemini 3.8 spends the
+    # output budget on hidden reasoning unless LOW is explicit, leaving a JSON object cut off before
+    # its closing quote/brace. It also rejects the older temperature/thinking combination.
+    if model.startswith("gemini-3.8"):
+        config["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
+    else:
+        config["temperature"] = 0.2
+
+    last_error: ValueError | None = None
+    for attempt in range(1, 4):
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(text=USER),
+                        types.Part.from_bytes(data=video.read_bytes(), mime_type="video/mp4"),
+                    ],
+                )
+            ],
+            config=types.GenerateContentConfig(**config),
+        )
+        try:
+            return parse_response(str(response.text or ""), clip_id)
+        except ValueError as error:
+            last_error = error
+            candidates = getattr(response, "candidates", None) or []
+            finish = getattr(candidates[0], "finish_reason", "unknown") if candidates else "no candidate"
+            if attempt < 3:
+                print(
+                    f"{clip_id}: incomplete Gemini JSON (finish={finish}), retry {attempt}/3",
+                    flush=True,
+                )
+    raise last_error  # type: ignore[misc]
 
 
 def build_client(backend: str) -> Any:
@@ -273,7 +294,7 @@ def main() -> None:
         video = target_video(record)
         print(f"{clip_id}: Vertex Gemini {args.model} <- {video}", flush=True)
         if args.backend == "vertex":
-            detail, subject = generate_vertex(client, args.model, video)
+            detail, subject = generate_vertex(client, args.model, video, clip_id)
         else:
             detail, subject = generate_developer(client, args.model, video, args.poll_seconds)
         detail_path.write_text(detail + "\n", encoding="utf-8")
