@@ -236,6 +236,34 @@ FACE LOCK: old generation-only lock."""
     assert builder.shot_narration(detail) == "[Shot 1] The camera arcs left around <Subject 1>."
 
 
+def test_gemini_motion_response_requires_the_two_low_high_observations() -> None:
+    generator = _load("generate_low_high_motion")
+    detail, subject = generator.parse_response(
+        json.dumps(
+            {
+                "detailed_description": "[Shot 1] The camera tracks the player down the boulevard.",
+                "subject_one_line": "A man in a teal jacket and white sneakers.",
+            }
+        ),
+        "seg_0000",
+    )
+
+    assert detail.startswith("[Shot 1]")
+    assert subject == "A man in a teal jacket and white sneakers."
+
+
+def test_gemini_motion_uses_the_validation_target_not_the_false_colour_proxy(tmp_path: Path) -> None:
+    generator = _load("generate_low_high_motion")
+    target = tmp_path / "rgb.mp4"
+    proxy = tmp_path / "duv.mp4"
+    target.write_bytes(b"rgb")
+    proxy.write_bytes(b"duv")
+
+    assert generator.target_video(
+        {"target_path": str(target), "proxy_path": str(proxy)}
+    ) == target
+
+
 def test_the_semantic_code_indexes_u_fastest_like_cwm_does() -> None:
     """``(U[label % 4], V[label // 4])``, not the cartesian product in the other order.
 
