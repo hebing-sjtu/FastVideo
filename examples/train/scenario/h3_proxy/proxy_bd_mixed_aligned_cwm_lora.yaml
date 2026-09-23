@@ -92,12 +92,12 @@ training:
     pin_cpu_memory: true
 
   data:
-    # The same clips twice, once under each contract. Equal weights because the release gives the
-    # two prompts equal standing; raise wn's repeat if a take is many windows long and w0 is the
-    # rarer event in deployment.
+    # The current 768x1344/Qwen-24FPS clips twice, once under each contract. Equal weights because
+    # the release gives the two prompts equal standing; raise wn's repeat if a take is many windows
+    # long and w0 is the rarer event in deployment.
     data_path:
-      /data/binghe/h3_proxy/cache/gta_v2_cwm: 1
-      /data/binghe/h3_proxy/cache/gta_v2_cwm_wn: 1
+      /data/binghe/h3_proxy/cache/gta_v2_cwm_1344_qwen24: 1
+      /data/binghe/h3_proxy/cache/gta_v2_cwm_1344_qwen24_wn: 1
     preprocessed_data_type: t2va
     dataloader_num_workers: 2
     train_batch_size: 1

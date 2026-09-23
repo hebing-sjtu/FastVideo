@@ -119,8 +119,8 @@ training:
     pin_cpu_memory: true
 
   data:
-    # Same wn cache as the attention-only aligned run. Registration is decided at pack time.
-    data_path: /data/binghe/h3_proxy/cache/gta_v2_cwm_wn
+    # Current 768x1344 cache with the Qwen 24 FPS prompt; registration is decided at pack time.
+    data_path: /data/binghe/h3_proxy/cache/gta_v2_cwm_1344_qwen24_wn
     preprocessed_data_type: t2va
     dataloader_num_workers: 2
     train_batch_size: 1
