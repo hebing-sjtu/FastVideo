@@ -174,6 +174,34 @@ class TrainingMethod(torch.nn.Module, ABC):
             except TypeError:
                 optimizer.zero_grad()
 
+    def synchronize_gradients(self, iteration: int) -> None:
+        """Synchronize trainable parameters added after distributed wrapping."""
+        del iteration
+        from fastvideo.train.utils.lora import synchronize_lora_gradients
+
+        synchronized = 0
+        for model in self._role_models.values():
+            if getattr(model, "_trainable", False):
+                synchronized += synchronize_lora_gradients(model.transformer)
+        if synchronized and not getattr(self, "_logged_lora_gradient_sync", False):
+            logger.info(
+                "Averaging %d replicated LoRA gradients before clipping and optimizer step",
+                synchronized,
+            )
+            self._logged_lora_gradient_sync = True
+
+    def optimizer_lr_metrics(self) -> dict[str, float]:
+        """Return the learning rates that the next optimizer step will use."""
+        metrics: dict[str, float] = {}
+        for role, optimizer in self._optimizer_dict.items():
+            if optimizer is None:
+                continue
+            groups = optimizer.param_groups
+            for index, group in enumerate(groups):
+                suffix = "" if len(groups) == 1 else f"/group_{index}"
+                metrics[f"learning_rate/{role}{suffix}"] = float(group["lr"])
+        return metrics
+
     def seed_optimizer_state_for_resume(self) -> None:
         """Seed optimizer state so DCP can load saved state.
 

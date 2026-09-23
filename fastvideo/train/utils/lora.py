@@ -189,6 +189,50 @@ def _replicate_lora_parameters(transformer: torch.nn.Module, ) -> None:
             setattr(module, attr_name, nn.Parameter(replicated))
 
 
+def synchronize_lora_gradients(transformer: torch.nn.Module) -> int:
+    """Average post-FSDP LoRA gradients over every replicated mesh dimension.
+
+    Training inserts LoRA after ``fully_shard`` has captured its parameter
+    groups. FSDP therefore neither owns nor reduces these new parameters.
+    ``DTensor.from_local(..., Replicate())`` describes their value layout but
+    does not turn rank-local gradients into a data-parallel average: the LoRA
+    forward converts them back to local tensors, whose backward gradients are
+    rank-local too.
+
+    Run this once after gradient accumulation and before clipping/AdamW. The
+    in-place all-reduce keeps the gradient's replicated DTensor layout while
+    making every rank apply the same update.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return 0
+
+    synchronized = 0
+    for module in transformer.modules():
+        if not isinstance(module, BaseLayerWithLoRA):
+            continue
+        for attr_name in ("lora_A", "lora_B"):
+            param = getattr(module, attr_name, None)
+            grad = getattr(param, "grad", None)
+            if not isinstance(param, DTensor) or not isinstance(grad, DTensor):
+                continue
+            if any(not isinstance(placement, Replicate) for placement in param.placements):
+                # A sharded LoRA parameter is owned by another distribution
+                # strategy and must not be reduced as a replicated parameter.
+                continue
+
+            local_grad = grad.to_local()
+            mesh = param.device_mesh
+            for mesh_dim in range(mesh.ndim):
+                group = mesh.get_group(mesh_dim)
+                group_size = dist.get_world_size(group)
+                if group_size <= 1:
+                    continue
+                dist.all_reduce(local_grad, op=dist.ReduceOp.SUM, group=group)
+                local_grad.div_(group_size)
+            synchronized += 1
+    return synchronized
+
+
 def enable_lora_training(
     transformer: torch.nn.Module,
     *,

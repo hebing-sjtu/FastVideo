@@ -8,10 +8,13 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
+from fastvideo.logger import init_logger
 from fastvideo.train.methods.base import TrainingMethod, LogScalar
 from fastvideo.train.models.base import ModelBase, NoisePrediction
 from fastvideo.train.utils.optimizer import (
     build_optimizer_and_scheduler, )
+
+logger = init_logger(__name__)
 
 
 def _compute_finetune_loss_map(
@@ -243,6 +246,13 @@ class FineTuneMethod(TrainingMethod):
         student_betas = tc.optimizer.betas
         student_sched = str(tc.optimizer.lr_scheduler)
         student_params = [p for p in self.student.transformer.parameters() if p.requires_grad]
+        trainable_elements = sum(param.numel() for param in student_params)
+        logger.info(
+            "Student optimizer receives %d trainable tensors / %.3fM parameters at peak lr %.3g",
+            len(student_params),
+            trainable_elements / 1e6,
+            student_lr,
+        )
         (
             self._student_optimizer,
             self._student_lr_scheduler,

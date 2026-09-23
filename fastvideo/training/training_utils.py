@@ -1353,11 +1353,10 @@ def get_cosine_schedule_with_min_lr(optimizer: Optimizer,
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        # Cosine decay from 1.0 to min_lr_ratio over num_cycles periods
-        # Use the same formula as standard cosine but ensure minimum is min_lr_ratio instead of 0
         cosine_value = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
-        # Ensure the value doesn't go below min_lr_ratio
-        return max(min_lr_ratio, cosine_value)
+        # Match Transformers/Musubi: scale the full cosine range onto
+        # [min_lr_ratio, 1] instead of clipping an ordinary zero-floor cosine.
+        return max(0.0, min_lr_ratio + (1.0 - min_lr_ratio) * cosine_value)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 

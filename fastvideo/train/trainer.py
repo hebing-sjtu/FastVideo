@@ -176,6 +176,7 @@ class Trainer:
             # to CPU once per step right before logging.
             loss_sums: dict[str, float | torch.Tensor] = {}
             metric_sums: dict[str, float | torch.Tensor] = {}
+            optimizer_metrics: dict[str, float] = {}
             if method_manages_optimization:
                 loss_map, outputs, step_metrics = method.managed_train_step(
                     data_stream,
@@ -227,6 +228,11 @@ class Trainer:
                         ))
 
             if not method_manages_optimization:
+                optimizer_metrics = method.optimizer_lr_metrics()
+                # LoRA adapters are attached after FSDP has captured its parameter groups,
+                # so their replicated gradients need an explicit data-parallel average.
+                # This must precede clipping so every rank clips the same global gradient.
+                method.synchronize_gradients(step)
                 self.callbacks.on_before_optimizer_step(
                     method,
                     iteration=step,
@@ -239,6 +245,7 @@ class Trainer:
             divisor = 1 if method_manages_optimization else grad_accum
             metrics = {k: float(v) / divisor for k, v in loss_sums.items()}
             metrics.update({k: float(v) / divisor for k, v in metric_sums.items()})
+            metrics.update(optimizer_metrics)
             metrics["step_time_sec"] = (time.perf_counter() - t0)
             metrics["vsa_sparsity"] = float(tc.vsa_sparsity)
             if self.global_rank == 0 and metrics:
