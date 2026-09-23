@@ -18,8 +18,18 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation im
     MiniMaxH3InputPreparationStage,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
+from fastvideo.train.callbacks.minimax_h3_proxy_validation import _ordered_visual_references
 
 PATCH_SIZE = (1, 2, 2)
+
+
+def test_validation_can_reverse_reference_order_without_changing_the_references():
+    picture, video = object(), object()
+
+    assert _ordered_visual_references(picture, video, "picture_video") == [picture, video]
+    assert _ordered_visual_references(picture, video, "video_picture") == [video, picture]
+    with pytest.raises(ValueError, match="reference_order"):
+        _ordered_visual_references(picture, video, "unknown")
 
 
 def _layout(num_latent_frames: int = 4, latent_height: int = 4, latent_width: int = 6):

@@ -31,6 +31,15 @@ PROXY_PATH_KEY = "proxy_path"
 TARGET_PATH_KEY = "target_path"
 ANCHOR_PATH_KEY = "anchor_path"
 CAMERA_PATH_KEY = "camera_path"
+REFERENCE_ORDERS = ("picture_video", "video_picture")
+
+
+def _ordered_visual_references(anchor: Any, proxy: Any, order: str) -> list[Any]:
+    if order == "picture_video":
+        return [anchor, proxy]
+    if order == "video_picture":
+        return [proxy, anchor]
+    raise ValueError(f"reference_order must be one of {REFERENCE_ORDERS}, got {order!r}.")
 
 
 class MiniMaxH3ProxyValidationCallback(ValidationCallback):
@@ -52,6 +61,7 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         # Keep old run configs reproducible. New full-rate caches set this explicitly to 24.
         qwen_video_fps: float = 2.0,
         align_proxy_reference_time: bool = False,
+        reference_order: str = "picture_video",
         cwm_system_prompt: str = "w0",
         num_given_latent_frames: int = 1,
         lock_first_frame: bool | None = None,
@@ -120,6 +130,11 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
         # without it presents the proxy a clip earlier than training ever did, which reads as a bad
         # checkpoint rather than as a mismatch.
         self.align_proxy_reference_time = bool(align_proxy_reference_time)
+        self.reference_order = str(reference_order).strip().lower()
+        if self.reference_order not in REFERENCE_ORDERS:
+            raise ValueError(
+                f"reference_order must be one of {REFERENCE_ORDERS}, got {reference_order!r}."
+            )
         if min(self.proxy_size) <= 0:
             raise ValueError(f"proxy_height and proxy_width must be positive, got {self.proxy_size}.")
         # Must match how the training cache's text embedding was wrapped. ABot clips are window 0.
@@ -162,19 +177,26 @@ class MiniMaxH3ProxyValidationCallback(ValidationCallback):
                              f"{validation_batch.get(PROXY_PATH_KEY)!r}. Paths must be absolute: the loader only "
                              "resolves the media keys it knows about against the dataset directory.")
 
-        # Anchor first, proxy second, matching how the training cache was encoded. The anchor is
-        # what fixes appearance, which a proxy render cannot supply.
-        batch.references = [
-            MiniMaxH3Reference(
-                source=self._resolve_anchor(validation_batch),
-                media_type="image",
-                short_edge=self.anchor_short_edge,
-            ),
-            MiniMaxH3Reference(source=proxy_path,
-                               media_type="video",
-                               size=self.proxy_size,
-                               time_aligned=self.align_proxy_reference_time),
-        ]
+        # The cache contract is picture→video. `video_picture` exists for a step-0 A/B against
+        # provider-style Ref2VA requests, which commonly submit the driving video before the soft
+        # appearance picture. Do not use that order for a trained checkpoint unless its text and
+        # reference rows were encoded in the same order.
+        anchor_reference = MiniMaxH3Reference(
+            source=self._resolve_anchor(validation_batch),
+            media_type="image",
+            short_edge=self.anchor_short_edge,
+        )
+        proxy_reference = MiniMaxH3Reference(
+            source=proxy_path,
+            media_type="video",
+            size=self.proxy_size,
+            time_aligned=self.align_proxy_reference_time,
+        )
+        batch.references = _ordered_visual_references(
+            anchor_reference,
+            proxy_reference,
+            self.reference_order,
+        )
 
         camera = self._record_path(validation_batch, CAMERA_PATH_KEY)
         if camera is not None:
