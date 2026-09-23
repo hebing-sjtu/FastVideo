@@ -247,11 +247,16 @@ class FineTuneMethod(TrainingMethod):
         student_sched = str(tc.optimizer.lr_scheduler)
         student_params = [p for p in self.student.transformer.parameters() if p.requires_grad]
         trainable_elements = sum(param.numel() for param in student_params)
+        trainable_dtypes: dict[str, int] = {}
+        for param in student_params:
+            key = str(param.dtype)
+            trainable_dtypes[key] = trainable_dtypes.get(key, 0) + 1
         logger.info(
-            "Student optimizer receives %d trainable tensors / %.3fM parameters at peak lr %.3g",
+            "Student optimizer receives %d trainable tensors / %.3fM parameters at peak lr %.3g; dtypes=%s",
             len(student_params),
             trainable_elements / 1e6,
             student_lr,
+            trainable_dtypes,
         )
         (
             self._student_optimizer,

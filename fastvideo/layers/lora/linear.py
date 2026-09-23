@@ -48,16 +48,22 @@ class BaseLayerWithLoRA(nn.Module):
             self.base_layer.requires_grad_(False)
             in_dim = self.base_layer.weight.shape[1]
             out_dim = self.base_layer.weight.shape[0]
+            # Keep trainable adapters and AdamW state in FP32 even when the
+            # frozen DiT is stored and evaluated in BF16. The forward path
+            # casts these matrices to the activation dtype below. This is the
+            # mixed-precision contract used by Musubi/CWM; directly optimizing
+            # BF16 LoRA weights can quantize away 2e-5-scale updates once their
+            # values reach the 1e-2 range.
             self.lora_A = nn.Parameter(
                 torch.zeros(self.lora_rank,
                             in_dim,
                             device=self.base_layer.weight.device,
-                            dtype=self.base_layer.weight.dtype))
+                            dtype=torch.float32))
             self.lora_B = nn.Parameter(
                 torch.zeros(out_dim,
                             self.lora_rank,
                             device=self.base_layer.weight.device,
-                            dtype=self.base_layer.weight.dtype))
+                            dtype=torch.float32))
             torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
             torch.nn.init.zeros_(self.lora_B)
         else:

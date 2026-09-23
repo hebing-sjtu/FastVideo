@@ -145,6 +145,12 @@ def maybe_load_fsdp_model(
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
     mp_policy = MixedPrecisionPolicy(param_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False)
+    logger.info(
+        "FSDP precision: parameter storage=%s, forward parameters=%s, gradient reduction=%s",
+        default_dtype,
+        param_dtype,
+        reduce_dtype,
+    )
 
     set_mixed_precision_policy(
         param_dtype=param_dtype,

@@ -5,9 +5,24 @@ from types import SimpleNamespace
 import torch
 
 import fastvideo.train.utils.lora as lora_utils
+from fastvideo.layers.lora.linear import BaseLayerWithLoRA
 from fastvideo.training.training_utils import (
     get_cosine_schedule_with_min_lr,
 )
+
+
+def test_training_lora_weights_stay_fp32_over_bf16_base() -> None:
+    base = torch.nn.Linear(8, 12, bias=False, dtype=torch.bfloat16)
+    layer = BaseLayerWithLoRA(
+        base,
+        lora_rank=4,
+        lora_alpha=4,
+        training_mode=True,
+    )
+
+    assert layer.base_layer.weight.dtype == torch.bfloat16
+    assert layer.lora_A.dtype == torch.float32
+    assert layer.lora_B.dtype == torch.float32
 
 
 def test_cosine_with_min_lr_scales_cosine_to_floor() -> None:
