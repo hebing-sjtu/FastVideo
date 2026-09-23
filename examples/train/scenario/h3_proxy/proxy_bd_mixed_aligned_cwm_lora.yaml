@@ -154,6 +154,9 @@ callbacks:
     cwm_system_prompt: wn
     every_steps: 0
     run_at_start: false
+    # Validation mp4s stay beside the checkpoints. W&B media upload is disabled because this
+    # cluster's shared filesystem cannot serve those files reliably; scalar training logs remain.
+    log_media_to_tracker: false
     sampling_steps: [50]
     guidance_scale: 1.0
     num_frames: 124

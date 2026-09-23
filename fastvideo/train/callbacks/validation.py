@@ -226,6 +226,7 @@ class ValidationCallback(Callback):
         sampling_timesteps: list[int] | None = None,
         overlay_actions: bool = False,
         keyboard_value_scale: float = 1.0,
+        log_media_to_tracker: bool = True,
         offload_training_state: bool = False,
         unload_pipeline_after_validation: bool = False,
         attn_qat_infer: bool = False,
@@ -251,6 +252,7 @@ class ValidationCallback(Callback):
         self.output_dir = (str(output_dir) if output_dir is not None else None)
         self.sampling_timesteps = ([int(s) for s in sampling_timesteps] if sampling_timesteps is not None else None)
         self.overlay_actions = self._coerce_bool(overlay_actions)
+        self.log_media_to_tracker = self._coerce_bool(log_media_to_tracker)
         # Validation-only action amplification for world model; training keeps raw action values.
         self.keyboard_value_scale = float(keyboard_value_scale)
         metrics_config = pipeline_kwargs.pop("metrics", None)
@@ -887,6 +889,17 @@ class ValidationCallback(Callback):
         all, so bundling them behind the media would hide exactly the run this is meant to explain:
         a tracker that drops video leaves a run with no validation trace and no reason why.
         """
+        if not self.log_media_to_tracker:
+            if scalar_metrics:
+                self.tracker.log_artifacts(dict(scalar_metrics), step)
+            if video_filenames:
+                logger.info(
+                    "Validation media upload is disabled; kept %d file(s) on disk under %s.",
+                    len(video_filenames),
+                    os.path.dirname(video_filenames[0]),
+                )
+            return
+
         video_logs = []
         for fname, cap in zip(
                 video_filenames,

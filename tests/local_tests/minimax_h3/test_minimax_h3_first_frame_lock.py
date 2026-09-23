@@ -18,7 +18,10 @@ from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_input_preparation im
     MiniMaxH3InputPreparationStage,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
-from fastvideo.train.callbacks.minimax_h3_proxy_validation import _ordered_visual_references
+from fastvideo.train.callbacks.minimax_h3_proxy_validation import (
+    MiniMaxH3ProxyValidationCallback,
+    _ordered_visual_references,
+)
 
 PATCH_SIZE = (1, 2, 2)
 
@@ -30,6 +33,32 @@ def test_validation_can_reverse_reference_order_without_changing_the_references(
     assert _ordered_visual_references(picture, video, "video_picture") == [video, picture]
     with pytest.raises(ValueError, match="reference_order"):
         _ordered_visual_references(picture, video, "unknown")
+
+
+def test_validation_can_keep_media_local_without_calling_tracker_video():
+    logged = []
+
+    class Tracker:
+
+        def video(self, *args, **kwargs):
+            raise AssertionError("tracker.video must not be called")
+
+        def log_artifacts(self, artifacts, step):
+            logged.append((artifacts, step))
+
+    callback = object.__new__(MiniMaxH3ProxyValidationCallback)
+    callback.log_media_to_tracker = False
+    callback.tracker = Tracker()
+    callback._log_validation_video_artifacts(
+        ["/shared/validation.mp4"],
+        ["caption"],
+        key="validation",
+        step=53,
+        fps=24,
+        scalar_metrics={"validation/video_count": 1.0},
+    )
+
+    assert logged == [({"validation/video_count": 1.0}, 53)]
 
 
 def _layout(num_latent_frames: int = 4, latent_height: int = 4, latent_width: int = 6):
