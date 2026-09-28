@@ -246,6 +246,9 @@ callbacks:
     # H3 has no zero-embedding branch for text CFG, matching training_cfg_rate: 0.0 above.
     guidance_scale: 1.0
     num_frames: 124
+    # Must equal encode_proxy_samples --qwen-video-fps. Only Qwen's video sampling is 2 fps;
+    # target and proxy VAE latents still contain all 124 source frames at 24 fps.
+    qwen_video_fps: 2.0
     # H3 packs one document per request.
     num_videos_per_prompt: 1
     # Required: this callback conditions through an ordered reference list, and image_path would
