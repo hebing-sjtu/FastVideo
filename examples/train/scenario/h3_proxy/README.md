@@ -177,6 +177,25 @@ Starts are staggered (`STAGGER_SEC`, default 45) because each shard deserialises
 ~64 GB bf16 text encoder. Eight simultaneous starts is one ~500 GB read burst and a host-RAM spike;
 the GPUs are idle through that window regardless, so the stagger costs nothing real.
 
+For equal-size multi-node jobs sharing the same manifest and output directory, set the same
+`NODE_COUNT` and local `NUM_SHARDS` everywhere, and give each node a distinct `NODE_RANK`. For two
+8-GPU nodes:
+
+```bash
+# node 0
+NODE_COUNT=2 NODE_RANK=0 NUM_SHARDS=8 STAGGER_SEC=45 \
+scripts/h3_proxy/prepare_data/encode_proxy_shards.sh <the same encoder arguments>
+
+# node 1
+NODE_COUNT=2 NODE_RANK=1 NUM_SHARDS=8 STAGGER_SEC=45 \
+scripts/h3_proxy/prepare_data/encode_proxy_shards.sh <the same encoder arguments>
+```
+
+The nodes then own global shards `0..7` and `8..15`; local shard `i` remains bound to local GPU
+`i`. Logs use the global shard number, so a shared `LOG_DIR` is safe. A node may finish while its
+peer is still writing, so the multi-node wrapper does not treat an intermediate cache count as a
+failure. Run `describe_cache.py --manifest ...` only after both nodes finish.
+
 For a dataset laid out as flat `seg_*/` directories holding `video_src.mp4`, `video_target.mp4` and
 `prompt.txt`, with the train/val split in `manifests/*_{train,val}.jsonl`, build that manifest with:
 
