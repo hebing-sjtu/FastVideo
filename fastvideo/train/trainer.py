@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
@@ -21,6 +22,33 @@ if TYPE_CHECKING:
         TrainingConfig, )
 
 logger = init_logger(__name__)
+
+
+def _distributed_mean_scalars(
+    values: dict[str, float | torch.Tensor],
+    *,
+    divisor: int,
+    world_group: Any,
+) -> dict[str, float]:
+    """Average scalar sums over accumulation rounds and every distributed rank."""
+    if not values:
+        return {}
+    divisor = max(1, int(divisor))
+    keys = sorted(values)
+    first_tensor = next((value for value in values.values() if isinstance(value, torch.Tensor)), None)
+    device = getattr(world_group, "device", None)
+    if device is None:
+        device = first_tensor.device if first_tensor is not None else torch.device("cpu")
+    scalars = [
+        torch.as_tensor(values[key], device=device, dtype=torch.float32).detach().reshape(())
+        for key in keys
+    ]
+    packed = torch.stack(scalars)
+    if int(world_group.world_size) > 1:
+        packed = world_group.all_reduce(packed)
+    packed.div_(divisor * int(world_group.world_size))
+    materialized = packed.cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, materialized, strict=True)}
 
 
 def _coerce_log_scalar(
@@ -75,6 +103,18 @@ class Trainer:
             callback_configs or {},
             training_config,
         )
+        self._metric_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=100))
+
+    def _rolling_loss_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
+        """Add an actual 100-step mean for noisy supervised-loss metrics."""
+        smoothed: dict[str, float] = {}
+        for key, value in metrics.items():
+            if key != "total_loss" and not key.endswith("_loss"):
+                continue
+            history = self._metric_history[key]
+            history.append(float(value))
+            smoothed[f"rolling_100/{key}"] = sum(history) / len(history)
+        return smoothed
 
     def _iter_dataloader(self, dataloader: Any) -> Iterator[dict[str, Any]]:
         data_iter = iter(dataloader)
@@ -243,8 +283,15 @@ class Trainer:
             # Single CPU sync point: materialise GPU tensors
             # to float right before logging.
             divisor = 1 if method_manages_optimization else grad_accum
-            metrics = {k: float(v) / divisor for k, v in loss_sums.items()}
-            metrics.update({k: float(v) / divisor for k, v in metric_sums.items()})
+            scalar_sums = dict(loss_sums)
+            scalar_sums.update(metric_sums)
+            metrics = _distributed_mean_scalars(
+                scalar_sums,
+                divisor=divisor,
+                world_group=self.world_group,
+            )
+            if self.global_rank == 0:
+                metrics.update(self._rolling_loss_metrics(metrics))
             metrics.update(optimizer_metrics)
             metrics["step_time_sec"] = (time.perf_counter() - t0)
             metrics["vsa_sparsity"] = float(tc.vsa_sparsity)

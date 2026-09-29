@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 
 from fastvideo.train.callbacks.validation import ValidationCallback
-from fastvideo.train.trainer import Trainer
+from fastvideo.train.trainer import Trainer, _distributed_mean_scalars
 from fastvideo.train.utils.training_config import TrainingConfig
 
 
@@ -82,6 +83,61 @@ class _DummyMethod:
     def optimizers_zero_grad(self, iteration: int) -> None:
         self.zero_grad_steps.append(iteration)
         self.weight.grad = None
+
+
+def test_distributed_mean_scalars_averages_accumulation_and_ranks() -> None:
+    class Group:
+        device = torch.device("cpu")
+        world_size = 2
+
+        @staticmethod
+        def all_reduce(values: torch.Tensor) -> torch.Tensor:
+            # The other rank contributes [6, 10].
+            return values + torch.tensor([6.0, 10.0])
+
+    metrics = _distributed_mean_scalars(
+        {
+            "a_loss": torch.tensor(2.0),
+            "b_loss": 6.0,
+        },
+        divisor=2,
+        world_group=Group(),
+    )
+
+    assert metrics == {
+        "a_loss": 2.0,
+        "b_loss": 4.0,
+    }
+
+
+def test_distributed_mean_scalars_single_rank() -> None:
+    class Group:
+        world_size = 1
+
+        @staticmethod
+        def all_reduce(values: torch.Tensor) -> torch.Tensor:
+            return values
+
+    assert _distributed_mean_scalars(
+        {"training_loss": torch.tensor(6.0)},
+        divisor=3,
+        world_group=Group(),
+    ) == {"training_loss": 2.0}
+
+
+def test_rolling_loss_metrics_uses_last_100_global_steps() -> None:
+    trainer = Trainer.__new__(Trainer)
+    trainer._metric_history = defaultdict(lambda: deque(maxlen=100))
+
+    result = {}
+    for step in range(101):
+        result = trainer._rolling_loss_metrics({
+            "training_loss": float(step),
+            "learning_rate": 2e-5,
+        })
+
+    assert result == {"rolling_100/training_loss": 50.5}
+    assert "learning_rate" not in trainer._metric_history
 
 
 def test_trainer_runs_validation_callback_during_training(monkeypatch, ) -> None:
