@@ -28,6 +28,17 @@
 #         --cache /data/binghe/h3_proxy/cache/gta_v2_cwm \
 #         --val-json /data/binghe/h3_proxy/gta_v2_validation_val6.json
 #
+# SolarWM proxy checkpoints use a different transaction layout. Select their EMA or live adapter
+# explicitly; the loader translates and verifies all 400 LoRA tensors before sampling:
+#
+#     scripts/h3_proxy/eval_checkpoint.sh \
+#         --step 500 \
+#         --solarwm-run /data/binghe/h3_proxy/solarwm-runs/gta-v2-w0-lora128-3000-v2 \
+#         --weight-source ema \
+#         --config examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml \
+#         --cache /data/binghe/h3_proxy/cache/gta_v2_cwm_1344_qwen2_simple \
+#         --val-json /data/binghe/h3_proxy/gta_v2_validation_val6.json
+#
 # `--step 0` is the base-model baseline and is the one case that legitimately has no checkpoint.
 #
 # Anything after a bare `--` is passed through to the trainer as extra overrides, and recorded in the
@@ -70,6 +81,8 @@ NNODES=1
 SP_SIZE=""
 STEP=""
 RUN=""
+SOLARWM_RUN=""
+WEIGHT_SOURCE=ema
 CACHE=""
 CACHE_FROM=""
 VAL_JSON=""
@@ -86,6 +99,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --step) STEP="$2"; shift 2 ;;
         --run) RUN="$2"; shift 2 ;;
+        --solarwm-run) SOLARWM_RUN="$2"; shift 2 ;;
+        --weight-source) WEIGHT_SOURCE="$2"; shift 2 ;;
         --cache) CACHE="$2"; shift 2 ;;
         --val-json) VAL_JSON="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
@@ -138,8 +153,16 @@ if [[ ! "$STEP" =~ ^[0-9]+$ ]]; then
     echo "--step must be a non-negative integer, got '$STEP'." >&2
     exit 2
 fi
-if [[ "$STEP" -gt 0 && -z "$RUN" ]]; then
-    echo "--run is required for --step $STEP; only --step 0 has no checkpoint to resume." >&2
+if [[ "$STEP" -gt 0 && -z "$RUN" && -z "$SOLARWM_RUN" ]]; then
+    echo "--run or --solarwm-run is required for --step $STEP; only --step 0 has no checkpoint." >&2
+    exit 2
+fi
+if [[ -n "$RUN" && -n "$SOLARWM_RUN" ]]; then
+    echo "--run and --solarwm-run are mutually exclusive." >&2
+    exit 2
+fi
+if [[ "$WEIGHT_SOURCE" != "live" && "$WEIGHT_SOURCE" != "ema" ]]; then
+    echo "--weight-source must be live or ema, got '$WEIGHT_SOURCE'." >&2
     exit 2
 fi
 # Step 0 has no checkpoint to read the run's own settings back out of, so it must be told them.
@@ -151,8 +174,31 @@ fi
 # Refuse before loading a 134 GB snapshot, rather than after.
 CKPT=""
 if [[ "$STEP" -gt 0 ]]; then
-    CKPT="$RUN/checkpoint-$STEP"
-    if [[ ! -d "$CKPT/dcp" ]]; then
+    if [[ -n "$SOLARWM_RUN" ]]; then
+        printf -v STEP_PADDED '%06d' "$STEP"
+        CKPT="$SOLARWM_RUN/checkpoint_model_$STEP_PADDED"
+        COMPONENT=adapter.pt
+        [[ "$WEIGHT_SOURCE" == "ema" ]] && COMPONENT=ema.pt
+        if [[ ! -f "$CKPT/COMPLETE.json" || ! -f "$CKPT/checkpoint-manifest.json" || ! -f "$CKPT/$COMPONENT" ]]; then
+            echo "No complete SolarWM $WEIGHT_SOURCE checkpoint at $CKPT." >&2
+            echo "Expected COMPLETE.json, checkpoint-manifest.json and $COMPONENT. On disk:" >&2
+            for candidate in $(ls -d "$SOLARWM_RUN"/checkpoint_model_* 2>/dev/null | sort -V); do
+                if [[ -f "$candidate/COMPLETE.json" ]]; then
+                    echo "  $(basename "$candidate")  complete" >&2
+                else
+                    echo "  $(basename "$candidate")  incomplete" >&2
+                fi
+            done
+            exit 2
+        fi
+        if [[ -z "$CONFIG_GIVEN" ]]; then
+            echo "A SolarWM checkpoint does not contain a FastVideo eval config; pass --config." >&2
+            exit 2
+        fi
+    else
+        CKPT="$RUN/checkpoint-$STEP"
+    fi
+    if [[ -z "$SOLARWM_RUN" && ! -d "$CKPT/dcp" ]]; then
         echo "No loadable checkpoint at $CKPT (needs dcp/). On disk:" >&2
         found=0
         for candidate in $(ls -d "$RUN"/checkpoint-* 2>/dev/null | sort -V); do
@@ -172,7 +218,7 @@ fi
 # rather than something to remember. Evaluating against that config makes every setting that shapes
 # a state-dict key agree by construction, which is the failure probe_resume.py otherwise only warns
 # about, and picks up the cache and validation set the run actually used.
-if [[ -n "$CKPT" ]]; then
+if [[ -n "$CKPT" && -z "$SOLARWM_RUN" ]]; then
     if [[ -z "$CONFIG_GIVEN" ]]; then
         # GNU mktemp wants the X's last, so name the file inside a temp dir rather than templating
         # a suffix onto it.
@@ -328,14 +374,35 @@ GEOM="$(python scripts/h3_proxy/describe_cache.py "$CACHE" --emit-flags)"
 # A resume whose key names disagree with this config loads nothing and says nothing, so settle that
 # before the GPUs are touched. When the config came from the checkpoint this can only agree, and
 # saying so is still worth the two seconds: it also reports how many LoRA weights are in the save.
-if [[ -n "$CKPT" ]]; then
+if [[ -n "$CKPT" && -z "$SOLARWM_RUN" ]]; then
     python scripts/h3_proxy/probe_resume.py "$CKPT" --config "$CONFIG"
+    echo
+elif [[ -n "$CKPT" ]]; then
+    python - "$CKPT/checkpoint-manifest.json" "$STEP" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+contract = manifest.get("contract") or {}
+expected = {
+    "family": "minimax_h3",
+    "stage": "stage0p5",
+    "parameterization": "peft-lora-r128-alpha128",
+    "data_generation": "h3.ref2va-proxy.124f.v1",
+}
+if int(manifest.get("step", -1)) != int(sys.argv[2]):
+    raise SystemExit("SolarWM checkpoint manifest step differs from --step")
+if any(contract.get(key) != value for key, value in expected.items()):
+    raise SystemExit(f"SolarWM checkpoint contract is not H3 proxy LoRA-128: {contract}")
+print("SolarWM checkpoint contract: H3 124f Ref2VA proxy LoRA-128")
+PY
     echo
 fi
 
 echo "eval-only:"
 echo "  step            $STEP"
 echo "  checkpoint      ${CKPT:-<none: base model, LoRA is zero>}"
+echo "  weight source   ${CKPT:+$WEIGHT_SOURCE}"
 echo "  config          $CONFIG_SOURCE"
 echo "  cache           $CACHE"
 echo "  geometry        $GEOM"
@@ -344,13 +411,16 @@ echo "  output          $OUT"
 echo "  every_steps     $EVERY   (must divide $STEP)"
 echo "  mesh            $NNODES node(s) x $NPROC = $WORLD GPUs, sp_size $SP_SIZE -> $(( WORLD / SP_SIZE )) SP group(s)"
 echo
-echo "  Watch for 'lora_B norm 0 -> <nonzero>' from the resume; that line is the proof the"
+echo "  Watch for 'LoRA-B norm 0 -> <nonzero>' from the load; that line is the proof the"
 echo "  checkpoint's weights reached the model that samples. It raises rather than logs if the"
 echo "  norm is still zero."
 echo
 
 RESUME=()
-if [[ -n "$CKPT" ]]; then
+if [[ -n "$SOLARWM_RUN" ]]; then
+    RESUME=(--training.checkpoint.solarwm_checkpoint "$CKPT"
+            --training.checkpoint.solarwm_weight_source "$WEIGHT_SOURCE")
+elif [[ -n "$CKPT" ]]; then
     RESUME=(--training.checkpoint.resume_from_checkpoint "$CKPT")
 fi
 

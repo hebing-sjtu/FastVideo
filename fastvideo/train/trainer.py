@@ -19,7 +19,8 @@ from fastvideo.train.utils.tracking import build_tracker
 
 if TYPE_CHECKING:
     from fastvideo.train.utils.training_config import (
-        TrainingConfig, )
+        TrainingConfig,
+    )
 
 logger = init_logger(__name__)
 
@@ -39,10 +40,7 @@ def _distributed_mean_scalars(
     device = getattr(world_group, "device", None)
     if device is None:
         device = first_tensor.device if first_tensor is not None else torch.device("cpu")
-    scalars = [
-        torch.as_tensor(values[key], device=device, dtype=torch.float32).detach().reshape(())
-        for key in keys
-    ]
+    scalars = [torch.as_tensor(values[key], device=device, dtype=torch.float32).detach().reshape(()) for key in keys]
     packed = torch.stack(scalars)
     if int(world_group.world_size) > 1:
         packed = world_group.all_reduce(packed)
@@ -64,13 +62,11 @@ def _coerce_log_scalar(
     """
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
-            raise ValueError(f"Expected scalar tensor at {where}, "
-                             f"got shape={tuple(value.shape)}")
+            raise ValueError(f"Expected scalar tensor at {where}, got shape={tuple(value.shape)}")
         return value.detach()
     if isinstance(value, float | int):
         return float(value)
-    raise TypeError(f"Expected a scalar (float/int/Tensor) at "
-                    f"{where}, got {type(value).__name__}")
+    raise TypeError(f"Expected a scalar (float/int/Tensor) at {where}, got {type(value).__name__}")
 
 
 @dataclass(slots=True)
@@ -80,14 +76,12 @@ class TrainLoopState:
 
 
 class Trainer:
-
     def __init__(
         self,
         training_config: TrainingConfig,
         *,
         config: dict[str, Any] | None = None,
-        callback_configs: dict[str, dict[str, Any]]
-        | None = None,
+        callback_configs: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.training_config = training_config
         self.world_group = get_world_group()
@@ -163,18 +157,44 @@ class Trainer:
             iteration=start_step,
         )
 
-        resume_from_checkpoint = (tc.checkpoint.resume_from_checkpoint or "")
+        resume_from_checkpoint = tc.checkpoint.resume_from_checkpoint or ""
+        solarwm_checkpoint = tc.checkpoint.solarwm_checkpoint or ""
+        if resume_from_checkpoint and solarwm_checkpoint:
+            raise ValueError("resume_from_checkpoint and solarwm_checkpoint are mutually exclusive")
+        if solarwm_checkpoint:
+            from fastvideo.train.utils.solarwm_lora import (
+                load_solarwm_h3_proxy_lora,
+            )
+
+            start_step = load_solarwm_h3_proxy_lora(
+                method.student.transformer,
+                solarwm_checkpoint,
+                weight_source=tc.checkpoint.solarwm_weight_source,
+            )
+            if int(max_steps) != start_step:
+                raise ValueError(
+                    "SolarWM checkpoint loading is eval-only: "
+                    f"max_train_steps={max_steps} must equal checkpoint step {start_step}"
+                )
         if checkpoint_manager is not None:
             if resume_from_checkpoint:
                 method.seed_optimizer_state_for_resume()
-            resumed_step = (checkpoint_manager.maybe_resume(resume_from_checkpoint=(resume_from_checkpoint)))
+            resumed_step = checkpoint_manager.maybe_resume(resume_from_checkpoint=(resume_from_checkpoint))
             if resumed_step is not None:
                 start_step = int(resumed_step)
         # An eval-only job names the step it wants by resuming into it, and an empty
         # resume_from_checkpoint is not an error -- it is how a fresh run starts. The two are then
         # only distinguishable from the step baked into the validation filenames, which is read
         # after the sampling has been paid for, so say which one this is before spending it.
-        if resume_from_checkpoint:
+        if solarwm_checkpoint:
+            logger.info(
+                "solarwm_checkpoint=%r resolved to step %s using %s weights; "
+                "the training loop is empty and validation runs once.",
+                solarwm_checkpoint,
+                start_step,
+                tc.checkpoint.solarwm_weight_source,
+            )
+        elif resume_from_checkpoint:
             logger.info(
                 "resume_from_checkpoint=%r resolved to step %s; validation and training continue from there.",
                 resume_from_checkpoint,
@@ -199,8 +219,10 @@ class Trainer:
         # Restore the RNG snapshot LAST — after dcp.load,
         # after iter(dataloader), after everything that may
         # have advanced the RNG as a side-effect.
-        if (checkpoint_manager is not None and resume_from_checkpoint):
-            checkpoint_manager.load_rng_snapshot(resume_from_checkpoint, )
+        if checkpoint_manager is not None and resume_from_checkpoint:
+            checkpoint_manager.load_rng_snapshot(
+                resume_from_checkpoint,
+            )
         progress = tqdm(
             range(start_step + 1, max_steps + 1),
             initial=start_step,
@@ -227,22 +249,23 @@ class Trainer:
                         loss_sums[k] = v.detach()
                 for k, v in step_metrics.items():
                     if k in loss_sums:
-                        raise ValueError(f"Metric key {k!r} collides "
-                                         "with loss key. Use a "
-                                         "different name (e.g. prefix "
-                                         "with 'train/').")
+                        raise ValueError(
+                            f"Metric key {k!r} collides "
+                            "with loss key. Use a "
+                            "different name (e.g. prefix "
+                            "with 'train/')."
+                        )
                     metric_sums[k] = _coerce_log_scalar(
                         v,
-                        where=("method.managed_train_step()"
-                               f".metrics[{k!r}]"),
+                        where=(f"method.managed_train_step().metrics[{k!r}]"),
                     )
             else:
                 for accum_iter in range(grad_accum):
                     batch = next(data_stream)
-                    loss_map, outputs, step_metrics = (method.single_train_step(
+                    loss_map, outputs, step_metrics = method.single_train_step(
                         batch,
                         step,
-                    ))
+                    )
 
                     method.backward(
                         loss_map,
@@ -256,16 +279,17 @@ class Trainer:
                             loss_sums[k] = prev + v.detach()
                     for k, v in step_metrics.items():
                         if k in loss_sums:
-                            raise ValueError(f"Metric key {k!r} collides "
-                                             "with loss key. Use a "
-                                             "different name (e.g. prefix "
-                                             "with 'train/').")
+                            raise ValueError(
+                                f"Metric key {k!r} collides "
+                                "with loss key. Use a "
+                                "different name (e.g. prefix "
+                                "with 'train/')."
+                            )
                         prev = metric_sums.get(k, 0.0)
-                        metric_sums[k] = (prev + _coerce_log_scalar(
+                        metric_sums[k] = prev + _coerce_log_scalar(
                             v,
-                            where=("method.single_train_step()"
-                                   f".metrics[{k!r}]"),
-                        ))
+                            where=(f"method.single_train_step().metrics[{k!r}]"),
+                        )
 
             if not method_manages_optimization:
                 optimizer_metrics = method.optimizer_lr_metrics()
@@ -293,7 +317,7 @@ class Trainer:
             if self.global_rank == 0:
                 metrics.update(self._rolling_loss_metrics(metrics))
             metrics.update(optimizer_metrics)
-            metrics["step_time_sec"] = (time.perf_counter() - t0)
+            metrics["step_time_sec"] = time.perf_counter() - t0
             metrics["vsa_sparsity"] = float(tc.vsa_sparsity)
             if self.global_rank == 0 and metrics:
                 self.tracker.log(metrics, step)

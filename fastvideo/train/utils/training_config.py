@@ -56,6 +56,8 @@ class TrainingLoopConfig:
 class CheckpointConfig:
     output_dir: str = ""
     resume_from_checkpoint: str = ""
+    solarwm_checkpoint: str = ""
+    solarwm_weight_source: str = "ema"
     training_state_checkpointing_steps: int = 0
     checkpoints_total_limit: int = 0
 

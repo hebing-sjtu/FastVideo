@@ -440,6 +440,21 @@ scripts/h3_proxy/eval_checkpoint.sh \
     --step 150 --run /data/binghe/h3_proxy/runs/gta_v2_cwm/checkpoints
 ```
 
+SolarWM's proxy route writes `checkpoint_model_XXXXXX` transactions instead of
+FastVideo DCP directories. Pass the SolarWM run root and choose its EMA or live
+adapter; the bridge validates the 124-frame Ref2VA contract and copies exactly
+400 LoRA tensors before sampling:
+
+```bash
+scripts/h3_proxy/eval_checkpoint.sh \
+    --step 500 \
+    --solarwm-run /data/binghe/h3_proxy/solarwm-runs/gta-v2-w0-lora128-3000-v2 \
+    --weight-source ema \
+    --config examples/train/scenario/h3_proxy/proxy_bd_finetune.yaml \
+    --cache /data/binghe/h3_proxy/cache/gta_v2_cwm_1344_qwen2_simple \
+    --val-json /data/binghe/h3_proxy/gta_v2_validation_val6.json
+```
+
 `--list` finds them first. Directory names drift, but every checkpoint records the cache it trained
 on, and that is what separates one experiment from another:
 

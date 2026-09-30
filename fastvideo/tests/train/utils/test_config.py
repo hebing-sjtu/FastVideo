@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only unit tests for :func:`load_run_config`."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -75,6 +76,8 @@ def test_minimal_yaml_applies_all_defaults(tmp_path: Path) -> None:
     assert t.loop.gradient_accumulation_steps == 1
 
     assert t.checkpoint.output_dir == ""
+    assert t.checkpoint.solarwm_checkpoint == ""
+    assert t.checkpoint.solarwm_weight_source == "ema"
     assert t.checkpoint.checkpoints_total_limit == 0
 
     assert t.tracker.trackers == []
@@ -126,6 +129,8 @@ def test_full_yaml_populates_all_training_fields(tmp_path: Path) -> None:
         },
         "checkpoint": {
             "output_dir": "/out",
+            "solarwm_checkpoint": "/solarwm/checkpoint_model_000500",
+            "solarwm_weight_source": "live",
             "training_state_checkpointing_steps": 50,
             "checkpoints_total_limit": 3,
         },
@@ -134,9 +139,7 @@ def test_full_yaml_populates_all_training_fields(tmp_path: Path) -> None:
             "project_name": "myproj",
             "run_name": "myrun",
         },
-        "vsa": {
-            "sparsity": 0.5
-        },
+        "vsa": {"sparsity": 0.5},
         "model": {
             "weighting_scheme": "logit_normal",
             "logit_mean": 0.5,
@@ -167,6 +170,8 @@ def test_full_yaml_populates_all_training_fields(tmp_path: Path) -> None:
     assert t.loop.gradient_accumulation_steps == 4
 
     assert t.checkpoint.output_dir == "/out"
+    assert t.checkpoint.solarwm_checkpoint == "/solarwm/checkpoint_model_000500"
+    assert t.checkpoint.solarwm_weight_source == "live"
     assert t.checkpoint.checkpoints_total_limit == 3
 
     assert t.tracker.trackers == ["wandb"]
@@ -228,10 +233,13 @@ def test_missing_config_file_raises(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("betas_value, expected", [
-    ([0.8, 0.9], (0.8, 0.9)),
-    ("0.9,0.999", (0.9, 0.999)),
-])
+@pytest.mark.parametrize(
+    "betas_value, expected",
+    [
+        ([0.8, 0.9], (0.8, 0.9)),
+        ("0.9,0.999", (0.9, 0.999)),
+    ],
+)
 def test_betas_parses_list_and_string_forms(
     tmp_path: Path,
     betas_value: Any,
@@ -245,12 +253,14 @@ def test_betas_parses_list_and_string_forms(
 
 def test_pipeline_quant_config_resolves_for_load_and_export(tmp_path: Path) -> None:
     from fastvideo.layers.quantization.nvfp4_qat_train_config import (
-        NVFP4QATTrainConfig, )
+        NVFP4QATTrainConfig,
+    )
     from fastvideo.train.entrypoint.dcp_to_diffusers import (
-        _run_config_from_raw, )
+        _run_config_from_raw,
+    )
 
     data = _minimal_yaml()
-    data["models"]["student"]["init_from"] = ("FastVideo/LTX2-Distilled-Diffusers")
+    data["models"]["student"]["init_from"] = "FastVideo/LTX2-Distilled-Diffusers"
     data["pipeline"] = {"dit_config": {"quant_config": "nvfp4_qat_train"}}
 
     cfg = load_run_config(_write_yaml(tmp_path, data))
@@ -265,7 +275,7 @@ def test_pipeline_quant_config_resolves_for_load_and_export(tmp_path: Path) -> N
 
 def test_pipeline_quant_config_rejects_unknown_name(tmp_path: Path) -> None:
     data = _minimal_yaml()
-    data["models"]["student"]["init_from"] = ("FastVideo/LTX2-Distilled-Diffusers")
+    data["models"]["student"]["init_from"] = "FastVideo/LTX2-Distilled-Diffusers"
     data["pipeline"] = {"dit_config": {"quant_config": "not_a_quantization_method"}}
 
     with pytest.raises(ValueError, match="Invalid quantization method"):
