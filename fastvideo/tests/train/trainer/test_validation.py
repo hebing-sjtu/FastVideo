@@ -45,6 +45,7 @@ class _DummyMethod:
         self.train_start_calls = 0
         self.zero_grad_steps: list[int] = []
         self.optimizer_steps: list[int] = []
+        self.synchronize_steps: list[int] = []
         self.backward_calls = 0
         self.tracker = None
 
@@ -79,6 +80,12 @@ class _DummyMethod:
 
     def optimizers_schedulers_step(self, iteration: int) -> None:
         self.optimizer_steps.append(iteration)
+
+    def optimizer_lr_metrics(self) -> dict[str, float]:
+        return {"learning_rate": 1e-4}
+
+    def synchronize_gradients(self, iteration: int) -> None:
+        self.synchronize_steps.append(iteration)
 
     def optimizers_zero_grad(self, iteration: int) -> None:
         self.zero_grad_steps.append(iteration)
@@ -191,5 +198,6 @@ def test_trainer_runs_validation_callback_during_training(monkeypatch, ) -> None
     assert method.backward_calls == 3
     assert method.zero_grad_steps == [0, 1, 2, 3]
     assert method.optimizer_steps == [1, 2, 3]
+    assert method.synchronize_steps == [1, 2, 3]
     assert [step for _, step in tracker.logs] == [1, 2, 3]
     assert tracker.finished is True
