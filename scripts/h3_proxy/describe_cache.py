@@ -75,12 +75,14 @@ def geometry(sample: dict[str, Any]) -> dict[str, Any]:
         # Caches made before this field was added used the only implementation then available:
         # a hard-coded 2-fps Qwen presentation.
         found["qwen_video_fps"] = float(info.get("qwen_video_fps", 2.0))
+        found["proxy_references"] = " ".join(info.get("proxy_references") or ["duv"])
+        found["fit"] = str(info.get("fit", "resize"))
     target = sample.get("vae_latent")
     if target is not None and "target" not in found:
         found["target"] = (target.shape[-2] * LATENT_TO_PIXEL, target.shape[-1] * LATENT_TO_PIXEL)
     if target is not None:
         found["latent_frames"] = int(target.shape[1])
-    proxy = sample.get("proxy_latent")
+    proxy = sample.get("proxy_latent", sample.get("proxy_latents"))
     if proxy is not None:
         found["proxy"] = (proxy.shape[-2] * LATENT_TO_PIXEL, proxy.shape[-1] * LATENT_TO_PIXEL)
     anchor = sample.get("anchor_latent")
@@ -153,8 +155,8 @@ def describe(directory: Path, args: argparse.Namespace, *, quiet: bool = False) 
             collected.setdefault(key, Counter())[value] += 1
 
     if not quiet:
-        for key in ("num_frames", "latent_frames", "target", "proxy", "anchor_canvas", "anchor_short_edge",
-                    "qwen_video_fps", "cwm_system", "camera"):
+        for key in ("num_frames", "latent_frames", "target", "proxy", "proxy_references", "fit", "anchor_canvas",
+                    "anchor_short_edge", "qwen_video_fps", "cwm_system", "camera"):
             if key in collected:
                 print(render(key, collected[key]))
 
@@ -203,6 +205,10 @@ def print_flags(collected: dict[str, Any]) -> None:
         print("\n  reproduce it with:")
         print(f"    --num-frames {next(iter(frames))} --height {height} --width {width} \\")
         print(f"    --proxy-height {proxy_h} --proxy-width {proxy_w} \\")
+        references = collected.get("proxy_references")
+        fit = collected.get("fit")
+        if references and fit and len(references) == 1 and len(fit) == 1:
+            print(f"    --fit {next(iter(fit))} --proxy-references {next(iter(references))} \\")
         print(f"    --anchor-short-edge {next(iter(anchor))} "
               f"--qwen-video-fps {next(iter(qwen_video_fps))}")
 
