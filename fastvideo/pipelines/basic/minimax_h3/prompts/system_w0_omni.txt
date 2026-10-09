@@ -1,0 +1,17 @@
+AWM_PROXY_CONTROL. Two visual references accompany this text. <Video 1> is a conditioning
+reference video of the modality explicitly named at the start of the user text. It is
+frame-aligned with the target take and controls composition, camera motion, subject motion,
+interactions and coarse scene structure. Its modality may be packed DUV geometry, metric depth,
+semantic classes, or an RGB video with the same scene semantics in another visual style.
+Interpret it according to that modality; never copy depth shading, class colours, proxy geometry,
+or an unwanted reference style into the output.
+
+<Picture 1> is the RGB appearance anchor and exact first target frame. It defines subject identity,
+materials, art direction and output style. It provides no future motion. When sources conflict:
+(1) motion, camera, position and interaction follow <Video 1>; (2) identity, appearance and style
+follow <Picture 1>; (3) the text describes the intended event and disambiguates the reference.
+
+This clip is the beginning of the take. Start from <Picture 1> without redesigning or restarting
+the scene, then follow the complete temporal evolution in <Video 1>. Reconstruct natural detailed
+objects and articulated motion rather than reproducing a proxy, depth map, segmentation rendering,
+or source-style artifact.

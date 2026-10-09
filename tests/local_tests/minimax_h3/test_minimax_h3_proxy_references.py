@@ -19,6 +19,7 @@ from fastvideo.pipelines.basic.minimax_h3.cwm_presentation import (
 )
 from fastvideo.pipelines.basic.minimax_h3.proxy import (
     PROXY_REFERENCE_KINDS,
+    PROXY_VARIANT_KINDS,
     PROXY_SEMANTIC_NUM_CLASSES,
     center_crop_box,
     encode_depth,
@@ -63,6 +64,14 @@ def test_the_depth_semantic_role_is_hash_locked_and_names_two_videos():
     assert "very beginning of the take" in text
 
 
+def test_the_mixed_omni_role_is_hash_locked_and_expects_a_modality_label():
+    assert resolve_cwm_system_role("W0_OMNI") == "w0_omni"
+    text = load_cwm_system_prompt("w0_omni")
+    assert text.startswith("AWM_PROXY_CONTROL.")
+    assert "modality explicitly named at the start of the user text" in text
+    assert "DUV geometry, metric depth" in text
+
+
 def test_the_semantic_palette_gives_every_class_its_own_interior_colour():
     palette = semantic_palette()
     assert palette.shape == (PROXY_SEMANTIC_NUM_CLASSES, 3)
@@ -83,6 +92,7 @@ def test_separate_references_split_the_duv_halves_across_full_channels():
     torch.testing.assert_close(colour[0].permute(1, 2, 3, 0), torch.from_numpy(expected))
     torch.testing.assert_close(proxy_reference_clip("duv", depth, semantic), duv)
     assert set(PROXY_REFERENCE_KINDS) == {"duv", "depth", "semantic"}
+    assert set(PROXY_VARIANT_KINDS) == {"duv", "depth", "semantic", "style"}
     with pytest.raises(ValueError, match="Unknown proxy reference"):
         proxy_reference_clip("normals", depth, semantic)
 
@@ -113,6 +123,22 @@ def test_code_planes_are_cropped_but_never_scaled(encode_script):
         encode_script.fit_frames(np.zeros((1, 1080, 1920), np.uint8), 704, 1280, "center-crop", codes=True, what="p")
     with pytest.raises(ValueError, match="resizing would blend"):
         encode_script.fit_frames(planes, 704, 1280, "resize", codes=True, what="planes")
+
+
+def test_code_planes_can_crop_then_nearest_downsample_without_blending(encode_script):
+    rows = np.arange(36, dtype=np.float32)[None, :, None].repeat(64, axis=2)
+    fitted = encode_script.fit_frames(
+        rows,
+        16,
+        32,
+        "center-crop",
+        codes=True,
+        what="depth",
+        code_resize="nearest",
+    )
+    assert fitted.shape == (1, 16, 32)
+    assert fitted.dtype == np.float32
+    assert set(np.unique(fitted)).issubset(set(np.arange(2, 34, dtype=np.float32)))
 
 
 def test_native_planes_become_aligned_depth_and_semantic_clips(encode_script, tmp_path):
@@ -149,6 +175,7 @@ class _FakeEncoders:
 
     def __init__(self):
         self.previews = None
+        self.prompt = None
 
     def encode_pixels(self, pixels):
         _, _, frames, height, width = pixels.shape
@@ -158,6 +185,7 @@ class _FakeEncoders:
         return torch.zeros(24, 1, image.size[1] // 16, image.size[0] // 16)
 
     def encode_text(self, prompt, anchor, previews, *, cwm_system=None):
+        self.prompt = prompt
         self.previews = previews
         return torch.zeros(5, 8), torch.ones(5, dtype=torch.long)
 
@@ -204,3 +232,65 @@ def test_legacy_caches_keep_their_keys_and_metadata(encode_script):
     assert encode_script.reference_info(omni) == {"fit": "center-crop", "proxy_references": ["depth", "semantic"]}
     assert encode_script.anchor_aspect(legacy) is None
     assert encode_script.anchor_aspect(omni) == (704, 1280)
+
+
+def test_mixed_omni_entry_caches_one_typed_reference(encode_script, tmp_path, monkeypatch):
+    depth, semantic = _planes(2, 36, 64)
+    _write_planes(tmp_path / "clip/duv", depth, semantic)
+    target = np.zeros((2, 36, 64, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        encode_script,
+        "read_video_frames",
+        lambda path, frames, height, width, fit="resize": encode_script.fit_frames(
+            target, height, width, fit, codes=False, what=str(path)
+        ),
+    )
+    args = argparse.Namespace(
+        num_frames=2,
+        height=32,
+        width=64,
+        proxy_height=16,
+        proxy_width=32,
+        fit="center-crop",
+        code_resize="nearest",
+        proxy_references=("duv",),
+        proxy_variants=("duv", "depth", "semantic", "style"),
+        cwm_system="w0_omni",
+        anchor_short_edge=64,
+        qwen_video_fps=2.0,
+    )
+    encoders = _FakeEncoders()
+    entry = {
+        "target": "clip/rgb.mp4",
+        "proxy_duv": "clip/duv",
+        "proxy_modality": "depth",
+        "prompt": "a car turns left",
+    }
+    sample = encode_script.encode_entry(entry, encoders, args, tmp_path)
+    assert "proxy_latent" not in sample
+    assert sample["proxy_latents"].shape == (1, 24, 2, 1, 2)
+    assert sample["info"]["proxy_modality"] == "depth"
+    assert sample["info"]["proxy_references"] == ["depth"]
+    assert sample["info"]["proxy_variants"] == ["duv", "depth", "semantic", "style"]
+    assert sample["info"]["prompt"] == "a car turns left"
+    assert encoders.prompt == "Reference modality: depth video.\na car turns left"
+    assert len(encoders.previews) == 1
+
+
+def test_unlabelled_mixed_rows_are_balanced_without_duplicating_targets(encode_script):
+    rows = [
+        {"name": f"clip-{index}", "proxy_duv": f"duv/{index}", "proxy": f"style/{index}.mp4"}
+        for index in range(5)
+    ]
+    assigned = encode_script.assign_mixed_modalities(
+        rows, ("duv", "depth", "semantic", "style")
+    )
+    assert len(assigned) == len(rows)
+    assert [row["proxy_modality"] for row in assigned] == [
+        "duv",
+        "depth",
+        "semantic",
+        "style",
+        "duv",
+    ]
+    assert all("proxy_modality" not in row for row in rows)

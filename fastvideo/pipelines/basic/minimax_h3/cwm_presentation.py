@@ -24,13 +24,15 @@ _PROMPT_PATHS = {
     "w0": _PROMPT_ROOT / "system_w0.txt",
     "wn": _PROMPT_ROOT / "system_wn.txt",
     "w0_depth_semantic": _PROMPT_ROOT / "system_w0_depth_semantic.txt",
+    "w0_omni": _PROMPT_ROOT / "system_w0_omni.txt",
 }
-# w0/wn are the CWM release; w0_depth_semantic is this repo's variant of w0 for
-# separate depth (<Video 1>) and semantic (<Video 2>) references.
+# w0/wn are the CWM release. The other roles are repo variants for separate
+# depth+semantic videos and for a modality-labelled mixed single reference.
 _PROMPT_SHA256 = {
     "w0": "d488897872a5b190ff8d56b6acc255b66a78f67ae862c12582fcffc8a5dd4ddc",
     "wn": "cd018def9793b4f73cd1c9da9d8ca9ca508dd94a260a19d915aaf9f80b97b6b2",
     "w0_depth_semantic": "2916e0ba968a95281e9955b89081c40d1deeb740c7188994a17df9d4d39634ca",
+    "w0_omni": "ba1f711d718f52c8a8fdcc5ea7039ff48728bd3bf79b81a871e5f5e660aa0870",
 }
 CWM_SYSTEM_ROLES = tuple(_PROMPT_PATHS)
 

@@ -126,6 +126,7 @@ PROXY_SEMANTIC_B = (64, 192)
 
 # What each separate proxy reference is called in manifests, cache metadata and configs.
 PROXY_REFERENCE_KINDS = ("duv", "depth", "semantic")
+PROXY_VARIANT_KINDS = (*PROXY_REFERENCE_KINDS, "style")
 
 
 def semantic_palette() -> np.ndarray:
@@ -240,6 +241,7 @@ __all__ = [
     "PROXY_DEPTH_NEAR_METRES",
     "PROXY_DEPTH_VALID_EPSILON_METRES",
     "PROXY_REFERENCE_KINDS",
+    "PROXY_VARIANT_KINDS",
     "PROXY_SEMANTIC_B",
     "PROXY_SEMANTIC_CLASSES",
     "PROXY_SEMANTIC_G",

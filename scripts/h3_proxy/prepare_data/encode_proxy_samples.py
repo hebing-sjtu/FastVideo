@@ -41,12 +41,12 @@ video, each with all three channels to itself -- stored in that order as ``proxy
 and ``<Video 2>``, so the chat role has to describe two videos: ``--cwm-system w0_depth_semantic``.
 
 ``--fit center-crop`` reaches the grid without changing aspect: each stream is scaled to cover the
-grid and the overflow is cut equally from both sides, so a 1280x720 clip becomes 1280x704 by
-dropping 8 rows top and bottom. Depth and class planes are never scaled -- they must already be at
-the cover size, i.e. cut at the target's resolution -- so every reference stays pixel-aligned with
-the target. The anchor is cropped to the target's aspect before it is scaled to its short edge.
-The default ``resize`` is the legacy behaviour: colour is resized to the grid, and depth, class and
-DUV-video planes must be exactly on it.
+grid and the overflow is cut equally from both sides, so a 1280x720 target becomes 1280x704 by
+dropping 8 rows top and bottom. Depth and class planes are cropped but not scaled by default.
+``--code-resize nearest`` permits a smaller aligned reference: crop the planes to the target field
+of view, nearest-neighbour resize them, then construct depth, semantic or DUV pixels. A pre-packed
+DUV video is never resized. The anchor is cropped to the target's aspect before it is scaled to its
+short edge. The default ``resize`` is the legacy behaviour.
 
 ``anchor`` defaults to the target's first frame. Supplying a separate one is what lets the anchor
 carry an appearance the target clip never shows — a different art style, a reference photograph.
@@ -71,6 +71,15 @@ Usage::
         --manifest ... --root ... --output ... --model-path ... \\
         --num-frames 124 --height 704 --width 1280 --proxy-height 704 --proxy-width 1280 \\
         --fit center-crop --proxy-references depth semantic --cwm-system w0_depth_semantic
+
+    Mixed-single-reference omni cache. Unlabelled rows are deterministically balanced across the
+    available modalities; an explicit ``proxy_modality`` field overrides the assignment::
+
+        python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \\
+        --manifest ... --root ... --output ... --model-path ... \\
+        --num-frames 124 --height 704 --width 1280 --proxy-height 176 --proxy-width 320 \\
+        --fit center-crop --code-resize nearest \\
+        --proxy-variants duv depth semantic style --cwm-system w0_omni
 
     Refresh only the Qwen rows (VAE latents stay) after changing the chat wrap::
 
@@ -98,7 +107,8 @@ FIT_MODES = ("resize", "center-crop")
 # Mirrors `proxy.PROXY_REFERENCE_KINDS` and `cwm_presentation.CWM_SYSTEM_ROLES`; spelled out so
 # --help does not import fastvideo.
 PROXY_REFERENCES = ("duv", "depth", "semantic")
-CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "none")
+PROXY_VARIANTS = (*PROXY_REFERENCES, "style")
+CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "w0_omni", "none")
 # The video references each chat role names, in <Video N> order. Roles not listed describe the one
 # proxy video of the CWM release.
 ROLE_VIDEO_REFERENCES = {"w0_depth_semantic": ("depth", "semantic")}
@@ -150,13 +160,29 @@ def parse_args() -> argparse.Namespace:
         help="How every stream reaches its grid. 'center-crop' keeps aspect and cuts the overflow equally from "
         "both sides (1280x720 -> 1280x704); 'resize' is the legacy stretch.",
     )
-    parser.add_argument(
+    reference_group = parser.add_mutually_exclusive_group()
+    reference_group.add_argument(
         "--proxy-references",
         nargs="+",
-        default=list(LEGACY_REFERENCES),
+        default=None,
         choices=PROXY_REFERENCES,
         help="Video references made from a proxy_duv directory, in <Video N> order. 'duv' is the packed legacy "
         "reference; 'depth semantic' is two separate ones.",
+    )
+    reference_group.add_argument(
+        "--proxy-variants",
+        nargs="+",
+        default=None,
+        choices=PROXY_VARIANTS,
+        help="Mixed-single-reference mode: each manifest row chooses one allowed modality with "
+        "'proxy_modality'. Requires --cwm-system w0_omni.",
+    )
+    parser.add_argument(
+        "--code-resize",
+        choices=("reject", "nearest"),
+        default="reject",
+        help="How depth and semantic code planes reach a smaller proxy grid after the common aspect crop. "
+        "'nearest' preserves labels and boundaries; the legacy default rejects every scale.",
     )
     parser.add_argument(
         "--text-only",
@@ -171,13 +197,22 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--shard-index must be in [0, --num-shards)")
     if not 0 < args.qwen_video_fps <= 24:
         raise SystemExit(f"--qwen-video-fps must be in (0, 24], got {args.qwen_video_fps}")
-    args.proxy_references = tuple(args.proxy_references)
+    args.proxy_references = tuple(args.proxy_references or LEGACY_REFERENCES)
+    args.proxy_variants = tuple(args.proxy_variants or ())
     if len(set(args.proxy_references)) != len(args.proxy_references):
         raise SystemExit(f"--proxy-references names a reference twice: {list(args.proxy_references)}")
-    try:
-        check_role_references(args.cwm_system, args.proxy_references)
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+    if len(set(args.proxy_variants)) != len(args.proxy_variants):
+        raise SystemExit(f"--proxy-variants names a modality twice: {list(args.proxy_variants)}")
+    if args.proxy_variants:
+        if args.cwm_system != "w0_omni":
+            raise SystemExit("--proxy-variants requires --cwm-system w0_omni")
+        for variant in args.proxy_variants:
+            check_role_references(args.cwm_system, (variant,))
+    else:
+        try:
+            check_role_references(args.cwm_system, args.proxy_references)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     return args
 
 
@@ -189,6 +224,12 @@ def check_role_references(role: str, references: tuple[str, ...]) -> None:
     nothing of the second one -- a cache that encodes and trains without complaint.
     """
     if role == "none":
+        return
+    if role == "w0_omni":
+        if len(references) != 1 or references[0] not in PROXY_VARIANTS:
+            raise ValueError(
+                f"CWM role {role!r} requires exactly one typed proxy video, got {list(references)}"
+            )
         return
     expected = ROLE_VIDEO_REFERENCES.get(role)
     if expected is None:
@@ -212,7 +253,16 @@ def cover_size(source: tuple[int, int], target: tuple[int, int]) -> tuple[int, i
     return max(target_h, round(source_h * scale)), max(target_w, round(source_w * scale))
 
 
-def fit_frames(frames: np.ndarray, height: int, width: int, fit: str, *, codes: bool, what: str) -> np.ndarray:
+def fit_frames(
+    frames: np.ndarray,
+    height: int,
+    width: int,
+    fit: str,
+    *,
+    codes: bool,
+    what: str,
+    code_resize: str = "reject",
+) -> np.ndarray:
     """Bring ``[T, H, W]`` or ``[T, H, W, C]`` frames onto the ``height`` x ``width`` grid.
 
     ``codes`` marks planes whose values are not intensities -- metric depth, class ids, a DUV
@@ -223,6 +273,20 @@ def fit_frames(frames: np.ndarray, height: int, width: int, fit: str, *, codes: 
     source = tuple(int(size) for size in frames.shape[1:3])
     if source == (height, width):
         return frames
+    if codes and code_resize == "nearest":
+        if fit != "center-crop":
+            raise ValueError("--code-resize nearest requires --fit center-crop")
+        source_h, source_w = source
+        if source_w * height > width * source_h:
+            crop_h, crop_w = source_h, round(source_h * width / height)
+        else:
+            crop_h, crop_w = round(source_w * height / width), source_w
+        top, left = center_crop_box(source, (crop_h, crop_w))
+        cropped = frames[:, top:top + crop_h, left:left + crop_w]
+        return np.stack([
+            np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.NEAREST))
+            for frame in cropped
+        ]).astype(frames.dtype, copy=False)
     if fit == "resize":
         if codes:
             raise ValueError(f"{what} is {source[1]}x{source[0]} but the grid is {width}x{height}, and its values "
@@ -256,7 +320,7 @@ def read_video_frames(path: Path, num_frames: int, height: int, width: int, fit:
 
 
 def read_proxy_planes(directory: Path, num_frames: int, height: int, width: int,
-                      fit: str = "resize") -> tuple[np.ndarray, np.ndarray]:
+                      fit: str = "resize", code_resize: str = "reject") -> tuple[np.ndarray, np.ndarray]:
     """Read ``[T, H, W]`` metric depth and class ids from a per-frame directory, on the grid.
 
     Under ``resize`` the planes must already be on the grid. Under ``center-crop`` they are read at
@@ -275,8 +339,12 @@ def read_proxy_planes(directory: Path, num_frames: int, height: int, width: int,
         semantic_frames.append(
             read_semantic_png(directory / f"{ordinal:06d}.semantic_id.png", height=plane_h, width=plane_w))
     what = f"The proxy planes in {directory}"
-    depth = fit_frames(np.stack(depth_frames), height, width, fit, codes=True, what=what)
-    semantic = fit_frames(np.stack(semantic_frames), height, width, fit, codes=True, what=what)
+    depth = fit_frames(
+        np.stack(depth_frames), height, width, fit, codes=True, what=what, code_resize=code_resize
+    )
+    semantic = fit_frames(
+        np.stack(semantic_frames), height, width, fit, codes=True, what=what, code_resize=code_resize
+    )
     return depth, semantic
 
 
@@ -290,11 +358,14 @@ def pixels_to_preview(pixels: torch.Tensor) -> np.ndarray:
 
 
 def read_proxy_reference_clips(directory: Path, num_frames: int, height: int, width: int, fit: str,
-                               references: tuple[str, ...]) -> list[tuple[torch.Tensor, np.ndarray]]:
+                               references: tuple[str, ...],
+                               code_resize: str = "reject") -> list[tuple[torch.Tensor, np.ndarray]]:
     """Build each named reference from one depth + class directory, as ``(pixels, preview)`` pairs."""
     from fastvideo.pipelines.basic.minimax_h3.proxy import proxy_reference_clip
 
-    depth, semantic = read_proxy_planes(directory, num_frames, height, width, fit)
+    depth, semantic = read_proxy_planes(
+        directory, num_frames, height, width, fit, code_resize
+    )
     clips = []
     for kind in references:
         pixels = proxy_reference_clip(kind, depth, semantic)
@@ -573,7 +644,7 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
     if missing:
         raise KeyError(f"Manifest entry is missing {missing}")
     supplied = [key for key in PROXY_KEYS if entry.get(key)]
-    if len(supplied) != 1:
+    if not mixed_variants(args) and len(supplied) != 1:
         raise KeyError(f"A manifest entry needs exactly one of {list(PROXY_KEYS)}, got {supplied}")
 
     def resolve(key: str) -> Path | None:
@@ -581,17 +652,24 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
         return None if not value else (root / str(value))
 
     role = entry_cwm_system(entry, args.cwm_system)
-    check_role_references(role, args.proxy_references)
+    references = entry_proxy_references(entry, args)
+    check_role_references(role, references)
     target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width, args.fit)
     target_pixels = torch.from_numpy(target_frames.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
 
     proxies = load_proxy_clips(entry, args, root)
-    anchor = read_anchor_image(resolve("anchor"),
+    anchor = read_anchor_image(None if mixed_variants(args) else resolve("anchor"),
                                target_frames,
                                args.anchor_short_edge,
                                aspect=anchor_aspect(args))
+    original_prompt = str(entry["prompt"])
+    conditioning_prompt = (
+        f"Reference modality: {references[0]} video.\n{original_prompt}"
+        if mixed_variants(args)
+        else original_prompt
+    )
     text_embedding, text_token_tags = encoders.encode_text(
-        str(entry["prompt"]), anchor, [preview for _, preview in proxies], cwm_system=role)
+        conditioning_prompt, anchor, [preview for _, preview in proxies], cwm_system=role)
 
     sample: dict[str, Any] = {"vae_latent": encoders.encode_pixels(target_pixels)}
     if is_legacy(args):
@@ -606,9 +684,11 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
             "num_frames": int(args.num_frames),
             "pixel_size": (int(args.height), int(args.width)),
             "qwen_video_fps": float(args.qwen_video_fps),
-            "prompt": str(entry["prompt"]),
+            "prompt": original_prompt,
+            **({"conditioning_prompt": conditioning_prompt} if mixed_variants(args) else {}),
+            **({"anchor_source": "target_first_frame"} if mixed_variants(args) else {}),
             "cwm_system": role,
-            **reference_info(args),
+            **reference_info(args, entry),
         },
     })
     camera_path = resolve("camera")
@@ -630,19 +710,50 @@ def entry_cwm_system(entry: dict[str, Any], default: str) -> str:
 
 def is_legacy(args: argparse.Namespace) -> bool:
     """The single packed reference, cached under ``proxy_latent`` exactly as before."""
-    return tuple(args.proxy_references) == LEGACY_REFERENCES
+    return not mixed_variants(args) and tuple(args.proxy_references) == LEGACY_REFERENCES
+
+
+def mixed_variants(args: argparse.Namespace) -> tuple[str, ...]:
+    return tuple(getattr(args, "proxy_variants", ()) or ())
+
+
+def entry_proxy_references(entry: dict[str, Any], args: argparse.Namespace) -> tuple[str, ...]:
+    variants = mixed_variants(args)
+    if not variants:
+        return tuple(args.proxy_references)
+    modality = str(entry.get("proxy_modality") or "").strip().lower()
+    if modality not in variants:
+        raise ValueError(
+            f"manifest proxy_modality must be one of {list(variants)}, got {modality!r}"
+        )
+    return (modality,)
 
 
 def anchor_aspect(args: argparse.Namespace) -> tuple[int, int] | None:
     return (int(args.height), int(args.width)) if args.fit == "center-crop" else None
 
 
-def reference_info(args: argparse.Namespace) -> dict[str, Any]:
+def reference_info(
+    args: argparse.Namespace,
+    entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Cache metadata for the non-legacy options, absent otherwise so a legacy sample is unchanged."""
     info: dict[str, Any] = {}
     if args.fit != "resize":
         info["fit"] = args.fit
-    if not is_legacy(args):
+    variants = mixed_variants(args)
+    if variants:
+        if entry is None:
+            info["proxy_variants"] = list(variants)
+        else:
+            modality = entry_proxy_references(entry, args)[0]
+            info.update({
+                "proxy_references": [modality],
+                "proxy_modality": modality,
+                "proxy_variants": list(variants),
+                "code_resize": str(getattr(args, "code_resize", "reject")),
+            })
+    elif not is_legacy(args):
         info["proxy_references"] = list(args.proxy_references)
     return info
 
@@ -651,12 +762,38 @@ def load_proxy_clips(entry: dict[str, Any], args: argparse.Namespace,
                      root: Path) -> list[tuple[torch.Tensor, np.ndarray]]:
     """Every proxy video reference of an entry, in <Video N> order, as ``(pixels, preview)``."""
     grid = (args.num_frames, args.proxy_height, args.proxy_width)
+    variants = mixed_variants(args)
+    if variants:
+        modality = entry_proxy_references(entry, args)[0]
+        if modality == "style":
+            if not entry.get("proxy"):
+                raise KeyError("proxy_modality='style' requires the manifest 'proxy' RGB video")
+            preview = read_video_frames(root / str(entry["proxy"]), *grid, args.fit)
+            pixels = torch.from_numpy(preview.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
+            return [(pixels, preview)]
+        if not entry.get("proxy_duv"):
+            raise KeyError(
+                f"proxy_modality={modality!r} requires 'proxy_duv' depth/semantic planes"
+            )
+        return read_proxy_reference_clips(
+            root / str(entry["proxy_duv"]),
+            *grid,
+            args.fit,
+            (modality,),
+            str(getattr(args, "code_resize", "reject")),
+        )
     if not is_legacy(args):
         if not entry.get("proxy_duv"):
             raise KeyError(f"--proxy-references {' '.join(args.proxy_references)} builds the references from depth and "
                            "class planes, so the entry needs 'proxy_duv' (a directory of .depth.f32 and "
                            ".semantic_id.png frames); a composed video or RGB render cannot be split.")
-        return read_proxy_reference_clips(root / str(entry["proxy_duv"]), *grid, args.fit, args.proxy_references)
+        return read_proxy_reference_clips(
+            root / str(entry["proxy_duv"]),
+            *grid,
+            args.fit,
+            args.proxy_references,
+            str(getattr(args, "code_resize", "reject")),
+        )
     if entry.get("proxy_duv"):
         return [read_duv_clip(root / str(entry["proxy_duv"]), *grid, args.fit)]
     if entry.get("proxy_duv_video"):
@@ -676,13 +813,16 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
     if not isinstance(sample, dict) or "vae_latent" not in sample:
         raise ValueError(f"{out_path} is not an H3 proxy cache sample")
     recorded = tuple((sample.get("info") or {}).get("proxy_references") or LEGACY_REFERENCES)
-    if recorded != tuple(args.proxy_references):
-        raise ValueError(f"{out_path} carries the proxy references {list(recorded)}, but --proxy-references is "
-                         f"{list(args.proxy_references)}; the Qwen rows would describe videos the latents are not.")
+    references = entry_proxy_references(entry, args)
+    if recorded != references:
+        raise ValueError(
+            f"{out_path} carries the proxy references {list(recorded)}, but this row requires "
+            f"{list(references)}; the Qwen rows would describe videos the latents are not."
+        )
     role = entry_cwm_system(entry, args.cwm_system)
-    check_role_references(role, args.proxy_references)
+    check_role_references(role, references)
     proxy_previews = load_proxy_previews(entry, args, root)
-    if entry.get("anchor"):
+    if entry.get("anchor") and not mixed_variants(args):
         # Target pixels are not loaded; the stored anchor size is unused for Qwen's PIL path.
         dummy = np.zeros((1, args.height, args.width, 3), dtype=np.uint8)
         anchor = read_anchor_image(root / str(entry["anchor"]), dummy, args.anchor_short_edge, aspect=anchor_aspect(args))
@@ -690,12 +830,21 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
         target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width,
                                           args.fit)
         anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
+    original_prompt = str(entry["prompt"])
+    conditioning_prompt = (
+        f"Reference modality: {references[0]} video.\n{original_prompt}"
+        if mixed_variants(args)
+        else original_prompt
+    )
     text_embedding, text_token_tags = encoders.encode_text(
-        str(entry["prompt"]), anchor, proxy_previews, cwm_system=role)
+        conditioning_prompt, anchor, proxy_previews, cwm_system=role)
     sample["text_embedding"] = text_embedding
     sample["text_token_tags"] = text_token_tags
     info = dict(sample.get("info") or {})
-    info["prompt"] = str(entry["prompt"])
+    info["prompt"] = original_prompt
+    if mixed_variants(args):
+        info["conditioning_prompt"] = conditioning_prompt
+        info.update(reference_info(args, entry))
     info["cwm_system"] = role
     info["qwen_video_fps"] = float(args.qwen_video_fps)
     sample["info"] = info
@@ -705,7 +854,60 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
 MEDIA_KEYS = ("target", *PROXY_KEYS, "anchor")
 
 
-def preflight_media(entries: list[dict[str, Any]], root: Path) -> None:
+def assign_mixed_modalities(
+    entries: list[dict[str, Any]],
+    variants: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Assign one available modality per unlabelled row, balanced and deterministically.
+
+    A row may carry both ``proxy_duv`` planes and a ``proxy`` style video. It is still encoded
+    exactly once: explicit ``proxy_modality`` wins; otherwise consecutive rows rotate through the
+    requested variants. This avoids storing the large target latent four times.
+    """
+
+    assigned: list[dict[str, Any]] = []
+    counts = dict.fromkeys(variants, 0)
+    for index, original in enumerate(entries):
+        entry = dict(original)
+        explicit = str(entry.get("proxy_modality") or "").strip().lower()
+        if explicit:
+            if explicit not in variants:
+                raise SystemExit(
+                    f"Manifest row {index + 1} has proxy_modality={explicit!r}, not one of "
+                    f"{list(variants)}"
+                )
+            choices = (explicit,)
+        else:
+            rotated = variants[index % len(variants):] + variants[:index % len(variants)]
+            choices = tuple(sorted(rotated, key=lambda kind: counts[kind]))
+        available = [
+            kind
+            for kind in choices
+            if (kind == "style" and entry.get("proxy"))
+            or (kind != "style" and entry.get("proxy_duv"))
+        ]
+        if not available:
+            raise SystemExit(
+                f"Manifest row {index + 1} has no source for any selected proxy modality; "
+                "DUV/depth/semantic need 'proxy_duv', and style needs 'proxy'"
+            )
+        entry["proxy_modality"] = available[0]
+        counts[available[0]] += 1
+        assigned.append(entry)
+    missing = [kind for kind, count in counts.items() if count == 0]
+    if missing:
+        raise SystemExit(
+            f"No manifest row was assigned requested proxy modalities {missing}; "
+            "remove unavailable names from --proxy-variants or add their media"
+        )
+    return assigned
+
+
+def preflight_media(
+    entries: list[dict[str, Any]],
+    root: Path,
+    args: argparse.Namespace | None = None,
+) -> None:
     """Stop on a wrong ``--root`` before the VAE and the text encoder load.
 
     Every path a seg manifest writes is relative and ``--root`` defaults to the launch directory, so
@@ -719,7 +921,13 @@ def preflight_media(entries: list[dict[str, Any]], root: Path) -> None:
     sample = entries[:3]
     reports = []
     for entry in sample:
-        present = [str(entry[key]) for key in MEDIA_KEYS if entry.get(key)]
+        if args is not None and mixed_variants(args):
+            modality = entry_proxy_references(entry, args)[0]
+            source_key = "proxy" if modality == "style" else "proxy_duv"
+            keys = ("target", source_key)
+        else:
+            keys = MEDIA_KEYS
+        present = [str(entry[key]) for key in keys if entry.get(key)]
         missing = [value for value in present if not (root / value).exists()]
         if len(missing) != len(present) or not present:
             return
@@ -741,10 +949,12 @@ def main() -> None:
 
     with open(args.manifest, encoding="utf-8") as handle:
         entries = [json.loads(line) for line in handle if line.strip() and not line.startswith("#")]
+    if mixed_variants(args):
+        entries = assign_mixed_modalities(entries, mixed_variants(args))
     entries = entries[args.shard_index::args.num_shards]
     if not entries:
         raise SystemExit(f"Manifest shard {args.shard_index}/{args.num_shards} is empty")
-    preflight_media(entries, root)
+    preflight_media(entries, root, args)
 
     init_single_process_distributed()
     encoders = Encoders(
