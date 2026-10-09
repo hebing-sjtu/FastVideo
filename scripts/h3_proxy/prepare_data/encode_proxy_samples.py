@@ -626,14 +626,16 @@ def init_single_process_distributed() -> None:
     The port has to be per-process, not a fixed constant: sharding a manifest across eight GPUs
     means eight of these running at once, and each rank-0 group stands up its own TCP store. A
     shared port lets exactly one shard start and the other seven die on ``EADDRINUSE`` seconds in,
-    which looks like a data problem and is not one. An explicit ``MASTER_PORT`` still wins, so a
-    caller that needs a fixed port can set one.
+    which looks like a data problem and is not one. Scheduler-provided distributed variables must
+    not win here: every encoder shard is intentionally its own one-rank local process group.
     """
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", free_localhost_port())
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.update({
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": free_localhost_port(),
+        "RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_RANK": "0",
+    })
     from fastvideo.distributed import maybe_init_distributed_environment_and_model_parallel
 
     maybe_init_distributed_environment_and_model_parallel(1, 1)
