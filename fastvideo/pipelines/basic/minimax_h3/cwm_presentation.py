@@ -23,11 +23,16 @@ _PROMPT_ROOT = Path(__file__).with_name("prompts")
 _PROMPT_PATHS = {
     "w0": _PROMPT_ROOT / "system_w0.txt",
     "wn": _PROMPT_ROOT / "system_wn.txt",
+    "w0_depth_semantic": _PROMPT_ROOT / "system_w0_depth_semantic.txt",
 }
+# w0/wn are the CWM release; w0_depth_semantic is this repo's variant of w0 for
+# separate depth (<Video 1>) and semantic (<Video 2>) references.
 _PROMPT_SHA256 = {
     "w0": "d488897872a5b190ff8d56b6acc255b66a78f67ae862c12582fcffc8a5dd4ddc",
     "wn": "cd018def9793b4f73cd1c9da9d8ca9ca508dd94a260a19d915aaf9f80b97b6b2",
+    "w0_depth_semantic": "2916e0ba968a95281e9955b89081c40d1deeb740c7188994a17df9d4d39634ca",
 }
+CWM_SYSTEM_ROLES = tuple(_PROMPT_PATHS)
 
 # A marker that cannot appear in the packaged system prompts. The chat template
 # is asked to place it as the entire user content; we split on it and splice
@@ -46,13 +51,13 @@ def canonical_caption(value: str) -> str:
 
 
 def load_cwm_system_prompt(role: str) -> str:
-    """Return the packaged CWM system text for ``w0`` or ``wn``.
+    """Return the packaged CWM system text for one of :data:`CWM_SYSTEM_ROLES`.
 
     Bytes are hashed against the CWM release so a silent edit of the prompt
     files cannot ship a different instruction than inference.
     """
     if role not in _PROMPT_PATHS:
-        raise ValueError(f"CWM system role must be 'w0' or 'wn', got {role!r}")
+        raise ValueError(f"CWM system role must be one of {list(CWM_SYSTEM_ROLES)}, got {role!r}")
     path = _PROMPT_PATHS[role]
     if not path.is_file():
         raise FileNotFoundError(f"packaged CWM system prompt is missing: {path}")
@@ -73,9 +78,9 @@ def resolve_cwm_system_role(value: object) -> str | None:
     role = str(value).strip().lower()
     if not role or role == "none":
         return None
-    if role in {"w0", "wn"}:
+    if role in _PROMPT_PATHS:
         return role
-    raise ValueError(f"CWM system role must be 'w0', 'wn', or 'none', got {value!r}")
+    raise ValueError(f"CWM system role must be one of {list(CWM_SYSTEM_ROLES)} or 'none', got {value!r}")
 
 
 def wrap_ref2va_chat(
@@ -143,6 +148,7 @@ def _token_ids(tokenizer: Any, value: str) -> list[int]:
 
 __all__ = [
     "CWM_SYSTEM_PROMPT_KEY",
+    "CWM_SYSTEM_ROLES",
     "canonical_caption",
     "load_cwm_system_prompt",
     "resolve_cwm_system_role",

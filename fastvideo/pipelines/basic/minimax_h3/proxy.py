@@ -117,6 +117,78 @@ def pack_duv_frame(metric_depth: np.ndarray, semantic_ids: np.ndarray) -> np.nda
     return np.stack((depth, u, v), axis=-1)
 
 
+# The separate semantic reference has all three channels to itself, so the 12 classes go on a
+# 3x2x2 lattice of the RGB cube rather than DUV's 4x3 UV square: the nearest two classes are 85
+# levels apart instead of 64, with every level still interior for the same ringing reason.
+PROXY_SEMANTIC_R = (43, 128, 213)
+PROXY_SEMANTIC_G = (64, 192)
+PROXY_SEMANTIC_B = (64, 192)
+
+# What each separate proxy reference is called in manifests, cache metadata and configs.
+PROXY_REFERENCE_KINDS = ("duv", "depth", "semantic")
+
+
+def semantic_palette() -> np.ndarray:
+    """``[PROXY_SEMANTIC_NUM_CLASSES, 3]`` uint8 colours of the separate semantic reference."""
+    ids = np.arange(PROXY_SEMANTIC_NUM_CLASSES)
+    return np.stack(
+        (
+            np.asarray(PROXY_SEMANTIC_R)[ids % 3],
+            np.asarray(PROXY_SEMANTIC_G)[(ids // 3) % 2],
+            np.asarray(PROXY_SEMANTIC_B)[ids // 6],
+        ),
+        axis=-1,
+    ).astype(np.uint8)
+
+
+def depth_frame_pixels(metric_depth: np.ndarray) -> np.ndarray:
+    """One depth map as a grey ``[H, W, 3]`` float32 image: DUV's D channel in all three."""
+    depth = encode_depth(metric_depth)
+    return np.repeat(depth[..., None], 3, axis=-1)
+
+
+def semantic_frame_pixels(semantic_ids: np.ndarray) -> np.ndarray:
+    """One class-id map as a flat-colour ``[H, W, 3]`` float32 image in ``[0, 1]``."""
+    ids = np.asarray(semantic_ids)
+    if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= PROXY_SEMANTIC_NUM_CLASSES):
+        raise ValueError(f"Proxy semantic ids must lie in [0, {PROXY_SEMANTIC_NUM_CLASSES}), got "
+                         f"[{int(ids.min())}, {int(ids.max())}].")
+    return semantic_palette()[ids.astype(np.int64)].astype(np.float32) / np.float32(255.0)
+
+
+def proxy_reference_clip(kind: str, depth_frames: np.ndarray, semantic_frames: np.ndarray) -> torch.Tensor:
+    """Build one proxy reference's ``[1, 3, T, H, W]`` VAE input from depth and class ids.
+
+    ``duv`` is the packed single reference; ``depth`` and ``semantic`` are the two halves of it as
+    separate references, each with the full three channels.
+    """
+    if kind == "duv":
+        return pack_duv_clip(depth_frames, semantic_frames)
+    if depth_frames.shape != semantic_frames.shape or depth_frames.ndim != 3:
+        raise ValueError("A proxy clip needs matching [frames, height, width] depth and semantic arrays, got "
+                         f"{depth_frames.shape} and {semantic_frames.shape}.")
+    if kind == "depth":
+        frames = np.stack([depth_frame_pixels(depth) for depth in depth_frames])
+    elif kind == "semantic":
+        frames = np.stack([semantic_frame_pixels(ids) for ids in semantic_frames])
+    else:
+        raise ValueError(f"Unknown proxy reference {kind!r}; expected one of {list(PROXY_REFERENCE_KINDS)}.")
+    tensor = torch.from_numpy(np.ascontiguousarray(frames)).to(torch.float32)
+    return tensor.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
+
+
+def center_crop_box(source: tuple[int, int], target: tuple[int, int]) -> tuple[int, int]:
+    """Top-left ``(top, left)`` of a ``target`` ``(H, W)`` window centred in ``source`` ``(H, W)``.
+
+    Cropping, never scaling: depth and class ids cannot be interpolated, so every reference of a
+    sample is cut from the same box and stays pixel-aligned with the target.
+    """
+    (source_h, source_w), (target_h, target_w) = source, target
+    if target_h > source_h or target_w > source_w:
+        raise ValueError(f"Cannot center-crop {target_w}x{target_h} out of a {source_w}x{source_h} frame.")
+    return (source_h - target_h) // 2, (source_w - target_w) // 2
+
+
 def read_raw_depth(path: str | Path, *, height: int, width: int) -> np.ndarray:
     """Read a headerless C-order little-endian float32 depth map of known shape."""
     payload = Path(path).read_bytes()
@@ -167,15 +239,24 @@ __all__ = [
     "PROXY_DEPTH_FAR_METRES",
     "PROXY_DEPTH_NEAR_METRES",
     "PROXY_DEPTH_VALID_EPSILON_METRES",
+    "PROXY_REFERENCE_KINDS",
+    "PROXY_SEMANTIC_B",
     "PROXY_SEMANTIC_CLASSES",
+    "PROXY_SEMANTIC_G",
     "PROXY_SEMANTIC_NUM_CLASSES",
+    "PROXY_SEMANTIC_R",
     "PROXY_SEMANTIC_U",
     "PROXY_SEMANTIC_V",
+    "center_crop_box",
+    "depth_frame_pixels",
     "encode_depth",
     "encode_semantic_ids",
     "pack_duv_clip",
     "pack_duv_frame",
+    "proxy_reference_clip",
     "read_raw_depth",
     "read_semantic_png",
     "rgb_clip_to_pixels",
+    "semantic_frame_pixels",
+    "semantic_palette",
 ]

@@ -35,12 +35,23 @@ Episodes, not clips, are split. Five clips cut from one 60-second episode share 
 and terrain, so splitting by clip would validate on footage already trained on and report a loss
 that looks much better than the model is.
 
+``--proxy-source duv-frames`` emits the clip's ``duv/`` directory as ``proxy_duv`` instead -- the
+per-frame metric depth and cwm12 class ids that ``clip-episodes PROXY_DUV=1`` writes beside the
+video. That is the form ``encode_proxy_samples.py --proxy-references depth semantic`` needs, since a
+composed video cannot be split back into its planes. Pass the grid the planes were *written* at
+(e.g. 1280x720 for a ``DUV_SIZE=native`` corpus); the encoder does the crop.
+
 Usage::
 
     python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \\
       --root /data/binghe/datasets/ABot-sub-2000-clips \\
       --split train --val-episodes 24 \\
       --out /workspace/h3_abot_train.jsonl
+
+    python scripts/h3_proxy/prepare_data/clip_dir_to_encode_manifest.py \\
+      --root /data/binghe/datasets/abot-720p-clips --proxy-source duv-frames \\
+      --target-height 720 --target-width 1280 --proxy-height 720 --proxy-width 1280 \\
+      --split train --val-episodes 24 --out /workspace/h3_abot_720p_train.jsonl
 """
 
 from __future__ import annotations
@@ -89,6 +100,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-width", type=int, default=1344)
     p.add_argument("--proxy-height", type=int, default=192)
     p.add_argument("--proxy-width", type=int, default=336)
+    p.add_argument("--proxy-source",
+                   choices=("duv-video", "duv-frames"),
+                   default="duv-video",
+                   help="'duv-video' passes proxy/duv.mp4 as proxy_duv_video; 'duv-frames' passes the per-frame "
+                   "duv/ directory as proxy_duv, for separate depth and semantic references.")
     p.add_argument("--prompt-fallback",
                    default="",
                    help="Prompt for clips with no prompt.txt. Empty means skip them.")
@@ -274,6 +290,36 @@ def preflight_duv(paths: list[Path], height: int, width: int, num_frames: int) -
     return problems, None
 
 
+def preflight_duv_frames(directories: list[Path], height: int, width: int, num_frames: int) -> list[str]:
+    """Check a sample of per-frame DUV directories are complete and on the expected grid.
+
+    Only the first and last frames are opened: a short write shows up as a missing or truncated last
+    frame, and a grid mismatch shows on the first.
+    """
+    from PIL import Image
+
+    problems: list[str] = []
+    expected = height * width * 4
+    for directory in directories:
+        clip = directory.parent.name
+        for ordinal in (0, num_frames - 1):
+            depth = directory / f"{ordinal:06d}.depth.f32"
+            semantic = directory / f"{ordinal:06d}.semantic_id.png"
+            if not depth.is_file() or not semantic.is_file():
+                problems.append(f"{clip}: duv/ has no frame {ordinal:06d}; {num_frames} are required")
+                break
+            if depth.stat().st_size != expected:
+                problems.append(f"{clip}: {depth.name} is {depth.stat().st_size} bytes, expected {expected} for "
+                                f"{width}x{height}")
+                break
+            with Image.open(semantic) as image:
+                if image.mode != "L" or image.size != (width, height):
+                    problems.append(f"{clip}: {semantic.name} is mode {image.mode} at {image.size[0]}x{image.size[1]}"
+                                    f", expected L at {width}x{height}")
+                    break
+    return problems
+
+
 def main() -> None:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
@@ -303,6 +349,8 @@ def main() -> None:
     progress(f"  {len(clip_dirs)} clips over {len(episodes)} episodes; split '{args.split}' selects {in_split} clips "
              f"over {len(keep_episodes)} episodes. Reading each clip_report.json ...")
 
+    frames_source = args.proxy_source == "duv-frames"
+    proxy_key = "proxy_duv" if frames_source else "proxy_duv_video"
     rows: list[dict] = []
     rejected: list[str] = []
     out_of_split = 0
@@ -322,6 +370,11 @@ def main() -> None:
         target, anchor, duv = (clip / "target" / "rgb.mp4", clip / "target" / "anchor.png", clip / "proxy" / "duv.mp4")
         report_file = clip / "clip_report.json"
         missing = [path.name for path in (target, anchor, duv, report_file) if not path.is_file()]
+        if frames_source:
+            duv = clip / "duv"
+            missing = [name for name in missing if name != "duv.mp4"]
+            if not duv.is_dir():
+                missing.append("duv/ (cut with PROXY_DUV=1)")
         if missing:
             rejected.append(f"{clip.name}: missing {', '.join(missing)}")
             continue
@@ -353,7 +406,7 @@ def main() -> None:
         rows.append({
             "name": clip.name,
             "target": str(target.relative_to(root)),
-            "proxy_duv_video": str(duv.relative_to(root)),
+            proxy_key: str(duv.relative_to(root)),
             "anchor": str(anchor.relative_to(root)),
             "prompt": prompt,
             "id": clip.name,
@@ -369,16 +422,20 @@ def main() -> None:
     progress(f"  scan done: {len(rows)} usable, {len(rejected)} rejected.")
     check_conventions(conventions)
     sampled = evenly_spaced(rows, args.preflight_limit) if args.preflight_limit > 0 else []
-    if sampled:
-        # Worth naming: the import behind this pulls in torch, which on a cold page cache is tens of
-        # seconds of a process that looks stuck.
-        progress(f"  decoding {len(sampled)} DUV clip(s) for the palette preflight (first call imports torch) ...")
-    problems, skipped = preflight_duv(
-        [root / row["proxy_duv_video"] for row in sampled],
-        args.proxy_height,
-        args.proxy_width,
-        args.num_frames,
-    )
+    if frames_source:
+        problems, skipped = preflight_duv_frames([root / row[proxy_key] for row in sampled], args.proxy_height,
+                                                 args.proxy_width, args.num_frames), None
+    else:
+        if sampled:
+            # Worth naming: the import behind this pulls in torch, which on a cold page cache is tens of
+            # seconds of a process that looks stuck.
+            progress(f"  decoding {len(sampled)} DUV clip(s) for the palette preflight (first call imports torch) ...")
+        problems, skipped = preflight_duv(
+            [root / row[proxy_key] for row in sampled],
+            args.proxy_height,
+            args.proxy_width,
+            args.num_frames,
+        )
     if problems:
         print(f"DUV preflight found {len(problems)} problem(s):")
         for line in problems:
@@ -416,6 +473,9 @@ def main() -> None:
     print(f"  DUV convention: taxonomy={taxonomy!r}, depth_inverted={inverted}")
     if skipped is not None:
         print(f"  DUV preflight skipped: {skipped}")
+    elif sampled and frames_source:
+        print(f"  DUV frame preflight passed on {len(sampled)} clip(s): {args.proxy_width}x{args.proxy_height}, "
+              f"frames 0 and {args.num_frames - 1} present")
     elif sampled:
         print(f"  DUV preflight passed on {len(sampled)} clip(s): "
               f"{args.proxy_width}x{args.proxy_height}, 24 fps, all class codes in the palette")
@@ -434,6 +494,8 @@ def report_frame_budget(rows: list[dict], root: Path, limit: int, num_frames: in
     budgets: list[tuple[str, int]] = []
     for row in sample:
         for key in ("target", "proxy_duv_video"):
+            if key not in row:
+                continue
             usable = probe_usable_frames(root / str(row[key]))
             if usable is not None:
                 budgets.append((f"{row['name']}/{key}", usable))

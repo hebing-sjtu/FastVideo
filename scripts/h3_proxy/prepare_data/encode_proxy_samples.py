@@ -33,6 +33,21 @@ than a shaded render does.
     it only has to be the same one at sampling time. Nothing is resized -- see
     :func:`read_duv_video_clip`.
 
+``--proxy-references`` decides what a ``proxy_duv`` directory becomes. The default ``duv`` is the
+one packed reference above, stored as ``proxy_latent`` ``[24, T, h, w]``. ``depth semantic`` makes
+two separate video references out of the same planes -- a grey depth video and a flat-colour class
+video, each with all three channels to itself -- stored in that order as ``proxy_latents``
+``[R, 24, T, h, w]`` with ``info["proxy_references"]`` naming them. Qwen sees them as ``<Video 1>``
+and ``<Video 2>``, so the chat role has to describe two videos: ``--cwm-system w0_depth_semantic``.
+
+``--fit center-crop`` reaches the grid without changing aspect: each stream is scaled to cover the
+grid and the overflow is cut equally from both sides, so a 1280x720 clip becomes 1280x704 by
+dropping 8 rows top and bottom. Depth and class planes are never scaled -- they must already be at
+the cover size, i.e. cut at the target's resolution -- so every reference stays pixel-aligned with
+the target. The anchor is cropped to the target's aspect before it is scaled to its short edge.
+The default ``resize`` is the legacy behaviour: colour is resized to the grid, and depth, class and
+DUV-video planes must be exactly on it.
+
 ``anchor`` defaults to the target's first frame. Supplying a separate one is what lets the anchor
 carry an appearance the target clip never shows — a different art style, a reference photograph.
 
@@ -49,6 +64,13 @@ Usage::
         --model-path data/models/MiniMax-H3 \\
         --num-frames 124 --height 768 --width 1344 \\
         --cwm-system w0
+
+    Omni cache from a 1280x720 native corpus -- target, depth and semantic all 1280x704::
+
+    python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \\
+        --manifest ... --root ... --output ... --model-path ... \\
+        --num-frames 124 --height 704 --width 1280 --proxy-height 704 --proxy-width 1280 \\
+        --fit center-crop --proxy-references depth semantic --cwm-system w0_depth_semantic
 
     Refresh only the Qwen rows (VAE latents stay) after changing the chat wrap::
 
@@ -72,6 +94,15 @@ import torch
 REQUIRED_MEDIA_KEYS = ("target", "prompt")
 # Exactly one of these names the proxy. Order is only for error messages.
 PROXY_KEYS = ("proxy", "proxy_duv", "proxy_duv_video")
+FIT_MODES = ("resize", "center-crop")
+# Mirrors `proxy.PROXY_REFERENCE_KINDS` and `cwm_presentation.CWM_SYSTEM_ROLES`; spelled out so
+# --help does not import fastvideo.
+PROXY_REFERENCES = ("duv", "depth", "semantic")
+CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "none")
+# The video references each chat role names, in <Video N> order. Roles not listed describe the one
+# proxy video of the CWM release.
+ROLE_VIDEO_REFERENCES = {"w0_depth_semantic": ("depth", "semantic")}
+LEGACY_REFERENCES = ("duv", )
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,9 +138,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cwm-system",
         default="w0",
-        choices=("w0", "wn", "none"),
-        help="Wrap Qwen in CWM's AWM_PROXY_CONTROL chat. ABot single-window clips are w0. "
-        "Per-row 'cwm_system' in the manifest overrides this. 'none' keeps the flat user body.",
+        choices=CWM_SYSTEM_CHOICES,
+        help="Wrap Qwen in CWM's AWM_PROXY_CONTROL chat. ABot single-window clips are w0; separate depth "
+        "and semantic references are w0_depth_semantic. Per-row 'cwm_system' in the manifest overrides this. "
+        "'none' keeps the flat user body.",
+    )
+    parser.add_argument(
+        "--fit",
+        default="resize",
+        choices=FIT_MODES,
+        help="How every stream reaches its grid. 'center-crop' keeps aspect and cuts the overflow equally from "
+        "both sides (1280x720 -> 1280x704); 'resize' is the legacy stretch.",
+    )
+    parser.add_argument(
+        "--proxy-references",
+        nargs="+",
+        default=list(LEGACY_REFERENCES),
+        choices=PROXY_REFERENCES,
+        help="Video references made from a proxy_duv directory, in <Video N> order. 'duv' is the packed legacy "
+        "reference; 'depth semantic' is two separate ones.",
     )
     parser.add_argument(
         "--text-only",
@@ -124,7 +171,33 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--shard-index must be in [0, --num-shards)")
     if not 0 < args.qwen_video_fps <= 24:
         raise SystemExit(f"--qwen-video-fps must be in (0, 24], got {args.qwen_video_fps}")
+    args.proxy_references = tuple(args.proxy_references)
+    if len(set(args.proxy_references)) != len(args.proxy_references):
+        raise SystemExit(f"--proxy-references names a reference twice: {list(args.proxy_references)}")
+    try:
+        check_role_references(args.cwm_system, args.proxy_references)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     return args
+
+
+def check_role_references(role: str, references: tuple[str, ...]) -> None:
+    """Refuse a chat role that describes different videos than the sample carries.
+
+    The system prompt is the only place Qwen is told what <Video 1> and <Video 2> are, so a w0
+    prompt over a depth+semantic pair would call the depth video "the conditioning proxy" and say
+    nothing of the second one -- a cache that encodes and trains without complaint.
+    """
+    if role == "none":
+        return
+    expected = ROLE_VIDEO_REFERENCES.get(role)
+    if expected is None:
+        if len(references) != 1:
+            raise ValueError(f"CWM role {role!r} describes one proxy video, but the proxy references are "
+                             f"{list(references)}. Use --cwm-system w0_depth_semantic for depth+semantic, or none.")
+    elif tuple(references) != expected:
+        raise ValueError(f"CWM role {role!r} describes the video references {list(expected)} in that order, but "
+                         f"the proxy references are {list(references)}.")
 
 
 # ----------------------------------------------------------------------
@@ -132,43 +205,120 @@ def parse_args() -> argparse.Namespace:
 # ----------------------------------------------------------------------
 
 
-def read_video_frames(path: Path, num_frames: int, height: int, width: int) -> np.ndarray:
-    """Decode, resample to 24 fps, trim, and resize a clip to ``[T, H, W, 3]`` uint8."""
+def cover_size(source: tuple[int, int], target: tuple[int, int]) -> tuple[int, int]:
+    """The ``(H, W)`` an aspect-preserving scale of ``source`` reaches when it just covers ``target``."""
+    (source_h, source_w), (target_h, target_w) = source, target
+    scale = max(target_h / source_h, target_w / source_w)
+    return max(target_h, round(source_h * scale)), max(target_w, round(source_w * scale))
+
+
+def fit_frames(frames: np.ndarray, height: int, width: int, fit: str, *, codes: bool, what: str) -> np.ndarray:
+    """Bring ``[T, H, W]`` or ``[T, H, W, C]`` frames onto the ``height`` x ``width`` grid.
+
+    ``codes`` marks planes whose values are not intensities -- metric depth, class ids, a DUV
+    video's packed codes -- which may be cropped but never interpolated.
+    """
+    from fastvideo.pipelines.basic.minimax_h3.proxy import center_crop_box
+
+    source = tuple(int(size) for size in frames.shape[1:3])
+    if source == (height, width):
+        return frames
+    if fit == "resize":
+        if codes:
+            raise ValueError(f"{what} is {source[1]}x{source[0]} but the grid is {width}x{height}, and its values "
+                             "are codes that resizing would blend. Write it at the grid, or use --fit center-crop "
+                             "if it is the target's resolution.")
+        return np.stack(
+            [np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames])
+    cover = cover_size(source, (height, width))
+    if cover != source:
+        if codes:
+            raise ValueError(f"{what} is {source[1]}x{source[0]}; center-cropping it onto {width}x{height} would "
+                             f"first need a scale to {cover[1]}x{cover[0]}, and its values are codes that cannot be "
+                             "scaled. Cut the corpus at the target's resolution.")
+        frames = np.stack([
+            np.asarray(Image.fromarray(frame).resize((cover[1], cover[0]), Image.Resampling.LANCZOS))
+            for frame in frames
+        ])
+    top, left = center_crop_box(cover, (height, width))
+    return np.ascontiguousarray(frames[:, top:top + height, left:left + width])
+
+
+def read_video_frames(path: Path, num_frames: int, height: int, width: int, fit: str = "resize") -> np.ndarray:
+    """Decode, resample to 24 fps, trim, and fit a clip to ``[T, H, W, 3]`` uint8."""
     from fastvideo.pipelines.basic.minimax_h3.reference import decode_reference_video, resample_reference_frames
 
     frames, source_fps, _ = decode_reference_video(path)
     frames = resample_reference_frames(frames, source_fps)
     if frames.shape[0] < num_frames:
         raise ValueError(f"{path} yields {frames.shape[0]} frames at 24 fps; {num_frames} are required.")
-    frames = frames[:num_frames]
-    if frames.shape[1:3] == (height, width):
-        return frames
-    return np.stack(
-        [np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames])
+    return fit_frames(frames[:num_frames], height, width, fit, codes=False, what=str(path))
 
 
-def read_duv_clip(directory: Path, num_frames: int, height: int, width: int) -> tuple[torch.Tensor, np.ndarray]:
-    """Pack a depth + semantic-id frame directory into VAE pixels and a Qwen preview.
+def read_proxy_planes(directory: Path, num_frames: int, height: int, width: int,
+                      fit: str = "resize") -> tuple[np.ndarray, np.ndarray]:
+    """Read ``[T, H, W]`` metric depth and class ids from a per-frame directory, on the grid.
 
-    Returns ``([1, 3, T, H, W]`` float32 in ``[0, 1]``, ``[T, H, W, 3]`` uint8``)``. The two differ
-    in depth precision: the VAE reads the full log-normalized float, while Qwen only ever sees an
-    8-bit rendering of it, so quantizing once here keeps the preview honest about what the text
-    encoder was shown.
+    Under ``resize`` the planes must already be on the grid. Under ``center-crop`` they are read at
+    whatever resolution the first semantic PNG says and cropped.
     """
-    from fastvideo.pipelines.basic.minimax_h3.proxy import pack_duv_clip, read_raw_depth, read_semantic_png
+    from fastvideo.pipelines.basic.minimax_h3.proxy import read_raw_depth, read_semantic_png
 
+    plane_h, plane_w = height, width
+    if fit == "center-crop":
+        with Image.open(directory / f"{0:06d}.semantic_id.png") as first:
+            plane_w, plane_h = first.size
     depth_frames = []
     semantic_frames = []
     for ordinal in range(num_frames):
-        depth_frames.append(read_raw_depth(directory / f"{ordinal:06d}.depth.f32", height=height, width=width))
+        depth_frames.append(read_raw_depth(directory / f"{ordinal:06d}.depth.f32", height=plane_h, width=plane_w))
         semantic_frames.append(
-            read_semantic_png(directory / f"{ordinal:06d}.semantic_id.png", height=height, width=width))
-    pixels = pack_duv_clip(np.stack(depth_frames), np.stack(semantic_frames))
-    preview = (pixels[0].permute(1, 2, 3, 0) * 255.0).round().clamp_(0, 255).to(torch.uint8).numpy()
-    return pixels, preview
+            read_semantic_png(directory / f"{ordinal:06d}.semantic_id.png", height=plane_h, width=plane_w))
+    what = f"The proxy planes in {directory}"
+    depth = fit_frames(np.stack(depth_frames), height, width, fit, codes=True, what=what)
+    semantic = fit_frames(np.stack(semantic_frames), height, width, fit, codes=True, what=what)
+    return depth, semantic
 
 
-def read_duv_video_clip(path: Path, num_frames: int, height: int, width: int) -> tuple[torch.Tensor, np.ndarray]:
+def pixels_to_preview(pixels: torch.Tensor) -> np.ndarray:
+    """``[1, 3, T, H, W]`` float pixels as the ``[T, H, W, 3]`` uint8 frames Qwen is shown.
+
+    The VAE reads the full float, while Qwen only ever sees an 8-bit rendering of it, so quantizing
+    once here keeps the preview honest about what the text encoder was shown.
+    """
+    return (pixels[0].permute(1, 2, 3, 0) * 255.0).round().clamp_(0, 255).to(torch.uint8).numpy()
+
+
+def read_proxy_reference_clips(directory: Path, num_frames: int, height: int, width: int, fit: str,
+                               references: tuple[str, ...]) -> list[tuple[torch.Tensor, np.ndarray]]:
+    """Build each named reference from one depth + class directory, as ``(pixels, preview)`` pairs."""
+    from fastvideo.pipelines.basic.minimax_h3.proxy import proxy_reference_clip
+
+    depth, semantic = read_proxy_planes(directory, num_frames, height, width, fit)
+    clips = []
+    for kind in references:
+        pixels = proxy_reference_clip(kind, depth, semantic)
+        clips.append((pixels, pixels_to_preview(pixels)))
+    return clips
+
+
+def read_duv_clip(directory: Path,
+                  num_frames: int,
+                  height: int,
+                  width: int,
+                  fit: str = "resize") -> tuple[torch.Tensor, np.ndarray]:
+    """Pack a depth + semantic-id frame directory into VAE pixels and a Qwen preview.
+
+    Returns ``([1, 3, T, H, W]`` float32 in ``[0, 1]``, ``[T, H, W, 3]`` uint8``)``.
+    """
+    return read_proxy_reference_clips(directory, num_frames, height, width, fit, LEGACY_REFERENCES)[0]
+
+
+def read_duv_video_clip(path: Path,
+                        num_frames: int,
+                        height: int,
+                        width: int,
+                        fit: str = "resize") -> tuple[torch.Tensor, np.ndarray]:
     """Read a pre-composed DUV video, refusing to resample it.
 
     Returns ``([1, 3, T, H, W]`` float32 in ``[0, 1]``, ``[T, H, W, 3]`` uint8``). Unlike
@@ -180,7 +330,8 @@ def read_duv_video_clip(path: Path, num_frames: int, height: int, width: int) ->
     :func:`read_video_frames`. A DUV frame is three integer codes wearing an RGB costume, so any
     interpolation averages unrelated depths and paints class boundaries a code no segmenter ever
     predicted -- and produces a perfectly plausible-looking image while doing it. A grid mismatch is
-    therefore an error to report, not a difference to smooth over.
+    therefore an error to report, not a difference to smooth over. ``center-crop`` may still cut a
+    target-resolution DUV down to the grid, since cropping keeps every code.
     """
     from fastvideo.pipelines.basic.minimax_h3.proxy import rgb_clip_to_pixels
     from fastvideo.pipelines.basic.minimax_h3.reference import decode_reference_video, resample_reference_frames
@@ -191,6 +342,8 @@ def read_duv_video_clip(path: Path, num_frames: int, height: int, width: int) ->
     if frames.shape[0] < num_frames:
         raise ValueError(f"{path} yields {frames.shape[0]} frames at 24 fps; {num_frames} are required.")
     frames = frames[:num_frames]
+    if fit == "center-crop":
+        frames = fit_frames(frames, height, width, fit, codes=True, what=str(path))
     if frames.shape[1:3] != (height, width):
         raise ValueError(f"{path} is {frames.shape[2]}x{frames.shape[1]} but the proxy grid is {width}x{height}. A "
                          "DUV video carries integer codes, so it has to be encoded at the grid it is consumed on; "
@@ -199,9 +352,32 @@ def read_duv_video_clip(path: Path, num_frames: int, height: int, width: int) ->
     return rgb_clip_to_pixels(frames), frames
 
 
-def read_anchor_image(path: Path | None, target_frames: np.ndarray, short_edge: int) -> Image.Image:
-    """Resolve the anchor frame and scale it to a canvas the patch grid can tile."""
+def crop_to_aspect(image: Image.Image, height: int, width: int) -> Image.Image:
+    """Center-crop ``image`` to the ``width / height`` aspect, keeping as many pixels as possible."""
+    source_w, source_h = image.size
+    if source_w * height > width * source_h:
+        crop_w, crop_h = round(source_h * width / height), source_h
+    else:
+        crop_w, crop_h = source_w, round(source_w * height / width)
+    if (crop_w, crop_h) == (source_w, source_h):
+        return image
+    left, top = (source_w - crop_w) // 2, (source_h - crop_h) // 2
+    return image.crop((left, top, left + crop_w, top + crop_h))
+
+
+def read_anchor_image(path: Path | None,
+                      target_frames: np.ndarray,
+                      short_edge: int,
+                      *,
+                      aspect: tuple[int, int] | None = None) -> Image.Image:
+    """Resolve the anchor frame and scale it to a canvas the patch grid can tile.
+
+    ``aspect`` ``(H, W)`` center-crops the anchor to the target's framing first, so a 16:9 anchor
+    of a 1280x704 target shows what the target shows rather than 8 extra rows it never will.
+    """
     image = Image.open(path).convert("RGB") if path is not None else Image.fromarray(target_frames[0])
+    if aspect is not None:
+        image = crop_to_aspect(image, *aspect)
     scale = short_edge / min(image.size)
     multiple = 32
     width = max(multiple, round(image.size[0] * scale / multiple) * multiple)
@@ -322,13 +498,17 @@ class Encoders:
         return latents.squeeze(0).float().cpu().contiguous()
 
     @torch.no_grad()
-    def encode_text(self, prompt: str, anchor: Image.Image,
-                    proxy_preview: np.ndarray, *, cwm_system: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_text(self,
+                    prompt: str,
+                    anchor: Image.Image,
+                    proxy_previews: np.ndarray | list[np.ndarray],
+                    *,
+                    cwm_system: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the Ref2VA conditioning stage over the same reference order training will pack.
 
-        The stage tokenizes ``<Picture 1>`` then ``<Video 1>`` labels around Qwen's vision
-        placeholders, so the per-token tags it returns are only valid for that exact reference
-        order. The training plugin packs anchor-then-proxy for the same reason.
+        The stage tokenizes ``<Picture 1>`` then ``<Video 1>``, ``<Video 2>``... labels around
+        Qwen's vision placeholders, so the per-token tags it returns are only valid for that exact
+        reference order. The training plugin packs anchor-then-proxies for the same reason.
         """
         from fastvideo.pipelines import ForwardBatch
         from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
@@ -343,9 +523,10 @@ class Encoders:
         if role:
             batch.extra[CWM_SYSTEM_PROMPT_KEY] = role
         batch.extra[MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS_KEY] = self.qwen_video_fps
+        previews = [proxy_previews] if isinstance(proxy_previews, np.ndarray) else list(proxy_previews)
         batch.references = [
             MiniMaxH3PreparedReference(media_type="image", image=anchor),
-            MiniMaxH3PreparedReference(media_type="video", frames=proxy_preview),
+            *(MiniMaxH3PreparedReference(media_type="video", frames=preview) for preview in previews),
         ]
         batch = self.conditioning.forward(batch, self.fastvideo_args)
         if not batch.prompt_embeds:
@@ -399,28 +580,25 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
         value = entry.get(key)
         return None if not value else (root / str(value))
 
-    target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width)
+    role = entry_cwm_system(entry, args.cwm_system)
+    check_role_references(role, args.proxy_references)
+    target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width, args.fit)
     target_pixels = torch.from_numpy(target_frames.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
 
-    if entry.get("proxy_duv"):
-        proxy_pixels, proxy_preview = read_duv_clip(root / str(entry["proxy_duv"]), args.num_frames, args.proxy_height,
-                                                    args.proxy_width)
-    elif entry.get("proxy_duv_video"):
-        proxy_pixels, proxy_preview = read_duv_video_clip(root / str(entry["proxy_duv_video"]), args.num_frames,
-                                                          args.proxy_height, args.proxy_width)
-    else:
-        proxy_preview = read_video_frames(root / str(entry["proxy"]), args.num_frames, args.proxy_height,
-                                          args.proxy_width)
-        proxy_pixels = torch.from_numpy(proxy_preview.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
-
-    anchor = read_anchor_image(resolve("anchor"), target_frames, args.anchor_short_edge)
-    role = entry_cwm_system(entry, args.cwm_system)
+    proxies = load_proxy_clips(entry, args, root)
+    anchor = read_anchor_image(resolve("anchor"),
+                               target_frames,
+                               args.anchor_short_edge,
+                               aspect=anchor_aspect(args))
     text_embedding, text_token_tags = encoders.encode_text(
-        str(entry["prompt"]), anchor, proxy_preview, cwm_system=role)
+        str(entry["prompt"]), anchor, [preview for _, preview in proxies], cwm_system=role)
 
-    sample: dict[str, Any] = {
-        "vae_latent": encoders.encode_pixels(target_pixels),
-        "proxy_latent": encoders.encode_pixels(proxy_pixels),
+    sample: dict[str, Any] = {"vae_latent": encoders.encode_pixels(target_pixels)}
+    if is_legacy(args):
+        sample["proxy_latent"] = encoders.encode_pixels(proxies[0][0])
+    else:
+        sample["proxy_latents"] = torch.stack([encoders.encode_pixels(pixels) for pixels, _ in proxies])
+    sample.update({
         "anchor_latent": encoders.encode_keyframe(anchor),
         "text_embedding": text_embedding,
         "text_token_tags": text_token_tags,
@@ -430,8 +608,9 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
             "qwen_video_fps": float(args.qwen_video_fps),
             "prompt": str(entry["prompt"]),
             "cwm_system": role,
+            **reference_info(args),
         },
-    }
+    })
     camera_path = resolve("camera")
     if camera_path is not None:
         camera = read_camera(camera_path, args.num_frames)
@@ -449,15 +628,45 @@ def entry_cwm_system(entry: dict[str, Any], default: str) -> str:
     return "none" if role in {"", "none"} else role
 
 
-def load_proxy_preview(entry: dict[str, Any], args: argparse.Namespace, root: Path) -> np.ndarray:
+def is_legacy(args: argparse.Namespace) -> bool:
+    """The single packed reference, cached under ``proxy_latent`` exactly as before."""
+    return tuple(args.proxy_references) == LEGACY_REFERENCES
+
+
+def anchor_aspect(args: argparse.Namespace) -> tuple[int, int] | None:
+    return (int(args.height), int(args.width)) if args.fit == "center-crop" else None
+
+
+def reference_info(args: argparse.Namespace) -> dict[str, Any]:
+    """Cache metadata for the non-legacy options, absent otherwise so a legacy sample is unchanged."""
+    info: dict[str, Any] = {}
+    if args.fit != "resize":
+        info["fit"] = args.fit
+    if not is_legacy(args):
+        info["proxy_references"] = list(args.proxy_references)
+    return info
+
+
+def load_proxy_clips(entry: dict[str, Any], args: argparse.Namespace,
+                     root: Path) -> list[tuple[torch.Tensor, np.ndarray]]:
+    """Every proxy video reference of an entry, in <Video N> order, as ``(pixels, preview)``."""
+    grid = (args.num_frames, args.proxy_height, args.proxy_width)
+    if not is_legacy(args):
+        if not entry.get("proxy_duv"):
+            raise KeyError(f"--proxy-references {' '.join(args.proxy_references)} builds the references from depth and "
+                           "class planes, so the entry needs 'proxy_duv' (a directory of .depth.f32 and "
+                           ".semantic_id.png frames); a composed video or RGB render cannot be split.")
+        return read_proxy_reference_clips(root / str(entry["proxy_duv"]), *grid, args.fit, args.proxy_references)
     if entry.get("proxy_duv"):
-        _, preview = read_duv_clip(root / str(entry["proxy_duv"]), args.num_frames, args.proxy_height, args.proxy_width)
-        return preview
+        return [read_duv_clip(root / str(entry["proxy_duv"]), *grid, args.fit)]
     if entry.get("proxy_duv_video"):
-        _, preview = read_duv_video_clip(root / str(entry["proxy_duv_video"]), args.num_frames, args.proxy_height,
-                                         args.proxy_width)
-        return preview
-    return read_video_frames(root / str(entry["proxy"]), args.num_frames, args.proxy_height, args.proxy_width)
+        return [read_duv_video_clip(root / str(entry["proxy_duv_video"]), *grid, args.fit)]
+    preview = read_video_frames(root / str(entry["proxy"]), *grid, args.fit)
+    return [(torch.from_numpy(preview.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0), preview)]
+
+
+def load_proxy_previews(entry: dict[str, Any], args: argparse.Namespace, root: Path) -> list[np.ndarray]:
+    return [preview for _, preview in load_proxy_clips(entry, args, root)]
 
 
 def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argparse.Namespace, root: Path,
@@ -466,17 +675,23 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
     sample = torch.load(out_path, map_location="cpu", weights_only=False)
     if not isinstance(sample, dict) or "vae_latent" not in sample:
         raise ValueError(f"{out_path} is not an H3 proxy cache sample")
-    proxy_preview = load_proxy_preview(entry, args, root)
+    recorded = tuple((sample.get("info") or {}).get("proxy_references") or LEGACY_REFERENCES)
+    if recorded != tuple(args.proxy_references):
+        raise ValueError(f"{out_path} carries the proxy references {list(recorded)}, but --proxy-references is "
+                         f"{list(args.proxy_references)}; the Qwen rows would describe videos the latents are not.")
+    role = entry_cwm_system(entry, args.cwm_system)
+    check_role_references(role, args.proxy_references)
+    proxy_previews = load_proxy_previews(entry, args, root)
     if entry.get("anchor"):
         # Target pixels are not loaded; the stored anchor size is unused for Qwen's PIL path.
         dummy = np.zeros((1, args.height, args.width, 3), dtype=np.uint8)
-        anchor = read_anchor_image(root / str(entry["anchor"]), dummy, args.anchor_short_edge)
+        anchor = read_anchor_image(root / str(entry["anchor"]), dummy, args.anchor_short_edge, aspect=anchor_aspect(args))
     else:
-        target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width)
-        anchor = read_anchor_image(None, target_frames, args.anchor_short_edge)
-    role = entry_cwm_system(entry, args.cwm_system)
+        target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width,
+                                          args.fit)
+        anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
     text_embedding, text_token_tags = encoders.encode_text(
-        str(entry["prompt"]), anchor, proxy_preview, cwm_system=role)
+        str(entry["prompt"]), anchor, proxy_previews, cwm_system=role)
     sample["text_embedding"] = text_embedding
     sample["text_token_tags"] = text_token_tags
     info = dict(sample.get("info") or {})
@@ -575,8 +790,9 @@ def main() -> None:
             print(f"[{index + 1}/{len(entries)}] {name}: text {tuple(sample['text_embedding'].shape)} "
                   f"cwm_system={sample['info'].get('cwm_system')}")
         else:
+            proxy_latent = sample.get("proxy_latent", sample.get("proxy_latents"))
             print(f"[{index + 1}/{len(entries)}] {name}: target {tuple(sample['vae_latent'].shape)}, "
-                  f"proxy {tuple(sample['proxy_latent'].shape)}")
+                  f"proxy {tuple(proxy_latent.shape)}")
 
     print(f"Done: {written} written, {skipped} skipped, {failed} failed -> {output_dir}")
 
