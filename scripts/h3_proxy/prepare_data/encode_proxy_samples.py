@@ -17,9 +17,9 @@ Manifest, one JSON object per line::
      "camera": "poses/0001.npz",
      "prompt": "a knight walks through a ruined cathedral"}
 
-Exactly one of ``proxy``, ``proxy_duv`` and ``proxy_duv_video`` is required. Prefer either DUV form
-when the renderer can emit depth, because a geometry channel constrains the output far more tightly
-than a shaded render does.
+Exactly one of ``proxy``, ``proxy_duv``, ``proxy_duv_video`` and ``proxy_depth_video`` is required.
+Prefer a DUV form when the renderer can emit depth, because a geometry channel constrains the
+output far more tightly than a shaded render does.
 
 ``proxy``
     An ordinary RGB render, used as-is and resized to the proxy grid.
@@ -30,8 +30,17 @@ than a shaded render does.
 ``proxy_duv_video``
     A DUV that some upstream pipeline already composed into a lossless video. The frames reach the
     VAE unchanged, so the channel convention is whatever the producer used rather than this repo's;
-    it only has to be the same one at sampling time. Nothing is resized -- see
-    :func:`read_duv_video_clip`.
+    it only has to be the same one at sampling time. Only cropped, or nearest-resized under
+    ``--code-resize nearest`` -- see :func:`read_duv_video_clip`.
+``proxy_depth_video`` + ``proxy_semantic_video``
+    A gta_record seg's ``proxy/depth.mp4`` (log-z grey) and ``proxy/semantic.mp4`` (class id in B),
+    with ``track.json`` and ``semantic.json`` beside them. Decoded to the same metric depth and class
+    planes a ``proxy_duv`` directory holds, so every reference kind can be built from them.
+
+``target_crop`` / ``proxy_crop`` ``[left, top, right, bottom]`` cut a video before it is fitted.
+A MiniMax-H3 restyle of a 1280x720 source is 1344x768 with about six invented rows above and below
+the source's field of view; cropping them keeps it aligned with that source's depth and semantic.
+Rows may also carry ``target_kind``, ``target_style`` and ``proxy_style``, copied into ``info``.
 
 ``--proxy-references`` decides what a ``proxy_duv`` directory becomes. The default ``duv`` is the
 one packed reference above, stored as ``proxy_latent`` ``[24, T, h, w]``. ``depth semantic`` makes
@@ -94,15 +103,20 @@ import gc
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
 from PIL import Image
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 REQUIRED_MEDIA_KEYS = ("target", "prompt")
-# Exactly one of these names the proxy. Order is only for error messages.
-PROXY_KEYS = ("proxy", "proxy_duv", "proxy_duv_video")
+# Exactly one of these names the proxy. Order is only for error messages. A depth video comes with
+# its `proxy_semantic_video`.
+PROXY_KEYS = ("proxy", "proxy_duv", "proxy_duv_video", "proxy_depth_video")
+INFO_PASSTHROUGH_KEYS = ("target_kind", "target_style", "proxy_style")
 FIT_MODES = ("resize", "center-crop")
 # Mirrors `proxy.PROXY_REFERENCE_KINDS` and `cwm_presentation.CWM_SYSTEM_ROLES`; spelled out so
 # --help does not import fastvideo.
@@ -308,15 +322,27 @@ def fit_frames(
     return np.ascontiguousarray(frames[:, top:top + height, left:left + width])
 
 
-def read_video_frames(path: Path, num_frames: int, height: int, width: int, fit: str = "resize") -> np.ndarray:
-    """Decode, resample to 24 fps, trim, and fit a clip to ``[T, H, W, 3]`` uint8."""
+def crop_frames(frames: np.ndarray, crop: Any, what: str) -> np.ndarray:
+    """Cut ``[left, top, right, bottom]`` out of ``[T, H, W, ...]`` frames; ``None`` keeps them."""
+    if crop is None:
+        return frames
+    left, top, right, bottom = (int(value) for value in crop)
+    if not (0 <= left < right <= frames.shape[2] and 0 <= top < bottom <= frames.shape[1]):
+        raise ValueError(f"{what}: crop {[left, top, right, bottom]} does not fit {frames.shape[2]}x{frames.shape[1]}")
+    return np.ascontiguousarray(frames[:, top:bottom, left:right])
+
+
+def read_video_frames(path: Path, num_frames: int, height: int, width: int, fit: str = "resize",
+                      crop: Any = None) -> np.ndarray:
+    """Decode, resample to 24 fps, trim, crop, and fit a clip to ``[T, H, W, 3]`` uint8."""
     from fastvideo.pipelines.basic.minimax_h3.reference import decode_reference_video, resample_reference_frames
 
     frames, source_fps, _ = decode_reference_video(path)
     frames = resample_reference_frames(frames, source_fps)
     if frames.shape[0] < num_frames:
         raise ValueError(f"{path} yields {frames.shape[0]} frames at 24 fps; {num_frames} are required.")
-    return fit_frames(frames[:num_frames], height, width, fit, codes=False, what=str(path))
+    frames = crop_frames(frames[:num_frames], crop, str(path))
+    return fit_frames(frames, height, width, fit, codes=False, what=str(path))
 
 
 def read_proxy_planes(directory: Path, num_frames: int, height: int, width: int,
@@ -357,15 +383,54 @@ def pixels_to_preview(pixels: torch.Tensor) -> np.ndarray:
     return (pixels[0].permute(1, 2, 3, 0) * 255.0).round().clamp_(0, 255).to(torch.uint8).numpy()
 
 
+def read_record_planes(depth_path: Path, semantic_path: Path, num_frames: int, height: int, width: int,
+                       fit: str = "resize", code_resize: str = "reject") -> tuple[np.ndarray, np.ndarray]:
+    """``[T, H, W]`` metric depth and proxy class ids from a gta_record seg's videos, on the grid."""
+    from gta_record import read_proxy_planes_from_videos
+
+    depth, semantic = read_proxy_planes_from_videos(depth_path, semantic_path, num_frames)
+    what = f"The proxy videos in {depth_path.parent}"
+    return (
+        fit_frames(depth, height, width, fit, codes=True, what=what, code_resize=code_resize),
+        fit_frames(semantic, height, width, fit, codes=True, what=what, code_resize=code_resize),
+    )
+
+
+def has_proxy_planes(entry: dict[str, Any]) -> bool:
+    """Whether the row carries depth + class planes, as a directory or as gta_record videos."""
+    return bool(entry.get("proxy_duv") or (entry.get("proxy_depth_video") and entry.get("proxy_semantic_video")))
+
+
+def read_entry_reference_clips(entry: dict[str, Any], root: Path, num_frames: int, height: int, width: int,
+                               fit: str, references: tuple[str, ...],
+                               code_resize: str = "reject") -> list[tuple[torch.Tensor, np.ndarray]]:
+    """Each named reference built from the row's planes, whichever form they come in."""
+    if entry.get("proxy_duv"):
+        return read_proxy_reference_clips(root / str(entry["proxy_duv"]), num_frames, height, width, fit, references,
+                                          code_resize)
+    if not (entry.get("proxy_depth_video") and entry.get("proxy_semantic_video")):
+        raise KeyError("depth/semantic references need 'proxy_duv' planes or 'proxy_depth_video' + "
+                       "'proxy_semantic_video'")
+    depth, semantic = read_record_planes(root / str(entry["proxy_depth_video"]),
+                                         root / str(entry["proxy_semantic_video"]), num_frames, height, width, fit,
+                                         code_resize)
+    return planes_to_reference_clips(depth, semantic, references)
+
+
 def read_proxy_reference_clips(directory: Path, num_frames: int, height: int, width: int, fit: str,
                                references: tuple[str, ...],
                                code_resize: str = "reject") -> list[tuple[torch.Tensor, np.ndarray]]:
     """Build each named reference from one depth + class directory, as ``(pixels, preview)`` pairs."""
-    from fastvideo.pipelines.basic.minimax_h3.proxy import proxy_reference_clip
-
     depth, semantic = read_proxy_planes(
         directory, num_frames, height, width, fit, code_resize
     )
+    return planes_to_reference_clips(depth, semantic, references)
+
+
+def planes_to_reference_clips(depth: np.ndarray, semantic: np.ndarray,
+                              references: tuple[str, ...]) -> list[tuple[torch.Tensor, np.ndarray]]:
+    from fastvideo.pipelines.basic.minimax_h3.proxy import proxy_reference_clip
+
     clips = []
     for kind in references:
         pixels = proxy_reference_clip(kind, depth, semantic)
@@ -389,7 +454,8 @@ def read_duv_video_clip(path: Path,
                         num_frames: int,
                         height: int,
                         width: int,
-                        fit: str = "resize") -> tuple[torch.Tensor, np.ndarray]:
+                        fit: str = "resize",
+                        code_resize: str = "reject") -> tuple[torch.Tensor, np.ndarray]:
     """Read a pre-composed DUV video, refusing to resample it.
 
     Returns ``([1, 3, T, H, W]`` float32 in ``[0, 1]``, ``[T, H, W, 3]`` uint8``). Unlike
@@ -402,7 +468,8 @@ def read_duv_video_clip(path: Path,
     interpolation averages unrelated depths and paints class boundaries a code no segmenter ever
     predicted -- and produces a perfectly plausible-looking image while doing it. A grid mismatch is
     therefore an error to report, not a difference to smooth over. ``center-crop`` may still cut a
-    target-resolution DUV down to the grid, since cropping keeps every code.
+    target-resolution DUV down to the grid, since cropping keeps every code, and ``code_resize
+    nearest`` may then subsample it, since nearest only ever selects codes that were written.
     """
     from fastvideo.pipelines.basic.minimax_h3.proxy import rgb_clip_to_pixels
     from fastvideo.pipelines.basic.minimax_h3.reference import decode_reference_video, resample_reference_frames
@@ -414,7 +481,7 @@ def read_duv_video_clip(path: Path,
         raise ValueError(f"{path} yields {frames.shape[0]} frames at 24 fps; {num_frames} are required.")
     frames = frames[:num_frames]
     if fit == "center-crop":
-        frames = fit_frames(frames, height, width, fit, codes=True, what=str(path))
+        frames = fit_frames(frames, height, width, fit, codes=True, what=str(path), code_resize=code_resize)
     if frames.shape[1:3] != (height, width):
         raise ValueError(f"{path} is {frames.shape[2]}x{frames.shape[1]} but the proxy grid is {width}x{height}. A "
                          "DUV video carries integer codes, so it has to be encoded at the grid it is consumed on; "
@@ -656,7 +723,8 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
     role = entry_cwm_system(entry, args.cwm_system)
     references = entry_proxy_references(entry, args)
     check_role_references(role, references)
-    target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width, args.fit)
+    target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width, args.fit,
+                                      crop=entry.get("target_crop"))
     target_pixels = torch.from_numpy(target_frames.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
 
     proxies = load_proxy_clips(entry, args, root)
@@ -691,6 +759,7 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
             **({"anchor_source": "target_first_frame"} if mixed_variants(args) else {}),
             "cwm_system": role,
             **reference_info(args, entry),
+            **{key: entry[key] for key in INFO_PASSTHROUGH_KEYS if entry.get(key)},
         },
     })
     camera_path = resolve("camera")
@@ -764,44 +833,59 @@ def load_proxy_clips(entry: dict[str, Any], args: argparse.Namespace,
                      root: Path) -> list[tuple[torch.Tensor, np.ndarray]]:
     """Every proxy video reference of an entry, in <Video N> order, as ``(pixels, preview)``."""
     grid = (args.num_frames, args.proxy_height, args.proxy_width)
+    code_resize = str(getattr(args, "code_resize", "reject"))
     variants = mixed_variants(args)
     if variants:
         modality = entry_proxy_references(entry, args)[0]
+        if not modality_available(entry, modality):
+            raise KeyError(f"proxy_modality={modality!r} has no source in this row; {MODALITY_SOURCES[modality]}")
         if modality == "style":
-            if not entry.get("proxy"):
-                raise KeyError("proxy_modality='style' requires the manifest 'proxy' RGB video")
-            preview = read_video_frames(root / str(entry["proxy"]), *grid, args.fit)
+            preview = read_video_frames(root / str(entry["proxy"]), *grid, args.fit, crop=entry.get("proxy_crop"))
             pixels = torch.from_numpy(preview.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
             return [(pixels, preview)]
-        if not entry.get("proxy_duv"):
-            raise KeyError(
-                f"proxy_modality={modality!r} requires 'proxy_duv' depth/semantic planes"
-            )
-        return read_proxy_reference_clips(
-            root / str(entry["proxy_duv"]),
-            *grid,
-            args.fit,
-            (modality,),
-            str(getattr(args, "code_resize", "reject")),
-        )
+        if modality == "duv" and entry.get("proxy_duv_video"):
+            return [read_duv_video_clip(root / str(entry["proxy_duv_video"]), *grid, args.fit, code_resize)]
+        return read_entry_reference_clips(entry, root, *grid, args.fit, (modality,), code_resize)
     if not is_legacy(args):
-        if not entry.get("proxy_duv"):
+        if not has_proxy_planes(entry):
             raise KeyError(f"--proxy-references {' '.join(args.proxy_references)} builds the references from depth and "
                            "class planes, so the entry needs 'proxy_duv' (a directory of .depth.f32 and "
-                           ".semantic_id.png frames); a composed video or RGB render cannot be split.")
-        return read_proxy_reference_clips(
-            root / str(entry["proxy_duv"]),
-            *grid,
-            args.fit,
-            args.proxy_references,
-            str(getattr(args, "code_resize", "reject")),
-        )
+                           ".semantic_id.png frames) or 'proxy_depth_video' + 'proxy_semantic_video'; a composed "
+                           "video or RGB render cannot be split.")
+        return read_entry_reference_clips(entry, root, *grid, args.fit, args.proxy_references, code_resize)
     if entry.get("proxy_duv"):
         return [read_duv_clip(root / str(entry["proxy_duv"]), *grid, args.fit)]
     if entry.get("proxy_duv_video"):
-        return [read_duv_video_clip(root / str(entry["proxy_duv_video"]), *grid, args.fit)]
-    preview = read_video_frames(root / str(entry["proxy"]), *grid, args.fit)
+        return [read_duv_video_clip(root / str(entry["proxy_duv_video"]), *grid, args.fit, code_resize)]
+    if entry.get("proxy_depth_video"):
+        return read_entry_reference_clips(entry, root, *grid, args.fit, LEGACY_REFERENCES, code_resize)
+    preview = read_video_frames(root / str(entry["proxy"]), *grid, args.fit, crop=entry.get("proxy_crop"))
     return [(torch.from_numpy(preview.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0), preview)]
+
+
+MODALITY_SOURCES = {
+    "duv": "DUV needs 'proxy_duv_video', 'proxy_duv', or 'proxy_depth_video' + 'proxy_semantic_video'",
+    "depth": "depth needs 'proxy_duv' or 'proxy_depth_video' + 'proxy_semantic_video'",
+    "semantic": "semantic needs 'proxy_duv' or 'proxy_depth_video' + 'proxy_semantic_video'",
+    "style": "style needs the 'proxy' RGB video",
+}
+
+
+def modality_source_keys(entry: dict[str, Any], kind: str) -> tuple[str, ...]:
+    """Manifest keys that would supply ``kind`` for this row, or ``()`` if it cannot be built."""
+    if kind == "style":
+        return ("proxy", ) if entry.get("proxy") else ()
+    if kind == "duv" and entry.get("proxy_duv_video"):
+        return ("proxy_duv_video", )
+    if entry.get("proxy_duv"):
+        return ("proxy_duv", )
+    if entry.get("proxy_depth_video") and entry.get("proxy_semantic_video"):
+        return ("proxy_depth_video", "proxy_semantic_video")
+    return ()
+
+
+def modality_available(entry: dict[str, Any], kind: str) -> bool:
+    return bool(modality_source_keys(entry, kind))
 
 
 def load_proxy_previews(entry: dict[str, Any], args: argparse.Namespace, root: Path) -> list[np.ndarray]:
@@ -830,7 +914,7 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
         anchor = read_anchor_image(root / str(entry["anchor"]), dummy, args.anchor_short_edge, aspect=anchor_aspect(args))
     else:
         target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width,
-                                          args.fit)
+                                          args.fit, crop=entry.get("target_crop"))
         anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
     original_prompt = str(entry["prompt"])
     conditioning_prompt = (
@@ -882,16 +966,11 @@ def assign_mixed_modalities(
         else:
             rotated = variants[index % len(variants):] + variants[:index % len(variants)]
             choices = tuple(sorted(rotated, key=lambda kind: counts[kind]))
-        available = [
-            kind
-            for kind in choices
-            if (kind == "style" and entry.get("proxy"))
-            or (kind != "style" and entry.get("proxy_duv"))
-        ]
+        available = [kind for kind in choices if modality_available(entry, kind)]
         if not available:
             raise SystemExit(
                 f"Manifest row {index + 1} has no source for any selected proxy modality; "
-                "DUV/depth/semantic need 'proxy_duv', and style needs 'proxy'"
+                + "; ".join(MODALITY_SOURCES[kind] for kind in choices)
             )
         entry["proxy_modality"] = available[0]
         counts[available[0]] += 1
@@ -925,8 +1004,7 @@ def preflight_media(
     for entry in sample:
         if args is not None and mixed_variants(args):
             modality = entry_proxy_references(entry, args)[0]
-            source_key = "proxy" if modality == "style" else "proxy_duv"
-            keys = ("target", source_key)
+            keys = ("target", *modality_source_keys(entry, modality))
         else:
             keys = MEDIA_KEYS
         present = [str(entry[key]) for key in keys if entry.get(key)]

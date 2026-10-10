@@ -315,10 +315,10 @@ def test_every_gta_class_including_ego_and_npc_gets_its_own_code() -> None:
     two labels share a symbol, since training cannot separate a symbol from itself.
     """
     compose = _load("compose_gta_duv")
-    class_ids = list(range(11))
+    class_names = dict(compose.LEGACY_CLASS_NAMES)
 
-    legacy = compose.build_palette("abot", class_ids)
-    cwm = compose.build_palette("cwm", class_ids)
+    legacy = compose.build_palette("abot", class_names)
+    cwm = compose.build_palette("cwm", class_names)
 
     assert len(set(legacy.values())) == 6
     assert legacy[0] == legacy[5], "the legacy table's sky and road really are the same symbol"
@@ -341,11 +341,79 @@ def test_a_class_the_mapping_has_no_entry_for_is_an_error_not_a_neighbouring_cod
     """A twelfth GTA label must stop the run. Falling through would silently relabel it."""
     compose = _load("compose_gta_duv")
     try:
-        compose.build_palette("cwm", [*range(11), 11])
+        compose.build_palette("cwm", {**compose.LEGACY_CLASS_NAMES, 11: "lava"})
     except SystemExit as error:
-        assert "GTA_TO_CWM" in str(error)
+        assert "SOURCE_CLASS_TO_PROXY" in str(error)
     else:
         raise AssertionError("an unmapped class id was accepted")
+
+
+def test_record_static_world_keeps_its_depth_and_only_named_sky_is_blanked() -> None:
+    """gta_record's id 0 is the whole static world. Treating it as sky would zero most depth."""
+    import numpy as np
+
+    compose = _load("compose_gta_duv")
+    names = {0: "static world", 1: "player", 2: "ped", 3: "vehicle", 10: "prop"}
+    palette = compose.build_palette("cwm", names)
+    sky = frozenset(compose.sky_source_ids(names))
+    assert sky == frozenset()
+    assert palette[0] == compose.cwm_code(0), "static world -> void_unknown"
+    assert len(set(palette.values())) == 5
+
+    metres = np.array([[2.0, 50.0]], dtype=np.float32)
+    ids = np.array([[0, 3]], dtype=np.uint8)
+    red = compose.compose_frame(metres, ids, palette, convention="cwm", sky_ids=sky)[..., 0]
+    assert red[0, 0] > 0, "static world keeps its depth"
+
+    legacy_sky = frozenset(compose.sky_source_ids(compose.LEGACY_CLASS_NAMES))
+    assert legacy_sky == frozenset({0})
+    red = compose.compose_frame(metres, ids, compose.build_palette("cwm", compose.LEGACY_CLASS_NAMES),
+                                convention="cwm", sky_ids=legacy_sky)[..., 0]
+    assert red[0, 0] == 0, "legacy sky is still blanked"
+
+
+def test_record_depth_codes_invert_the_track_json_formula(tmp_path: Path) -> None:
+    """``g = floor(1 + 254 * (1 - log(z/0.1)/log(2560)) + 0.5)``: 255 is 0.1 m, 1 is 256 m."""
+    import math
+
+    import numpy as np
+
+    record = _load("gta_record")
+    proxy = tmp_path / "proxy"
+    proxy.mkdir()
+    (proxy / "track.json").write_text(json.dumps({"depth": {
+        "encoding": "h264-logz-gray8",
+        "quantization": {"clipNear": 0.1, "clipFar": 256.0, "invalidCode": 0},
+    }}))
+    quantization = record.read_depth_quantization(proxy)
+    assert (quantization.near, quantization.far, quantization.codes) == (0.1, 256.0, "record")
+
+    metres = np.array([0.1, 1.0, 21.0, 256.0])
+    fraction = np.log(metres / 0.1) / math.log(2560.0)
+    codes = np.floor(1 + 254 * (1 - fraction) + 0.5).astype(np.uint8)
+    decoded = record.decode_depth_codes(np.append(codes, 0), quantization)
+    assert decoded[-1] == 0.0
+    assert np.allclose(decoded[:-1], metres, rtol=0.016), "within half a code (1.55%)"
+    assert decoded[0] == np.float32(0.1) and decoded[3] == np.float32(256.0)
+
+
+def test_record_semantic_ids_map_by_name_and_reject_undeclared_codes() -> None:
+    import numpy as np
+    import pytest
+
+    record = _load("gta_record")
+    lut = record.proxy_class_lut({0: "static world", 1: "player", 2: "ped", 3: "vehicle", 10: "prop"})
+    ids = np.array([[0, 1, 2, 3, 10]], dtype=np.uint8)
+    mapped = record.map_class_ids(ids, lut)
+    assert [record.PROXY_CLASSES[i] for i in mapped[0]] == ["void_unknown", "human", "animal", "vehicle", "prop"]
+    with pytest.raises(ValueError, match="does not declare"):
+        record.map_class_ids(np.array([[4]], dtype=np.uint8), lut)
+
+
+def test_record_render_crop_recovers_the_720p_field_of_view() -> None:
+    record = _load("gta_record")
+    assert record.render_crop_box((1344, 768), (1280, 720)) == (0, 6, 1344, 762)
+    assert record.render_crop_box((1280, 720), (1280, 720)) == (0, 0, 1280, 720)
 
 
 def test_the_depth_plane_is_bright_near_and_zero_where_there_is_no_hit() -> None:

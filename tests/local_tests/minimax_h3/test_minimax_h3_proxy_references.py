@@ -195,7 +195,7 @@ def test_an_omni_entry_caches_one_latent_per_reference(encode_script, tmp_path, 
     _write_planes(tmp_path / "clip/duv", depth, semantic)
     target = np.zeros((2, 36, 64, 3), dtype=np.uint8)
     monkeypatch.setattr(
-        encode_script, "read_video_frames", lambda path, frames, height, width, fit="resize": encode_script.fit_frames(
+        encode_script, "read_video_frames", lambda path, frames, height, width, fit="resize", crop=None: encode_script.fit_frames(
             target, height, width, fit, codes=False, what=str(path)))
     args = argparse.Namespace(num_frames=2,
                               height=32,
@@ -241,7 +241,7 @@ def test_mixed_omni_entry_caches_one_typed_reference(encode_script, tmp_path, mo
     monkeypatch.setattr(
         encode_script,
         "read_video_frames",
-        lambda path, frames, height, width, fit="resize": encode_script.fit_frames(
+        lambda path, frames, height, width, fit="resize", crop=None: encode_script.fit_frames(
             target, height, width, fit, codes=False, what=str(path)
         ),
     )

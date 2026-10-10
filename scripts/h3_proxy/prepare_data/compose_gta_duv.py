@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compose ``proxy/duv.mp4`` from native GTA ``depth.mp4`` + ``semantic.mp4``.
 
-``gta_web_0902`` ships the three game streams separately and never wrote a DUV,
-so this composes one. Decoding is always DATA_F.md's ``depth.mp4`` convention --
-inverted log-z over ``[near, far]``, near bright, ``gray == 0`` invalid -- with
-the range taken from the seg's ``metadata.json`` when it declares one.
+``gta_web_0902`` and ``gta_record_*`` ship the game streams separately and never
+wrote a DUV, so this composes one. ``depth.mp4`` is inverted log-z over
+``[near, far]``, near bright, ``gray == 0`` invalid. A ``proxy/track.json`` depth
+quantization (gta_record: codes 1..255 over 0.1-256 m) wins; otherwise the range
+comes from ``metadata.json`` or DATA_F.md's ``gray / 255`` ramp. Class meanings
+come from ``proxy/semantic.json`` by name, so gta_record's merged "static world"
+id 0 keeps its depth instead of being blanked as sky.
 
 The output convention is a choice. ``cwm`` is the default, matching
 ``cwm_h3_inference.duv``:
@@ -50,6 +53,15 @@ Usage::
 
     python scripts/h3_proxy/prepare_data/compose_gta_duv.py \\
         --root /data/binghe/datasets/gta_web_0902_v2/gta_web_0902 --overwrite
+
+    # gta_record: keep the native 1280x720 grid (the encoder crops), read from a local copy and
+    # write next to the dataset's proxy streams, eight processes in parallel.
+    for i in $(seq 0 7); do
+      python scripts/h3_proxy/prepare_data/compose_gta_duv.py --vlm-filter none \\
+          --root /workspace/staging/gta_record_0930-v0003 \\
+          --out-root /data/binghe/datasets/gta_record_0930-v0003 \\
+          --height 720 --num-shards 8 --shard-index $i &
+    done; wait
 """
 
 from __future__ import annotations
@@ -58,13 +70,20 @@ import argparse
 from fractions import Fraction
 import json
 import math
+import os
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from gta_record import (  # noqa: E402
+    PROXY_CLASSES, SOURCE_CLASS_TO_PROXY, DepthQuantization, decode_depth_codes, read_depth_quantization,
+    sky_source_ids, source_class_key,
+)
 from vlm_filter import add_filter_arguments, load_vlm_filter  # noqa: E402
 
 # DATA_F.md's depth.mp4: inverted log-z over this range, near bright, gray == 0 invalid. Used for
@@ -84,7 +103,20 @@ ABOT_FAR = 8000.0
 ABOT_MAX = 254
 ABOT_SKY = 255
 
-GTA_SKY_ID = 0
+# DATA_F.md's class names, for a seg without proxy/semantic.json.
+LEGACY_CLASS_NAMES = {
+    0: "sky",
+    1: "player",
+    2: "ped",
+    3: "vehicle",
+    4: "building",
+    5: "road",
+    6: "ground",
+    7: "vegetation",
+    8: "terrain",
+    9: "water",
+    10: "prop",
+}
 
 # DATA_F.md's semantic *colours*. Not injective: eleven labels collapse onto six codes, because sky
 # and road share (255,255) and building, ground, terrain, water and prop all share (0,0). Sky is
@@ -103,13 +135,15 @@ ABOT_GB = {
     10: (0, 0),  # prop
 }
 
-# GTA label (DATA_F.md) -> CWM label (INFERENCE.md).
+# GTA class name -> CWM label (INFERENCE.md), via gta_record.SOURCE_CLASS_TO_PROXY. Matched by
+# name, not id: gta_record_* reuses id 0 for a merged "static world", which is not sky.
 #
-#   GTA  0 sky 1 player 2 ped 3 vehicle 4 building 5 road 6 ground 7 vegetation 8 terrain 9 water 10 prop
+#   GTA  sky player ped vehicle building road ground vegetation terrain water prop | static world
 #   CWM  0 void_unknown 1 sky 2 water 3 terrain 4 road_paved 5 vegetation
 #        6 building_structure 7 infrastructure 8 human 9 animal 10 vehicle 11 prop
 #
-# Which slot a label lands in does not matter, and it is worth being explicit about why, because the
+# ped lands on `animal`, an arbitrary free slot rather than a claim, and static world on
+# `void_unknown`. Which slot a label lands in does not matter, and it is worth being explicit about why, because the
 # names invite an argument that has no stake in it. The adapter here is trained from scratch on base
 # MiniMax-H3 Ref2VA, which has never seen a DUV frame -- the association between these (G, B) pairs
 # and what they denote lives in CWM's LoRA, which is not loaded. To this model `(96, 128)` is two
@@ -128,19 +162,6 @@ ABOT_GB = {
 #
 # Following CWM's meanings anyway costs nothing and keeps the option of checking a clip against the
 # released LoRA, which needs the codes to line up.
-GTA_TO_CWM = {
-    0: 1,   # sky            -> sky
-    1: 8,   # player         -> human
-    2: 9,   # ped            -> animal        (see above: an arbitrary free slot, not a claim)
-    3: 10,  # vehicle        -> vehicle
-    4: 6,   # building       -> building_structure
-    5: 4,   # road           -> road_paved
-    6: 7,   # ground         -> infrastructure
-    7: 5,   # vegetation     -> vegetation
-    8: 3,   # terrain        -> terrain
-    9: 2,   # water          -> water
-    10: 11,  # prop          -> prop
-}
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,12 +218,23 @@ def parse_args() -> argparse.Namespace:
         "--source-near",
         type=float,
         default=SOURCE_NEAR,
-        help=f"depth.mp4's near plane in metres, used only when metadata.json declares none "
-        f"(default {SOURCE_NEAR}, DATA_F.md).",
+        help=f"depth.mp4's near plane in metres, used only when neither proxy/track.json nor "
+        f"metadata.json declares one (default {SOURCE_NEAR}, DATA_F.md).",
     )
     p.add_argument("--source-far", type=float, default=SOURCE_FAR, help="See --source-near.")
+    p.add_argument(
+        "--out-root",
+        default="",
+        help="Write <out-root>/<seg>/proxy/<out-name> instead of under --root, e.g. read a fast local "
+        "copy and write into the FUSE-mounted dataset. Empty writes under --root.",
+    )
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-index", type=int, default=0)
     add_filter_arguments(p)
-    return p.parse_args()
+    args = p.parse_args()
+    if not 0 <= args.shard_index < args.num_shards:
+        p.error("--shard-index must be in [0, --num-shards)")
+    return args
 
 
 def cwm_code(label: int) -> tuple[int, int]:
@@ -216,15 +248,28 @@ def cwm_code(label: int) -> tuple[int, int]:
     return CWM_SEMANTIC_U[label % 4], CWM_SEMANTIC_V[label // 4]
 
 
-def build_palette(kind: str, class_ids: list[int]) -> dict[int, tuple[int, int]]:
-    """GTA class id -> (G, B). All eleven labels get distinct codes."""
+def build_palette(kind: str, class_names: dict[int, str]) -> dict[int, tuple[int, int]]:
+    """GTA class id -> (G, B). Every declared class gets a distinct code."""
     if kind == "abot":
         return dict(ABOT_GB)
-    unknown = [class_id for class_id in class_ids if class_id not in GTA_TO_CWM]
+    unknown = [f"{class_id}={name!r}" for class_id, name in class_names.items()
+               if source_class_key(name) not in SOURCE_CLASS_TO_PROXY]
     if unknown:
-        raise SystemExit(f"semantic.json declares classes {unknown} that GTA_TO_CWM has no entry for. "
+        raise SystemExit(f"semantic.json declares classes {unknown} that SOURCE_CLASS_TO_PROXY has no entry for. "
                          "Add them rather than letting them fall through to a neighbouring code.")
-    return {class_id: cwm_code(GTA_TO_CWM[class_id]) for class_id in class_ids}
+    return {
+        class_id: cwm_code(PROXY_CLASSES.index(SOURCE_CLASS_TO_PROXY[source_class_key(name)]))
+        for class_id, name in class_names.items()
+    }
+
+
+def read_depth_quantization_for(seg: Path, near: float, far: float) -> DepthQuantization:
+    """``proxy/track.json``'s quantization, else the ``metadata.json`` / argument range on DATA_F's ramp."""
+    quantization = read_depth_quantization(seg / "proxy", near=near, far=far)
+    if quantization.codes == "record":
+        return quantization
+    near, far, origin = read_source_depth_range(seg, near, far)
+    return DepthQuantization(near, far, "legacy", origin)
 
 
 def read_source_depth_range(seg: Path, near: float, far: float) -> tuple[float, float, str]:
@@ -279,8 +324,8 @@ def resample_nearest(plane: np.ndarray, width: int, height: int) -> np.ndarray:
     return plane[rows[:, None], cols[None, :]]
 
 
-def read_class_ids(seg: Path) -> list[int]:
-    """Class ids the seg's ``proxy/semantic.json`` declares, or the legacy 0..10."""
+def read_class_names(seg: Path) -> dict[int, str]:
+    """Class id -> name from the seg's ``proxy/semantic.json``, or DATA_F's eleven."""
     path = seg / "proxy" / "semantic.json"
     if path.is_file():
         try:
@@ -288,15 +333,11 @@ def read_class_ids(seg: Path) -> list[int]:
         except (OSError, json.JSONDecodeError):
             classes = None
         if isinstance(classes, dict) and classes:
-            return sorted(int(key) for key in classes)
-    return sorted(ABOT_GB)
-
-
-def decode_depth_grey(grey: np.ndarray, near: float, far: float) -> np.ndarray:
-    """``depth.mp4`` grey -> metres. Inverted log-z, near bright, 0 invalid (DATA_F.md)."""
-    span = math.log(far) - math.log(near)
-    metres = np.exp(math.log(far) - (grey.astype(np.float64) / 255.0) * span)
-    return np.where(grey == 0, 0.0, metres).astype(np.float32)
+            return {
+                int(key): str(value.get("name") if isinstance(value, dict) else value)
+                for key, value in classes.items()
+            }
+    return dict(LEGACY_CLASS_NAMES)
 
 
 def encode_depth_cwm(metres: np.ndarray) -> np.ndarray:
@@ -324,8 +365,8 @@ def encode_depth_abot(metres: np.ndarray) -> np.ndarray:
 
 
 def compose_frame(metres: np.ndarray, ids: np.ndarray, palette: dict[int, tuple[int, int]], *,
-                  convention: str) -> np.ndarray:
-    sky = (metres <= 1.0e-3) | (ids == GTA_SKY_ID)
+                  convention: str, sky_ids: frozenset[int] = frozenset({0})) -> np.ndarray:
+    sky = (metres <= 1.0e-3) | np.isin(ids, list(sky_ids))
     if convention == "abot":
         red = encode_depth_abot(metres)
         red[sky] = ABOT_SKY
@@ -366,8 +407,8 @@ def read_grey_video(path: Path) -> list[np.ndarray]:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         for frame in container.decode(stream):
-            rgb = frame.to_ndarray(format="rgb24")
-            frames.append(rgb[..., 0])
+            # Luma itself: an RGB conversion adds whatever chroma noise the lossy encode left.
+            frames.append(frame.to_ndarray(format="gray"))
     if not frames:
         raise ValueError(f"no frames in {path}")
     return frames
@@ -399,13 +440,32 @@ def write_duv(path: Path, frames: list[np.ndarray], fps: float, *, codec: str = 
     Verified by reading a frame back, because this is exactly the kind of claim that is made in a
     docstring and then quietly stops holding. stdin-to-ffmpeg died with EPIPE on this node, hence
     PyAV.
+
+    Encoded and verified in a local temporary file, then copied whole: the GCS FUSE mount under
+    /data refuses the rename an in-place temporary would need.
     """
     import av
 
     height, width = frames[0].shape[:2]
     pixel_format = "rgb24" if codec == "libx264rgb" else "yuv444p"
-    temporary = path.with_name(path.stem + ".tmp.mp4")
-    temporary.unlink(missing_ok=True)
+    handle, name = tempfile.mkstemp(suffix=".mp4", prefix=f"{path.parent.parent.name}-")
+    os.close(handle)
+    temporary = Path(name)
+    try:
+        _encode_duv(av, temporary, frames, fps, codec=codec, pixel_format=pixel_format, size=(width, height))
+        verify_duv_roundtrip(temporary, frames, codec=codec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(temporary, path)
+        if path.stat().st_size != temporary.stat().st_size:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(f"copying {temporary} -> {path} was truncated")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _encode_duv(av, temporary: Path, frames: list[np.ndarray], fps: float, *, codec: str, pixel_format: str,
+                size: tuple[int, int]) -> None:
+    width, height = size
     container = av.open(str(temporary), mode="w", format="mp4")
     try:
         stream = container.add_stream(codec, rate=Fraction(fps).limit_denominator(1000))
@@ -422,10 +482,7 @@ def write_duv(path: Path, frames: list[np.ndarray], fps: float, *, codec: str = 
     finally:
         container.close()
     if not temporary.is_file() or temporary.stat().st_size == 0:
-        temporary.unlink(missing_ok=True)
         raise RuntimeError(f"PyAV wrote no bytes to {temporary}")
-    verify_duv_roundtrip(temporary, frames, codec=codec)
-    temporary.replace(path)
 
 
 def verify_duv_roundtrip(path: Path, frames: list[np.ndarray], *, codec: str) -> None:
@@ -510,12 +567,15 @@ def main() -> None:
             raise SystemExit("Every clip was rejected. Lower --min-vlm-score or pass --vlm-filter none.")
     if args.limit:
         segs = segs[: args.limit]
+    all_segs = segs
+    segs = segs[args.shard_index::args.num_shards]
+    out_root = Path(args.out_root).expanduser().resolve() if args.out_root else root
 
     composed_names: list[str] = []
     written = skipped = failed = 0
     for index, seg in enumerate(segs):
         depth_path, semantic_path, duv_path = (seg / "proxy" / "depth.mp4", seg / "proxy" / "semantic.mp4",
-                                               seg / "proxy" / args.out_name)
+                                               out_root / seg.name / "proxy" / args.out_name)
         if duv_path.is_file() and not args.overwrite and not args.probe_only:
             # Already composed on an earlier run, so still part of the corpus for the split.
             composed_names.append(seg.name)
@@ -530,20 +590,24 @@ def main() -> None:
             semantic_frames = read_rgb_video(semantic_path)
             if len(depth_frames) != len(semantic_frames):
                 raise ValueError(f"depth {len(depth_frames)} frames vs semantic {len(semantic_frames)}")
-            palette = build_palette(args.convention, read_class_ids(seg))
-            near, far, origin = read_source_depth_range(seg, args.source_near, args.source_far)
+            class_names = read_class_names(seg)
+            palette = build_palette(args.convention, class_names)
+            sky_ids = frozenset(sky_source_ids(class_names))
+            quantization = read_depth_quantization_for(seg, args.source_near, args.source_far)
             ids0 = semantic_ids(semantic_frames[0])
-            metres0 = decode_depth_grey(depth_frames[0], near, far)
+            metres0 = decode_depth_codes(depth_frames[0], quantization)
             if index == 0 or args.probe_only:
                 distinct = len(set(palette.values()))
                 red_scale = ("0.3-256 m inverted, near bright, invalid 0"
                              if args.convention == "cwm" else "0.1-8000 m forward, sky 255")
                 collapsed = "" if distinct == len(palette) else f"  [{len(palette) - distinct} collapsed]"
                 print(f"  convention {args.convention}: R = {red_scale}")
-                print(f"  decode range {near}-{far} m, from {origin}")
-                print(f"  palette: {len(palette)} classes -> {distinct} distinct (G,B){collapsed}")
+                print(f"  decode range {quantization.near}-{quantization.far} m ({quantization.codes} codes), "
+                      f"from {quantization.origin}")
+                print(f"  palette: {len(palette)} classes -> {distinct} distinct (G,B){collapsed}; "
+                      f"sky ids {sorted(sky_ids) or 'none'}")
                 valid = metres0 > 1.0e-3
-                red0 = compose_frame(metres0, ids0, palette, convention=args.convention)[..., 0]
+                red0 = compose_frame(metres0, ids0, palette, convention=args.convention, sky_ids=sky_ids)[..., 0]
                 print(f"{seg.name}: {depth_frames[0].shape[1]}x{depth_frames[0].shape[0]} "
                       f"{len(depth_frames)} frames, depth grey "
                       f"min={int(depth_frames[0].min())} max={int(depth_frames[0].max())}, "
@@ -563,8 +627,8 @@ def main() -> None:
                     grey = resample_nearest(grey, args.out_width, args.out_height)
                     ids = resample_nearest(ids, args.out_width, args.out_height)
                 composed.append(
-                    compose_frame(decode_depth_grey(grey, near, far), ids, palette,
-                                  convention=args.convention))
+                    compose_frame(decode_depth_codes(grey, quantization), ids, palette,
+                                  convention=args.convention, sky_ids=sky_ids))
             # --out-* already chose a tileable grid, so the 720 -> 704 crop only applies otherwise.
             if not resize and args.height and composed[0].shape[0] != args.height:
                 if args.height > composed[0].shape[0]:
@@ -584,10 +648,26 @@ def main() -> None:
 
     if not args.probe_only:
         print(f"Done: {written} written, {skipped} skipped, {failed} failed")
-        if composed_names and not args.limit:
-            write_split_manifests(root, sorted(composed_names))
+        if declared_splits(all_segs):
+            print("  every seg's metadata.json declares its split, so no manifests/ split was drawn.")
+        elif args.num_shards > 1:
+            print("  sharded run, so no split was written; rerun unsharded once every shard is done.")
+        elif composed_names and not args.limit:
+            write_split_manifests(out_root, sorted(composed_names))
         elif args.limit:
             print(f"  --limit {args.limit} was set, so no split was written; rerun without it.")
+
+
+def declared_splits(segs: list[Path]) -> bool:
+    """Whether every seg's ``metadata.json`` names its split (gta_record does, by parent)."""
+    for seg in segs:
+        try:
+            split = json.loads((seg / "metadata.json").read_text(encoding="utf-8")).get("split")
+        except (OSError, json.JSONDecodeError):
+            return False
+        if split not in {"train", "val"}:
+            return False
+    return bool(segs)
 
 
 if __name__ == "__main__":
