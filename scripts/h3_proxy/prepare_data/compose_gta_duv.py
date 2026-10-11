@@ -366,6 +366,10 @@ def encode_depth_abot(metres: np.ndarray) -> np.ndarray:
 
 def compose_frame(metres: np.ndarray, ids: np.ndarray, palette: dict[int, tuple[int, int]], *,
                   convention: str, sky_ids: frozenset[int] = frozenset({0})) -> np.ndarray:
+    # An id without a palette entry would keep G=B=0, which is no class's code.
+    stray = np.setdiff1d(np.unique(ids), np.fromiter(palette, dtype=np.int64))
+    if stray.size:
+        raise ValueError(f"semantic frames carry ids {stray.tolist()} that semantic.json does not declare")
     sky = (metres <= 1.0e-3) | np.isin(ids, list(sky_ids))
     if convention == "abot":
         red = encode_depth_abot(metres)

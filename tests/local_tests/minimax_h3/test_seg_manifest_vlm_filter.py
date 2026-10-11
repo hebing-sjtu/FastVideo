@@ -15,6 +15,8 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[3] / "scripts" / "h3_proxy" / "prepare_data"
 
 
@@ -370,6 +372,9 @@ def test_record_static_world_keeps_its_depth_and_only_named_sky_is_blanked() -> 
     red = compose.compose_frame(metres, ids, compose.build_palette("cwm", compose.LEGACY_CLASS_NAMES),
                                 convention="cwm", sky_ids=legacy_sky)[..., 0]
     assert red[0, 0] == 0, "legacy sky is still blanked"
+
+    with pytest.raises(ValueError, match=r"ids \[5\]"):
+        compose.compose_frame(metres, np.array([[0, 5]], dtype=np.uint8), palette, convention="cwm", sky_ids=sky)
 
 
 def test_record_depth_codes_invert_the_track_json_formula(tmp_path: Path) -> None:
