@@ -127,6 +127,28 @@ CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "w0_omni", "none")
 # proxy video of the CWM release.
 ROLE_VIDEO_REFERENCES = {"w0_depth_semantic": ("depth", "semantic")}
 LEGACY_REFERENCES = ("duv", )
+MODALITY_PROMPT_MODES = ("label", "gta-record")
+# How to read each modality, for gta_record sources: the semantic plane gives people, vehicles and
+# props their own classes and leaves the whole static world as one background class.
+GTA_RECORD_MODALITY_PROMPTS = {
+    "duv":
+    "Reference modality: DUV video, packed geometry. The red channel is metric depth on a log scale: "
+    "bright is near, dark is far, black is invalid or beyond 256 m. Green and blue together give each "
+    "pixel's semantic class as a flat colour; people, vehicles and props have their own classes, and the "
+    "whole static world (road, buildings, terrain, sky) is one background class.",
+    "depth":
+    "Reference modality: depth video. A grey metric depth map on a log scale: bright is near, dark is "
+    "far, black is invalid or beyond 256 m. It fixes the scene layout, object distances and camera "
+    "motion, and carries no appearance.",
+    "semantic":
+    "Reference modality: semantic video. Flat class colours mark only people, vehicles and props; the "
+    "whole static world (road, buildings, terrain, sky) is one uniform background colour. Take object "
+    "positions, sizes and motion from it, and the scene layout from <Picture 1> and the text.",
+    "style":
+    "Reference modality: low-poly render video. The same take re-rendered with coarse simplified 3D "
+    "geometry (low-poly meshes, primitives, capsules or voxels) in its own flat colours. Follow its "
+    "layout, camera and motion; never copy its simplified geometry, colours or materials.",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,7 +226,25 @@ def parse_args() -> argparse.Namespace:
         help="Rewrite text_embedding/text_token_tags on existing .pt files. Does not load the VAE "
         "or touch latents. Missing .pt files are skipped (run a full encode for those first).",
     )
+    parser.add_argument(
+        "--text-source",
+        default=None,
+        help="With --text-only, read the existing samples from this cache directory and write the "
+        "refreshed ones to --output, leaving the source cache untouched.",
+    )
+    parser.add_argument(
+        "--modality-prompt",
+        choices=MODALITY_PROMPT_MODES,
+        default="label",
+        help="Mixed mode: the line naming <Video 1>'s modality ahead of the caption. 'label' is the "
+        "bare 'Reference modality: X video.'; 'gta-record' also says how to read each modality and "
+        "assumes the gta_record classes, where the whole static world is one class.",
+    )
     args = parser.parse_args()
+    if args.text_source and not args.text_only:
+        raise SystemExit("--text-source requires --text-only")
+    if args.modality_prompt != "label" and not args.proxy_variants:
+        raise SystemExit("--modality-prompt applies to the mixed --proxy-variants mode only")
     if args.num_frames % 17 != 5:
         raise SystemExit(f"--num-frames must satisfy n %% 17 == 5 for the H3 causal VAE, got {args.num_frames}")
     if not 0 <= args.shard_index < args.num_shards:
@@ -733,11 +773,7 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
                                args.anchor_short_edge,
                                aspect=anchor_aspect(args))
     original_prompt = str(entry["prompt"])
-    conditioning_prompt = (
-        f"Reference modality: {references[0]} video.\n{original_prompt}"
-        if mixed_variants(args)
-        else original_prompt
-    )
+    conditioning_prompt = conditioning_prompt_for(args, references, original_prompt)
     text_embedding, text_token_tags = encoders.encode_text(
         conditioning_prompt, anchor, [preview for _, preview in proxies], cwm_system=role)
 
@@ -788,6 +824,15 @@ def mixed_variants(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(getattr(args, "proxy_variants", ()) or ())
 
 
+def conditioning_prompt_for(args: argparse.Namespace, references: tuple[str, ...], caption: str) -> str:
+    """The user text Qwen reads: in mixed mode a modality line, then the caption."""
+    if not mixed_variants(args):
+        return caption
+    if getattr(args, "modality_prompt", "label") == "gta-record":
+        return f"{GTA_RECORD_MODALITY_PROMPTS[references[0]]}\n{caption}"
+    return f"Reference modality: {references[0]} video.\n{caption}"
+
+
 def entry_proxy_references(entry: dict[str, Any], args: argparse.Namespace) -> tuple[str, ...]:
     variants = mixed_variants(args)
     if not variants:
@@ -814,6 +859,8 @@ def reference_info(
         info["fit"] = args.fit
     variants = mixed_variants(args)
     if variants:
+        if getattr(args, "modality_prompt", "label") != "label":
+            info["modality_prompt"] = args.modality_prompt
         if entry is None:
             info["proxy_variants"] = list(variants)
         else:
@@ -893,16 +940,16 @@ def load_proxy_previews(entry: dict[str, Any], args: argparse.Namespace, root: P
 
 
 def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argparse.Namespace, root: Path,
-                           out_path: Path) -> dict[str, Any]:
+                           source_path: Path) -> dict[str, Any]:
     """Refresh Qwen rows on an existing sample. Latents stay as they were."""
-    sample = torch.load(out_path, map_location="cpu", weights_only=False)
+    sample = torch.load(source_path, map_location="cpu", weights_only=False)
     if not isinstance(sample, dict) or "vae_latent" not in sample:
-        raise ValueError(f"{out_path} is not an H3 proxy cache sample")
+        raise ValueError(f"{source_path} is not an H3 proxy cache sample")
     recorded = tuple((sample.get("info") or {}).get("proxy_references") or LEGACY_REFERENCES)
     references = entry_proxy_references(entry, args)
     if recorded != references:
         raise ValueError(
-            f"{out_path} carries the proxy references {list(recorded)}, but this row requires "
+            f"{source_path} carries the proxy references {list(recorded)}, but this row requires "
             f"{list(references)}; the Qwen rows would describe videos the latents are not."
         )
     role = entry_cwm_system(entry, args.cwm_system)
@@ -917,11 +964,7 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
                                           args.fit, crop=entry.get("target_crop"))
         anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
     original_prompt = str(entry["prompt"])
-    conditioning_prompt = (
-        f"Reference modality: {references[0]} video.\n{original_prompt}"
-        if mixed_variants(args)
-        else original_prompt
-    )
+    conditioning_prompt = conditioning_prompt_for(args, references, original_prompt)
     text_embedding, text_token_tags = encoders.encode_text(
         conditioning_prompt, anchor, proxy_previews, cwm_system=role)
     sample["text_embedding"] = text_embedding
@@ -1050,17 +1093,21 @@ def main() -> None:
         # Flatten ids like ``kof-video-0809/seg_0001``: the train loader scans one directory level.
         name = str(entry.get("name") or Path(str(entry["target"])).stem).replace("/", "__")
         out_path = output_dir / f"{name}.pt"
+        source_path = Path(args.text_source).expanduser() / out_path.name if args.text_source else out_path
         if args.text_only:
-            if not out_path.exists():
+            if not source_path.exists():
                 skipped += 1
                 print(f"[{index + 1}/{len(entries)}] SKIP {name}: no existing .pt for --text-only")
+                continue
+            if args.text_source and out_path.exists() and not args.overwrite:
+                skipped += 1
                 continue
         elif out_path.exists() and not args.overwrite:
             skipped += 1
             continue
         try:
             if args.text_only:
-                sample = encode_entry_text_only(entry, encoders, args, root, out_path)
+                sample = encode_entry_text_only(entry, encoders, args, root, source_path)
             else:
                 sample = encode_entry(entry, encoders, args, root)
         except (KeyError, OSError, RuntimeError, ValueError) as error:

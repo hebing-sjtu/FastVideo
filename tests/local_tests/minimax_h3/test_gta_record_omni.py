@@ -155,6 +155,37 @@ def test_a_record_row_builds_every_plane_modality_from_videos(encode_script, tmp
     assert np.array_equal(encoders.previews[0], encode_script.pixels_to_preview(expected))
 
 
+def test_text_refresh_describes_the_modality_and_keeps_the_source_latents(encode_script, tmp_path, monkeypatch):
+    _record_proxy(tmp_path / "seg/proxy")
+    monkeypatch.setattr(encode_script, "read_video_frames",
+                        lambda path, frames, height, width, fit="resize", crop=None: np.zeros(
+                            (frames, height, width, 3), dtype=np.uint8))
+    entry = {
+        "target": "seg/proxy/color.mp4",
+        "proxy_depth_video": "seg/proxy/depth.mp4",
+        "proxy_semantic_video": "seg/proxy/semantic.mp4",
+        "proxy_modality": "semantic",
+        "prompt": "a car drives",
+    }
+    source = encode_script.encode_entry(entry, _FakeEncoders(), _mixed_args(), tmp_path)
+    source["vae_latent"] = torch.full_like(source["vae_latent"], 7.0)
+    source_path = tmp_path / "source.pt"
+    torch.save(source, source_path)
+
+    encoders = _FakeEncoders()
+    refreshed = encode_script.encode_entry_text_only(entry, encoders, _mixed_args(modality_prompt="gta-record"),
+                                                     tmp_path, source_path)
+    description = encode_script.GTA_RECORD_MODALITY_PROMPTS["semantic"]
+    assert encoders.prompt == f"{description}\na car drives"
+    assert refreshed["info"]["conditioning_prompt"] == encoders.prompt
+    assert refreshed["info"]["modality_prompt"] == "gta-record"
+    assert refreshed["info"]["prompt"] == "a car drives"
+    assert torch.equal(refreshed["vae_latent"], torch.full_like(source["vae_latent"], 7.0))
+    assert torch.load(source_path, weights_only=False)["info"]["conditioning_prompt"].startswith(
+        "Reference modality: semantic video.\n")
+    assert set(encode_script.GTA_RECORD_MODALITY_PROMPTS) == set(encode_script.PROXY_VARIANTS)
+
+
 def test_a_composed_duv_video_may_be_nearest_resized_but_never_blended(encode_script, tmp_path):
     rng = np.random.default_rng(1)
     codes = rng.choice(np.array([0, 64, 128, 255], dtype=np.uint8), size=(2, 36, 64, 3))
@@ -245,6 +276,26 @@ def test_the_builder_pairs_both_targets_with_balanced_single_references(builder,
         else:
             assert row["proxy_depth_video"] == f"{row['id']}/proxy/depth.mp4"
     assert builder.assign(targets, builder.VARIANTS, "seed") == rows, "deterministic"
+
+
+def test_complement_rows_pair_each_target_with_every_other_modality(builder, tmp_path):
+    _record_dataset(tmp_path / "ds")
+    targets, _ = builder.collect_targets(tmp_path / "ds", "train", kinds=("color", "high"), prose="rich",
+                                         allow_unscored=False)
+    one = builder.assign(targets, builder.VARIANTS, "seed")
+    extra = builder.assign(targets, builder.VARIANTS, "seed", "complement")
+    assert builder.assign(targets, builder.VARIANTS, "seed", "all") == sorted(one + extra, key=lambda r: r["name"])
+    assert len({row["name"] for row in one + extra}) == len(one) + len(extra)
+
+    chosen = {row["name"]: row["proxy_modality"] for row in one}
+    pairs = Counter()
+    for row in extra:
+        base, modality = row["name"].rsplit("__", 1)
+        assert row["proxy_modality"] == modality != chosen[base]
+        pairs[base] += 1
+    with_style = {target["name"] for target in targets if target["lows"]}
+    for name in chosen:
+        assert pairs[name] == (3 if name in with_style else 2)
 
 
 def test_heldout_cells_draw_from_distinct_segs_of_the_val_split(builder, tmp_path):

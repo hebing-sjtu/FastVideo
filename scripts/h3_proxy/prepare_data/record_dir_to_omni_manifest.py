@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--targets", nargs="+", choices=TARGET_KINDS, default=list(TARGET_KINDS))
     p.add_argument("--contract-prose", choices=CONTRACT_PROSE_STYLES, default="rich")
     p.add_argument("--seed", default="gta_record_omni_v1", help="Salt of the deterministic row order.")
+    p.add_argument("--modalities",
+                   choices=("one", "complement", "all"),
+                   default="one",
+                   help="'one' modality per target; 'complement' the other modalities of each target, to "
+                   "encode next to an existing 'one' cache; 'all' both.")
     p.add_argument("--heldout-per-cell", type=int, default=0)
     p.add_argument("--heldout-out", default="")
     p.add_argument("--allow-unscored",
@@ -72,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.heldout_per_cell and not args.heldout_out:
         p.error("--heldout-per-cell needs --heldout-out")
+    if args.heldout_per_cell and args.modalities != "one":
+        p.error("--heldout-per-cell picks from one-modality rows; use --modalities one")
     return args
 
 
@@ -156,13 +163,18 @@ def collect_targets(root: Path, split: str, *, kinds: tuple[str, ...], prose: st
     return targets, skipped
 
 
-def assign(targets: list[dict], variants: tuple[str, ...], seed: str) -> list[dict]:
-    """One modality per target, balanced per (kind, tag); style rotates the seg's low-poly renders."""
+def assign(targets: list[dict], variants: tuple[str, ...], seed: str, modalities: str = "one") -> list[dict]:
+    """One modality per target, balanced per (kind, tag); style rotates the seg's low-poly renders.
+
+    ``complement`` returns instead every other available modality of each target, named
+    ``<name>__<modality>``, so a cache built from the ``one`` manifest plus these rows holds every
+    pairing without re-encoding a row; ``all`` returns both.
+    """
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for target in targets:
         groups[(target["kind"], target["tag"])].append(target)
     style_turn: Counter = Counter()
-    rows = []
+    picked = []
     for key in sorted(groups):
         ordered = sorted(groups[key], key=lambda t: stable_key(seed, t["name"]))
         offset = int(stable_key(seed, *key), 16) % len(variants)
@@ -171,7 +183,17 @@ def assign(targets: list[dict], variants: tuple[str, ...], seed: str) -> list[di
             modality = next((kind for kind in choices if kind != "style" or target["lows"]), None)
             if modality is None:
                 continue
-            rows.append(build_row(target, modality, style_turn, seed))
+            picked.append((target, modality, build_row(target, modality, style_turn, seed)))
+    rows = [row for _, _, row in picked] if modalities in ("one", "all") else []
+    if modalities in ("complement", "all"):
+        # A second pass, so the one-per-target rows (and their style rotation) match the 'one' manifest.
+        for target, chosen, _ in picked:
+            for modality in variants:
+                if modality == chosen or (modality == "style" and not target["lows"]):
+                    continue
+                row = build_row(target, modality, style_turn, seed)
+                row["name"] = f"{target['name']}__{modality}"
+                rows.append(row)
     return sorted(rows, key=lambda row: row["name"])
 
 
@@ -267,7 +289,7 @@ def main() -> None:
                                        allow_unscored=args.allow_unscored)
     if not targets:
         raise SystemExit(f"No {args.split} targets under {root}")
-    rows = assign(targets, variants, args.seed)
+    rows = assign(targets, variants, args.seed, args.modalities)
     check_media(root, rows)
     write_rows(Path(args.out).expanduser(), rows)
     summarize(f"Wrote {args.out}", rows)
