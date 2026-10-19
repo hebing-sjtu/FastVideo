@@ -125,13 +125,15 @@ REQUIRED_MEDIA_KEYS = ("target", "prompt")
 # Exactly one of these names the proxy. Order is only for error messages. A depth video comes with
 # its `proxy_semantic_video`.
 PROXY_KEYS = ("proxy", "proxy_duv", "proxy_duv_video", "proxy_depth_video")
-INFO_PASSTHROUGH_KEYS = ("target_kind", "target_style", "proxy_style")
+INFO_PASSTHROUGH_KEYS = ("target_kind", "target_style", "proxy_style", "take", "take_segment", "take_anchor")
 FIT_MODES = ("resize", "center-crop")
 # Mirrors `proxy.PROXY_REFERENCE_KINDS` and `cwm_presentation.CWM_SYSTEM_ROLES`; spelled out so
 # --help does not import fastvideo.
 PROXY_REFERENCES = ("duv", "depth", "semantic")
 PROXY_VARIANTS = (*PROXY_REFERENCES, "style")
-CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "w0_omni", "none")
+CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "w0_omni", "wn_omni", "none")
+# Roles of the mixed single-reference mode: a take's opening clip and its continuations.
+OMNI_ROLES = ("w0_omni", "wn_omni")
 # The video references each chat role names, in <Video N> order. Roles not listed describe the one
 # proxy video of the CWM release.
 ROLE_VIDEO_REFERENCES = {"w0_depth_semantic": ("depth", "semantic")}
@@ -220,7 +222,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=PROXY_VARIANTS,
         help="Mixed-single-reference mode: each manifest row chooses one allowed modality with "
-        "'proxy_modality'. Requires --cwm-system w0_omni.",
+        "'proxy_modality'. Requires --cwm-system w0_omni (rows of a long take may set wn_omni and "
+        "'take_anchor').",
     )
     parser.add_argument(
         "--code-resize",
@@ -283,8 +286,8 @@ def parse_args() -> argparse.Namespace:
     if len(set(args.proxy_variants)) != len(args.proxy_variants):
         raise SystemExit(f"--proxy-variants names a modality twice: {list(args.proxy_variants)}")
     if args.proxy_variants:
-        if args.cwm_system != "w0_omni":
-            raise SystemExit("--proxy-variants requires --cwm-system w0_omni")
+        if args.cwm_system not in OMNI_ROLES:
+            raise SystemExit(f"--proxy-variants requires --cwm-system in {list(OMNI_ROLES)}")
         for variant in args.proxy_variants:
             check_role_references(args.cwm_system, (variant,))
     else:
@@ -304,7 +307,7 @@ def check_role_references(role: str, references: tuple[str, ...]) -> None:
     """
     if role == "none":
         return
-    if role == "w0_omni":
+    if role in OMNI_ROLES:
         if len(references) != 1 or references[0] not in PROXY_VARIANTS:
             raise ValueError(
                 f"CWM role {role!r} requires exactly one typed proxy video, got {list(references)}"
@@ -803,10 +806,8 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
     target_pixels = torch.from_numpy(target_frames.copy()).permute(3, 0, 1, 2)[None].float().div_(255.0)
 
     proxies = load_proxy_clips(entry, args, root)
-    anchor = read_anchor_image(None if mixed_variants(args) else resolve("anchor"),
-                               target_frames,
-                               args.anchor_short_edge,
-                               aspect=anchor_aspect(args))
+    anchor_path = take_anchor_path(entry, root) or (None if mixed_variants(args) else resolve("anchor"))
+    anchor = read_anchor_image(anchor_path, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
     original_prompt = str(entry["prompt"])
     conditioning_prompt = conditioning_prompt_for(args, references, original_prompt)
     text_embedding, text_token_tags = encoders.encode_text(
@@ -827,7 +828,8 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
             "qwen_video_fps": float(args.qwen_video_fps),
             "prompt": original_prompt,
             **({"conditioning_prompt": conditioning_prompt} if mixed_variants(args) else {}),
-            **({"anchor_source": "target_first_frame"} if mixed_variants(args) else {}),
+            **({"anchor_source": "take_anchor"} if entry.get("take_anchor") else
+               {"anchor_source": "target_first_frame"} if mixed_variants(args) else {}),
             "cwm_system": role,
             **reference_info(args, entry),
             **{key: entry[key] for key in INFO_PASSTHROUGH_KEYS if entry.get(key)},
@@ -841,6 +843,12 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
         if pixel_size is not None:
             sample["info"]["pixel_size"] = pixel_size
     return sample
+
+
+def take_anchor_path(entry: dict[str, Any], root: Path) -> Path | None:
+    """A long take's global ``<Picture 1>``, which its continuation clips do not open on."""
+    value = entry.get("take_anchor")
+    return None if not value else root / str(value)
 
 
 def entry_cwm_system(entry: dict[str, Any], default: str) -> str:
@@ -990,10 +998,12 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
     role = entry_cwm_system(entry, args.cwm_system)
     check_role_references(role, references)
     proxy_previews = load_proxy_previews(entry, args, root)
-    if entry.get("anchor") and not mixed_variants(args):
+    explicit = take_anchor_path(entry, root) or (
+        root / str(entry["anchor"]) if entry.get("anchor") and not mixed_variants(args) else None)
+    if explicit is not None:
         # Target pixels are not loaded; the stored anchor size is unused for Qwen's PIL path.
         dummy = np.zeros((1, args.height, args.width, 3), dtype=np.uint8)
-        anchor = read_anchor_image(root / str(entry["anchor"]), dummy, args.anchor_short_edge, aspect=anchor_aspect(args))
+        anchor = read_anchor_image(explicit, dummy, args.anchor_short_edge, aspect=anchor_aspect(args))
     else:
         target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width,
                                           args.fit, crop=entry.get("target_crop"))
@@ -1056,7 +1066,8 @@ def encode_entry_oc_refresh(entry: dict[str, Any], encoders: Encoders, args: arg
     previews = load_proxy_previews(entry, args, root)
     target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width, args.fit,
                                       crop=entry.get("target_crop"))
-    anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
+    anchor = read_anchor_image(take_anchor_path(entry, root), target_frames, args.anchor_short_edge,
+                               aspect=anchor_aspect(args))
     if verify:
         embedding, tags = encoders.encode_text(document, anchor, previews, cwm_system=role)
         cached = sample["text_embedding"].float()

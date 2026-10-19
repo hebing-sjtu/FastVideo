@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from PIL import Image
 import pytest
 import torch
 
@@ -103,6 +104,8 @@ class _FakeEncoders:
 
     def encode_text(self, prompt, anchor, previews, *, cwm_system=None):
         self.prompt = prompt
+        self.anchor = anchor
+        self.role = cwm_system
         self.previews = previews
         return torch.zeros(5, 8), torch.ones(5, dtype=torch.long)
 
@@ -184,6 +187,44 @@ def test_text_refresh_describes_the_modality_and_keeps_the_source_latents(encode
     assert torch.load(source_path, weights_only=False)["info"]["conditioning_prompt"].startswith(
         "Reference modality: semantic video.\n")
     assert set(encode_script.GTA_RECORD_MODALITY_PROMPTS) == set(encode_script.PROXY_VARIANTS)
+
+
+def test_a_take_continuation_row_shows_the_take_anchor_not_its_own_first_frame(encode_script, tmp_path,
+                                                                              monkeypatch):
+    _record_proxy(tmp_path / "seg/proxy")
+    monkeypatch.setattr(encode_script, "read_video_frames",
+                        lambda path, frames, height, width, fit="resize", crop=None: np.zeros(
+                            (frames, height, width, 3), dtype=np.uint8))
+    Image.new("RGB", (64, 32), (200, 10, 10)).save(tmp_path / "anchor.png")
+    entry = {
+        "target": "seg/proxy/color.mp4",
+        "proxy_depth_video": "seg/proxy/depth.mp4",
+        "proxy_semantic_video": "seg/proxy/semantic.mp4",
+        "proxy_modality": "depth",
+        "prompt": "a car drives",
+        "cwm_system": "wn_omni",
+        "take_anchor": "anchor.png",
+        "take": "demo",
+        "take_segment": 1,
+    }
+    encoders = _FakeEncoders()
+    sample = encode_script.encode_entry(entry, encoders, _mixed_args(), tmp_path)
+    assert encoders.role == "wn_omni"
+    assert np.asarray(encoders.anchor)[..., 0].min() == 200
+    info = sample["info"]
+    assert info["anchor_source"] == "take_anchor" and info["cwm_system"] == "wn_omni"
+    assert (info["take"], info["take_segment"]) == ("demo", 1)
+
+    source_path = tmp_path / "source.pt"
+    torch.save(sample, source_path)
+    encoders = _FakeEncoders()
+    encode_script.encode_entry_text_only(entry, encoders, _mixed_args(), tmp_path, source_path)
+    assert np.asarray(encoders.anchor)[..., 0].min() == 200
+
+    encoders = _FakeEncoders()
+    encode_script.encode_entry({**entry, "take_anchor": None, "cwm_system": "w0_omni"}, encoders, _mixed_args(),
+                               tmp_path)
+    assert np.asarray(encoders.anchor).max() == 0
 
 
 def test_a_composed_duv_video_may_be_nearest_resized_but_never_blended(encode_script, tmp_path):

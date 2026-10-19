@@ -72,6 +72,15 @@ def test_the_mixed_omni_role_is_hash_locked_and_expects_a_modality_label():
     assert "DUV geometry, metric depth" in text
 
 
+def test_the_omni_continuation_role_keeps_the_modality_text_and_gives_34_frames():
+    assert resolve_cwm_system_role("wn_omni") == "wn_omni"
+    opening, continuation = load_cwm_system_prompt("w0_omni"), load_cwm_system_prompt("wn_omni")
+    assert continuation.split("\n\n")[0] == opening.split("\n\n")[0].replace("target take", "target clip")
+    assert "first 34 frames (1.4167 seconds)" in continuation
+    assert "NOT the first frame of\nthis clip" in continuation
+    assert "beginning of the take" not in continuation
+
+
 def test_the_semantic_palette_gives_every_class_its_own_interior_colour():
     palette = semantic_palette()
     assert palette.shape == (PROXY_SEMANTIC_NUM_CLASSES, 3)
