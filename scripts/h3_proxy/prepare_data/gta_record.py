@@ -62,6 +62,44 @@ SOURCE_CLASS_TO_PROXY = {
     "prop": "prop",
 }
 
+# CARLA 0.9.14+ semantic tags (the CityScapes palette plus CARLA's extras), as SolarRenderer-Data
+# exports them, -> proxy class. The CityScapes part follows proxy_extract.taxonomy.CITYSCAPES_TO_CWM.
+# A semantic.json declaring ``"taxonomy": "carla"`` is read with this table instead of the one above,
+# because the two vocabularies share names ("ground") that mean different things.
+CARLA_TAGS = (
+    ("unlabeled", (0, 0, 0), "void_unknown"),
+    ("road", (128, 64, 128), "road_paved"),
+    ("sidewalk", (244, 35, 232), "road_paved"),
+    ("building", (70, 70, 70), "building_structure"),
+    ("wall", (102, 102, 156), "building_structure"),
+    ("fence", (190, 153, 153), "infrastructure"),
+    ("pole", (153, 153, 153), "infrastructure"),
+    ("traffic light", (250, 170, 30), "infrastructure"),
+    ("traffic sign", (220, 220, 0), "infrastructure"),
+    ("vegetation", (107, 142, 35), "vegetation"),
+    ("terrain", (152, 251, 152), "terrain"),
+    ("sky", (70, 130, 180), "sky"),
+    ("pedestrian", (220, 20, 60), "human"),
+    ("rider", (255, 0, 0), "human"),
+    ("car", (0, 0, 142), "vehicle"),
+    ("truck", (0, 0, 70), "vehicle"),
+    ("bus", (0, 60, 100), "vehicle"),
+    ("train", (0, 80, 100), "vehicle"),
+    ("motorcycle", (0, 0, 230), "vehicle"),
+    ("bicycle", (119, 11, 32), "vehicle"),
+    ("static", (110, 190, 160), "prop"),
+    ("dynamic", (170, 120, 50), "prop"),
+    ("other", (55, 90, 80), "void_unknown"),
+    ("water", (45, 60, 150), "water"),
+    ("road line", (157, 234, 50), "road_paved"),
+    ("ground", (81, 0, 81), "road_paved"),
+    ("bridge", (150, 100, 100), "building_structure"),
+    ("rail track", (230, 150, 140), "infrastructure"),
+    ("guard rail", (180, 165, 180), "infrastructure"),
+)
+CARLA_CLASS_TO_PROXY = {name: proxy for name, _, proxy in CARLA_TAGS}
+TAXONOMIES = {"gta_record": SOURCE_CLASS_TO_PROXY, "carla": CARLA_CLASS_TO_PROXY}
+
 UNMAPPED = 255
 
 
@@ -91,28 +129,39 @@ def read_semantic_map(proxy_dir: Path) -> dict[int, str]:
     return {int(key): str(value.get("name") if isinstance(value, dict) else value) for key, value in classes.items()}
 
 
-def proxy_class_lut(semantic_map: dict[int, str]) -> np.ndarray:
+def read_semantic_taxonomy(proxy_dir: Path) -> str:
+    """Which class-name table ``semantic.json`` is written in; gta_record when it does not say."""
+    path = proxy_dir / "semantic.json"
+    taxonomy = str(json.loads(path.read_text(encoding="utf-8")).get("taxonomy") or "gta_record")
+    if taxonomy not in TAXONOMIES:
+        raise ValueError(f"{path}: unknown taxonomy {taxonomy!r}; expected one of {sorted(TAXONOMIES)}")
+    return taxonomy
+
+
+def proxy_class_lut(semantic_map: dict[int, str], taxonomy: str = "gta_record") -> np.ndarray:
     """``[256]`` uint8 table from a source class id to a ``PROXY_CLASSES`` index.
 
     Ids the map does not declare stay :data:`UNMAPPED`, which :func:`map_class_ids` rejects, so a
     stray code cannot quietly borrow a neighbour's class.
     """
+    table = TAXONOMIES[taxonomy]
     lut = np.full(256, UNMAPPED, dtype=np.uint8)
     unknown = []
     for class_id, name in semantic_map.items():
-        target = SOURCE_CLASS_TO_PROXY.get(source_class_key(name))
+        target = table.get(source_class_key(name))
         if target is None:
             unknown.append(f"{class_id}={name!r}")
             continue
         lut[class_id] = PROXY_CLASSES.index(target)
     if unknown:
-        raise ValueError(f"semantic.json classes with no proxy mapping: {', '.join(unknown)}. Add them to "
-                         "SOURCE_CLASS_TO_PROXY rather than letting them fall onto another code.")
+        raise ValueError(f"semantic.json classes with no proxy mapping in the {taxonomy} table: {', '.join(unknown)}. "
+                         "Add them to that table rather than letting them fall onto another code.")
     return lut
 
 
-def sky_source_ids(semantic_map: dict[int, str]) -> set[int]:
-    return {class_id for class_id, name in semantic_map.items() if SOURCE_CLASS_TO_PROXY.get(source_class_key(name)) == "sky"}
+def sky_source_ids(semantic_map: dict[int, str], taxonomy: str = "gta_record") -> set[int]:
+    table = TAXONOMIES[taxonomy]
+    return {class_id for class_id, name in semantic_map.items() if table.get(source_class_key(name)) == "sky"}
 
 
 def map_class_ids(ids: np.ndarray, lut: np.ndarray) -> np.ndarray:
@@ -199,14 +248,20 @@ def read_semantic_video(path: Path, num_frames: int, lut: np.ndarray) -> np.ndar
     return map_class_ids(frames[..., 2], lut)
 
 
+def read_proxy_semantic_from_video(semantic_path: Path, num_frames: int) -> np.ndarray:
+    """``[T, H, W]`` proxy class indices, through the table ``semantic.json`` beside the video names."""
+    directory = semantic_path.parent
+    lut = proxy_class_lut(read_semantic_map(directory), read_semantic_taxonomy(directory))
+    return read_semantic_video(semantic_path, num_frames, lut)
+
+
 def read_proxy_planes_from_videos(depth_path: Path, semantic_path: Path, num_frames: int) -> tuple[np.ndarray, np.ndarray]:
     """Metric depth and proxy class indices of one record seg, each ``[T, H, W]``.
 
     ``semantic.json`` and ``track.json`` are read from the videos' directory.
     """
-    lut = proxy_class_lut(read_semantic_map(semantic_path.parent))
     depth = read_depth_video(depth_path, num_frames, read_depth_quantization(depth_path.parent))
-    semantic = read_semantic_video(semantic_path, num_frames, lut)
+    semantic = read_proxy_semantic_from_video(semantic_path, num_frames)
     if depth.shape != semantic.shape:
         raise ValueError(f"depth {depth.shape} and semantic {semantic.shape} differ for {depth_path.parent}")
     return depth, semantic

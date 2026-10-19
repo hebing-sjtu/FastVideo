@@ -127,7 +127,7 @@ CWM_SYSTEM_CHOICES = ("w0", "wn", "w0_depth_semantic", "w0_omni", "none")
 # proxy video of the CWM release.
 ROLE_VIDEO_REFERENCES = {"w0_depth_semantic": ("depth", "semantic")}
 LEGACY_REFERENCES = ("duv", )
-MODALITY_PROMPT_MODES = ("label", "gta-record")
+MODALITY_PROMPT_MODES = ("label", "gta-record", "solarrenderer")
 # How to read each modality, for gta_record sources: the semantic plane gives people, vehicles and
 # props their own classes and leaves the whole static world as one background class.
 GTA_RECORD_MODALITY_PROMPTS = {
@@ -149,6 +149,21 @@ GTA_RECORD_MODALITY_PROMPTS = {
     "geometry (low-poly meshes, primitives, capsules or voxels) in its own flat colours. Follow its "
     "layout, camera and motion; never copy its simplified geometry, colours or materials.",
 }
+# SolarRenderer-Data rows: CARLA semantics are engine ground truth over the full class set, and the
+# Magpie structure is an untextured grey block-out rather than a low-poly restyle. Only these two
+# modalities exist in that corpus, which has no depth.
+SOLARRENDERER_MODALITY_PROMPTS = {
+    "semantic":
+    "Reference modality: semantic video. Every pixel is a flat class colour: sky, water, terrain, road, "
+    "vegetation, buildings, infrastructure, people, vehicles and props each have their own colour. Take the "
+    "scene layout and every object's position, size and motion from it, and all appearance from <Picture 1> "
+    "and the text.",
+    "style":
+    "Reference modality: grey-box render video. The same take rendered as untextured grey block-out geometry: "
+    "the layout, large shapes, characters' bodies, their motion and the camera, with no final materials or "
+    "lighting. Follow its layout, camera and motion; never copy its grey surfaces.",
+}
+MODALITY_PROMPTS = {"gta-record": GTA_RECORD_MODALITY_PROMPTS, "solarrenderer": SOLARRENDERER_MODALITY_PROMPTS}
 
 
 def parse_args() -> argparse.Namespace:
@@ -238,7 +253,8 @@ def parse_args() -> argparse.Namespace:
         default="label",
         help="Mixed mode: the line naming <Video 1>'s modality ahead of the caption. 'label' is the "
         "bare 'Reference modality: X video.'; 'gta-record' also says how to read each modality and "
-        "assumes the gta_record classes, where the whole static world is one class.",
+        "assumes the gta_record classes, where the whole static world is one class; 'solarrenderer' "
+        "describes full-class CARLA semantics and Magpie grey boxes. A row's own 'modality_prompt' wins.",
     )
     args = parser.parse_args()
     if args.text_source and not args.text_only:
@@ -434,6 +450,19 @@ def read_record_planes(depth_path: Path, semantic_path: Path, num_frames: int, h
         fit_frames(depth, height, width, fit, codes=True, what=what, code_resize=code_resize),
         fit_frames(semantic, height, width, fit, codes=True, what=what, code_resize=code_resize),
     )
+
+
+def read_semantic_video_clip(path: Path, num_frames: int, height: int, width: int, fit: str,
+                             code_resize: str = "reject") -> tuple[torch.Tensor, np.ndarray]:
+    """The semantic reference of a corpus that has class ids and no depth (SolarRenderer's CARLA)."""
+    from fastvideo.pipelines.basic.minimax_h3.proxy import semantic_frame_pixels
+    from gta_record import read_proxy_semantic_from_video
+
+    semantic = fit_frames(read_proxy_semantic_from_video(path, num_frames), height, width, fit, codes=True,
+                          what=f"The semantic video {path}", code_resize=code_resize)
+    frames = np.stack([semantic_frame_pixels(ids) for ids in semantic])
+    pixels = torch.from_numpy(np.ascontiguousarray(frames)).to(torch.float32).permute(3, 0, 1, 2).unsqueeze(0)
+    return pixels.contiguous(), pixels_to_preview(pixels)
 
 
 def has_proxy_planes(entry: dict[str, Any]) -> bool:
@@ -773,7 +802,7 @@ def encode_entry(entry: dict[str, Any], encoders: Encoders, args: argparse.Names
                                args.anchor_short_edge,
                                aspect=anchor_aspect(args))
     original_prompt = str(entry["prompt"])
-    conditioning_prompt = conditioning_prompt_for(args, references, original_prompt)
+    conditioning_prompt = conditioning_prompt_for(args, references, original_prompt, entry)
     text_embedding, text_token_tags = encoders.encode_text(
         conditioning_prompt, anchor, [preview for _, preview in proxies], cwm_system=role)
 
@@ -824,13 +853,26 @@ def mixed_variants(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(getattr(args, "proxy_variants", ()) or ())
 
 
-def conditioning_prompt_for(args: argparse.Namespace, references: tuple[str, ...], caption: str) -> str:
+def modality_prompt_mode(args: argparse.Namespace, entry: dict[str, Any] | None = None) -> str:
+    """The row's ``modality_prompt``, else the process-wide flag."""
+    mode = str((entry or {}).get("modality_prompt") or getattr(args, "modality_prompt", "label"))
+    if mode not in MODALITY_PROMPT_MODES:
+        raise ValueError(f"modality_prompt must be one of {list(MODALITY_PROMPT_MODES)}, got {mode!r}")
+    return mode
+
+
+def conditioning_prompt_for(args: argparse.Namespace, references: tuple[str, ...], caption: str,
+                            entry: dict[str, Any] | None = None) -> str:
     """The user text Qwen reads: in mixed mode a modality line, then the caption."""
     if not mixed_variants(args):
         return caption
-    if getattr(args, "modality_prompt", "label") == "gta-record":
-        return f"{GTA_RECORD_MODALITY_PROMPTS[references[0]]}\n{caption}"
-    return f"Reference modality: {references[0]} video.\n{caption}"
+    mode = modality_prompt_mode(args, entry)
+    if mode == "label":
+        return f"Reference modality: {references[0]} video.\n{caption}"
+    prompts = MODALITY_PROMPTS[mode]
+    if references[0] not in prompts:
+        raise ValueError(f"modality_prompt {mode!r} does not describe a {references[0]!r} reference")
+    return f"{prompts[references[0]]}\n{caption}"
 
 
 def entry_proxy_references(entry: dict[str, Any], args: argparse.Namespace) -> tuple[str, ...]:
@@ -859,8 +901,9 @@ def reference_info(
         info["fit"] = args.fit
     variants = mixed_variants(args)
     if variants:
-        if getattr(args, "modality_prompt", "label") != "label":
-            info["modality_prompt"] = args.modality_prompt
+        mode = modality_prompt_mode(args, entry)
+        if mode != "label":
+            info["modality_prompt"] = mode
         if entry is None:
             info["proxy_variants"] = list(variants)
         else:
@@ -892,6 +935,8 @@ def load_proxy_clips(entry: dict[str, Any], args: argparse.Namespace,
             return [(pixels, preview)]
         if modality == "duv" and entry.get("proxy_duv_video"):
             return [read_duv_video_clip(root / str(entry["proxy_duv_video"]), *grid, args.fit, code_resize)]
+        if modality_source_keys(entry, modality) == ("proxy_semantic_video", ):
+            return [read_semantic_video_clip(root / str(entry["proxy_semantic_video"]), *grid, args.fit, code_resize)]
         return read_entry_reference_clips(entry, root, *grid, args.fit, (modality,), code_resize)
     if not is_legacy(args):
         if not has_proxy_planes(entry):
@@ -913,7 +958,7 @@ def load_proxy_clips(entry: dict[str, Any], args: argparse.Namespace,
 MODALITY_SOURCES = {
     "duv": "DUV needs 'proxy_duv_video', 'proxy_duv', or 'proxy_depth_video' + 'proxy_semantic_video'",
     "depth": "depth needs 'proxy_duv' or 'proxy_depth_video' + 'proxy_semantic_video'",
-    "semantic": "semantic needs 'proxy_duv' or 'proxy_depth_video' + 'proxy_semantic_video'",
+    "semantic": "semantic needs 'proxy_duv', 'proxy_depth_video' + 'proxy_semantic_video', or 'proxy_semantic_video'",
     "style": "style needs the 'proxy' RGB video",
 }
 
@@ -928,6 +973,8 @@ def modality_source_keys(entry: dict[str, Any], kind: str) -> tuple[str, ...]:
         return ("proxy_duv", )
     if entry.get("proxy_depth_video") and entry.get("proxy_semantic_video"):
         return ("proxy_depth_video", "proxy_semantic_video")
+    if kind == "semantic" and entry.get("proxy_semantic_video"):
+        return ("proxy_semantic_video", )
     return ()
 
 
@@ -964,7 +1011,7 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
                                           args.fit, crop=entry.get("target_crop"))
         anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
     original_prompt = str(entry["prompt"])
-    conditioning_prompt = conditioning_prompt_for(args, references, original_prompt)
+    conditioning_prompt = conditioning_prompt_for(args, references, original_prompt, entry)
     text_embedding, text_token_tags = encoders.encode_text(
         conditioning_prompt, anchor, proxy_previews, cwm_system=role)
     sample["text_embedding"] = text_embedding
@@ -996,6 +1043,7 @@ def assign_mixed_modalities(
 
     assigned: list[dict[str, Any]] = []
     counts = dict.fromkeys(variants, 0)
+    rotated_rows = 0
     for index, original in enumerate(entries):
         entry = dict(original)
         explicit = str(entry.get("proxy_modality") or "").strip().lower()
@@ -1007,6 +1055,7 @@ def assign_mixed_modalities(
                 )
             choices = (explicit,)
         else:
+            rotated_rows += 1
             rotated = variants[index % len(variants):] + variants[:index % len(variants)]
             choices = tuple(sorted(rotated, key=lambda kind: counts[kind]))
         available = [kind for kind in choices if modality_available(entry, kind)]
@@ -1018,8 +1067,10 @@ def assign_mixed_modalities(
         entry["proxy_modality"] = available[0]
         counts[available[0]] += 1
         assigned.append(entry)
+    # A fully labelled manifest may cover a subset (a corpus with no depth has no duv rows) while
+    # the cache still records every variant the training config names.
     missing = [kind for kind, count in counts.items() if count == 0]
-    if missing:
+    if missing and rotated_rows:
         raise SystemExit(
             f"No manifest row was assigned requested proxy modalities {missing}; "
             "remove unavailable names from --proxy-variants or add their media"

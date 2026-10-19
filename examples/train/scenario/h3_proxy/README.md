@@ -277,6 +277,66 @@ in pixel units, and optionally `pixel_size` naming the resolution the intrinsics
 They are normalised at build time — rebased onto frame 0, recentred, rescaled — so the model never
 sees the dataset's world origin or unit scale.
 
+### SolarRenderer-Data: extra semantic and grey-box pairs
+
+[`Enderfga/SolarRenderer-Data`](https://huggingface.co/datasets/Enderfga/SolarRenderer-Data) pairs an
+engine structure video with the engine render of the same shot (24 fps, 158 frames, 1344x768). Two
+of its sources line up with omni modalities, and
+`scripts/h3_proxy/prepare_data/solarrenderer_data.py` turns a subset of each into omni encode rows:
+
+| source | structure video | omni modality | reference read from |
+| --- | --- | --- | --- |
+| CARLA | CityScapes-palette semantic segmentation | `semantic` | `semantic.mp4`, CARLA tag in B |
+| Magpie | untextured grey block-out render | `style` | `condition.mp4` as is |
+
+Neither carries depth, so neither yields `depth` or `duv` rows; UnrealZoo is CC BY-NC and left out.
+The steps are resumable and run on CPU except the encode:
+
+```bash
+S=scripts/h3_proxy/prepare_data/solarrenderer_data.py
+python $S select   --root /workspace/solarrenderer --per-source 2000
+python $S fetch    --root /workspace/solarrenderer --workers 48
+python $S semantic --root /workspace/solarrenderer --workers 96
+python $S captions --root /workspace/solarrenderer --env-file /data/binghe/secrets/vertex.env --workers 16
+python $S manifest --root /workspace/solarrenderer --split train   --out .../solarrenderer_subset_v1_train.jsonl
+python $S manifest --root /workspace/solarrenderer --split heldout --out .../solarrenderer_subset_v1_heldout.jsonl
+```
+
+- **select** spreads the CARLA pick evenly over clip ids (every shard, so every map and weather run)
+  and round-robins Magpie over its `sceneXX_playerY` recordings. Only clips whose release
+  `training_input` is "structure + first frame + text" qualify. The release's own
+  `benchmark/heldout` CARLA and Magpie clips, held out there by map, scene or recording, become the
+  `heldout` split and are excluded from the train pick.
+- **fetch** reads only the picked members out of the ~2 GB WebDataset shards with HTTP range
+  requests, after walking each shard's tar headers once (`shard_index/`).
+- **semantic** snaps every pixel of the CRF-15 palette video to the nearest CARLA tag colour. Two
+  kinds of pixel are not trusted: a colour far from every tag, and a tag holding fewer than 7 of
+  its 5x5 window — the average of road and sky is close to the wall colour, so a codec-blurred
+  edge would otherwise draw a thin wall along the horizon. Those take the most common trusted tag
+  around them; `meta.json` records the share per clip. `semantic.json` says
+  `"taxonomy": "carla"`, which `gta_record.py` maps onto the twelve `PROXY_CLASSES` the same way as
+  the GTA labels.
+- **captions** recaption the first 124 frames of the render (the window the encoder keeps) in the
+  `gta_record` prose: medium, setting, lighting, then the action in order. The release prompt is
+  written for the full 158 frames and as a reference-binding instruction, so it is only a hint.
+- **manifest** rows carry `"modality_prompt": "solarrenderer"`, which overrides
+  `--modality-prompt` per row: the grey-box text says the reference is an untextured block-out
+  render rather than a GTA mesh render. Mixing these rows into a `gta-record` encode is therefore
+  safe.
+
+Encode with exactly the GTA omni geometry, so the two caches train together:
+
+```bash
+scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
+    --manifest /data/binghe/h3_proxy/manifests/solarrenderer_subset_v1_train.jsonl \
+    --root /data/binghe/datasets/solarrenderer_subset_v1 \
+    --output /data/binghe/h3_proxy/cache/solarrenderer_subset_v1_704p_ref640 \
+    --model-path /data/models/MiniMax-H3 \
+    --num-frames 124 --height 704 --width 1280 --proxy-height 352 --proxy-width 640 \
+    --fit center-crop --code-resize nearest --proxy-variants duv depth semantic style \
+    --cwm-system w0_omni --qwen-video-fps 2 --modality-prompt gta-record
+```
+
 Write the cache to the persistent data disk. The `gcsfuse` faults that once forced a staged
 write — `Errno 107` and `SIGBUS` under sustained throughput — are fixed, so the detour through
 `/workspace` followed by a copy is no longer worth its cost: at ~15 MB per clip a 10k-clip set is a
