@@ -67,3 +67,4 @@ def test_swapped_sheets_keep_the_subject_and_change_the_style() -> None:
     assert "oc" not in swapped["f"]
     with pytest.raises(SystemExit, match="no vehicle sheet"):
         oc_sheets.swap_sheets(rows[3:4])
+    assert oc_sheets.swap_sheets(rows[3:4], pool=rows)[0]["oc"] == "e.png"

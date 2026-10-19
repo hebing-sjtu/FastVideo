@@ -77,9 +77,12 @@ def add_sheets(root: Path, rows: list[dict]) -> list[dict]:
     return out
 
 
-def swap_sheets(rows: list[dict], seed: str = "oc-swap") -> list[dict]:
-    """Give each sheeted row a sheet of the same subject kind from a row of another style."""
-    sheeted = [row for row in rows if row.get("oc")]
+def swap_sheets(rows: list[dict], seed: str = "oc-swap", pool: list[dict] | None = None) -> list[dict]:
+    """Give each sheeted row a sheet of the same subject kind from a row of another style.
+
+    Donors come from ``pool`` when given (a small evaluation set may hold one style per kind).
+    """
+    sheeted = [row for row in (rows if pool is None else pool) if row.get("oc")]
     out = []
     for row in rows:
         if not row.get("oc"):
@@ -101,13 +104,17 @@ def main() -> None:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--swap", action="store_true")
+    parser.add_argument("--donors", default="", help="With --swap, take the swapped-in sheets from this manifest.")
     args = parser.parse_args()
     root = Path(args.root).expanduser()
-    with open(args.manifest, encoding="utf-8") as handle:
-        rows = [json.loads(line) for line in handle if line.strip()]
-    rows = add_sheets(root, rows)
+
+    def read(path: str) -> list[dict]:
+        with open(path, encoding="utf-8") as handle:
+            return add_sheets(root, [json.loads(line) for line in handle if line.strip()])
+
+    rows = read(args.manifest)
     if args.swap:
-        rows = swap_sheets(rows)
+        rows = swap_sheets(rows, pool=read(args.donors) if args.donors else None)
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as handle:
