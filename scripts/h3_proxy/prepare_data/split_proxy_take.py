@@ -144,7 +144,8 @@ def write_lossless(path: Path, frames: np.ndarray, layout: str) -> None:
     with av.open(str(path), mode="w") as container:
         stream = container.add_stream("libx264rgb" if layout == "rgb24" else "libx264", rate=FPS)
         stream.height, stream.width = frames.shape[1:3]
-        stream.pix_fmt = layout
+        # libx264 quietly turns 'gray' into limited-range yuv420p; full-range Y keeps every code.
+        stream.pix_fmt = "rgb24" if layout == "rgb24" else "yuvj444p"
         stream.options = {"qp": "0", "preset": "veryfast"}
         for array in frames:
             frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(array), format=layout)
