@@ -1017,21 +1017,22 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
 
 def encode_entry_oc_refresh(entry: dict[str, Any], encoders: Encoders, args: argparse.Namespace, root: Path,
                             source_path: Path, *, verify: bool) -> dict[str, Any]:
-    """Add the row's ``<Picture 2>`` identity sheet to an existing sample; a row without one is copied.
+    """Add the row's ``<Picture 2>`` identity sheet to an existing sample.
 
     The sheeted Qwen rows reuse the source's conditioning prompt with the sheet's line put in front of
     the caption, so the two documents differ only by the sheet. ``verify`` first re-encodes the source
     document and refuses a sample it does not reproduce: the anchor, proxy preview, chat role and
     modality line are all rebuilt from these flags, and any mismatch would make ``text_embedding_no_oc``
     and ``text_embedding`` describe different documents.
+
+    Both Qwen row sets are stored in bfloat16, the precision the transformer reads them in, which keeps
+    a sample with two of them the size of a single-document float32 one.
     """
     from oc_sheets import OC_PROMPTS
 
     sample = torch.load(source_path, map_location="cpu", weights_only=False)
     if not isinstance(sample, dict) or "vae_latent" not in sample:
         raise ValueError(f"{source_path} is not an H3 proxy cache sample")
-    if not entry.get("oc"):
-        return sample
     if "oc_latent" in sample:
         raise ValueError(f"{source_path} already carries an OC sheet")
     info = dict(sample.get("info") or {})
@@ -1080,9 +1081,9 @@ def encode_entry_oc_refresh(entry: dict[str, Any], encoders: Encoders, args: arg
     return {
         **sample,
         "oc_latent": encoders.encode_keyframe(sheet),
-        "text_embedding": embedding,
+        "text_embedding": embedding.to(torch.bfloat16),
         "text_token_tags": tags,
-        "text_embedding_no_oc": sample["text_embedding"],
+        "text_embedding_no_oc": sample["text_embedding"].to(torch.bfloat16),
         "text_token_tags_no_oc": sample["text_token_tags"],
         "info": info,
     }
@@ -1204,6 +1205,10 @@ def main() -> None:
         out_path = output_dir / f"{name}.pt"
         source_path = Path(args.text_source).expanduser() / out_path.name if args.text_source else out_path
         if args.oc_refresh:
+            if not entry.get("oc"):
+                skipped += 1
+                print(f"[{index + 1}/{len(entries)}] SKIP {name}: no sheet; train on the source sample")
+                continue
             if not source_path.exists():
                 failed += 1
                 print(f"[{index + 1}/{len(entries)}] FAILED {name}: no source sample {source_path}")
@@ -1211,7 +1216,7 @@ def main() -> None:
             if out_path.exists() and not args.overwrite:
                 skipped += 1
                 continue
-            verify = bool(entry.get("oc")) and verify_left > 0
+            verify = verify_left > 0
             try:
                 sample = encode_entry_oc_refresh(entry, encoders, args, root, source_path, verify=verify)
             except (KeyError, OSError, RuntimeError, ValueError) as error:
@@ -1228,10 +1233,8 @@ def main() -> None:
             if written % 10 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
-            sheet = sample.get("oc_latent")
-            print(f"[{index + 1}/{len(entries)}] {name}: "
-                  f"{'copied' if sheet is None else f'oc {tuple(sheet.shape)}'}, "
-                  f"text {tuple(sample['text_embedding'].shape)}")
+            print(f"[{index + 1}/{len(entries)}] {name}: oc {tuple(sample['oc_latent'].shape)}, "
+                  f"text {tuple(sample['text_embedding_no_oc'].shape)} -> {tuple(sample['text_embedding'].shape)}")
             continue
         if args.text_only:
             if not source_path.exists():
