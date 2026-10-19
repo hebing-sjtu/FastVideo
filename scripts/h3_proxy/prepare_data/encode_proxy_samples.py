@@ -94,6 +94,15 @@ Usage::
 
     python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \\
         --manifest ... --root ... --output ... --model-path ... --text-only --cwm-system w0
+
+    Add each row's ``oc`` identity sheet (see ``oc_sheets.py``) to an existing mixed cache as
+    ``<Picture 2>``. Pass the flags the source cache was encoded with; ``--oc-verify-rows`` first
+    re-encodes that many rows without the sheet and refuses to continue unless they reproduce the
+    cached Qwen rows. Rows without ``oc`` are copied unchanged::
+
+    python scripts/h3_proxy/prepare_data/encode_proxy_samples.py \\
+        --manifest train_oc.jsonl --root ... --output new_cache --model-path ... <source flags> \\
+        --oc-refresh --text-source old_cache
 """
 
 from __future__ import annotations
@@ -229,8 +238,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--text-source",
         default=None,
-        help="With --text-only, read the existing samples from this cache directory and write the "
-        "refreshed ones to --output, leaving the source cache untouched.",
+        help="With --text-only or --oc-refresh, read the existing samples from this cache directory and "
+        "write the refreshed ones to --output, leaving the source cache untouched.",
+    )
+    parser.add_argument(
+        "--oc-refresh",
+        action="store_true",
+        help="Add each row's 'oc' identity sheet as <Picture 2>: its VAE keyframe as oc_latent and the Qwen "
+        "rows with it as text_embedding, keeping the source rows as text_embedding_no_oc. Needs --text-source.",
+    )
+    parser.add_argument("--oc-short-edge", type=int, default=1024, help="Short edge the sheet is scaled to.")
+    parser.add_argument(
+        "--oc-verify-rows",
+        type=int,
+        default=2,
+        help="With --oc-refresh, re-encode this many sheeted rows without the sheet first and stop unless "
+        "they reproduce the source cache, which proves the flags match the source encode.",
     )
     parser.add_argument(
         "--modality-prompt",
@@ -241,8 +264,10 @@ def parse_args() -> argparse.Namespace:
         "assumes the gta_record classes, where the whole static world is one class.",
     )
     args = parser.parse_args()
-    if args.text_source and not args.text_only:
-        raise SystemExit("--text-source requires --text-only")
+    if args.text_source and not (args.text_only or args.oc_refresh):
+        raise SystemExit("--text-source requires --text-only or --oc-refresh")
+    if args.oc_refresh and (args.text_only or not args.text_source or not args.proxy_variants):
+        raise SystemExit("--oc-refresh needs --text-source and --proxy-variants, and excludes --text-only")
     if args.modality_prompt != "label" and not args.proxy_variants:
         raise SystemExit("--modality-prompt applies to the mixed --proxy-variants mode only")
     if args.num_frames % 17 != 5:
@@ -556,10 +581,17 @@ def read_anchor_image(path: Path | None,
     image = Image.open(path).convert("RGB") if path is not None else Image.fromarray(target_frames[0])
     if aspect is not None:
         image = crop_to_aspect(image, *aspect)
+    return scale_to_short_edge(image, short_edge)
+
+
+def scale_to_short_edge(image: Image.Image, short_edge: int) -> Image.Image:
+    """Scale to ``short_edge`` on a canvas the patch grid can tile, keeping the aspect."""
     scale = short_edge / min(image.size)
     multiple = 32
     width = max(multiple, round(image.size[0] * scale / multiple) * multiple)
     height = max(multiple, round(image.size[1] * scale / multiple) * multiple)
+    if (width, height) == image.size:
+        return image
     return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
@@ -681,12 +713,14 @@ class Encoders:
                     anchor: Image.Image,
                     proxy_previews: np.ndarray | list[np.ndarray],
                     *,
-                    cwm_system: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                    cwm_system: str | None = None,
+                    pictures: tuple[Image.Image, ...] = ()) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the Ref2VA conditioning stage over the same reference order training will pack.
 
         The stage tokenizes ``<Picture 1>`` then ``<Video 1>``, ``<Video 2>``... labels around
         Qwen's vision placeholders, so the per-token tags it returns are only valid for that exact
-        reference order. The training plugin packs anchor-then-proxies for the same reason.
+        reference order. The training plugin packs anchor-then-proxies for the same reason;
+        ``pictures`` (``<Picture 2>``...) go between the anchor and the proxies, as it packs them.
         """
         from fastvideo.pipelines import ForwardBatch
         from fastvideo.pipelines.basic.minimax_h3.reference import MiniMaxH3PreparedReference
@@ -704,6 +738,7 @@ class Encoders:
         previews = [proxy_previews] if isinstance(proxy_previews, np.ndarray) else list(proxy_previews)
         batch.references = [
             MiniMaxH3PreparedReference(media_type="image", image=anchor),
+            *(MiniMaxH3PreparedReference(media_type="image", image=picture) for picture in pictures),
             *(MiniMaxH3PreparedReference(media_type="video", frames=preview) for preview in previews),
         ]
         batch = self.conditioning.forward(batch, self.fastvideo_args)
@@ -980,6 +1015,79 @@ def encode_entry_text_only(entry: dict[str, Any], encoders: Encoders, args: argp
     return sample
 
 
+def encode_entry_oc_refresh(entry: dict[str, Any], encoders: Encoders, args: argparse.Namespace, root: Path,
+                            source_path: Path, *, verify: bool) -> dict[str, Any]:
+    """Add the row's ``<Picture 2>`` identity sheet to an existing sample; a row without one is copied.
+
+    The sheeted Qwen rows reuse the source's conditioning prompt with the sheet's line put in front of
+    the caption, so the two documents differ only by the sheet. ``verify`` first re-encodes the source
+    document and refuses a sample it does not reproduce: the anchor, proxy preview, chat role and
+    modality line are all rebuilt from these flags, and any mismatch would make ``text_embedding_no_oc``
+    and ``text_embedding`` describe different documents.
+    """
+    from oc_sheets import OC_PROMPTS
+
+    sample = torch.load(source_path, map_location="cpu", weights_only=False)
+    if not isinstance(sample, dict) or "vae_latent" not in sample:
+        raise ValueError(f"{source_path} is not an H3 proxy cache sample")
+    if not entry.get("oc"):
+        return sample
+    if "oc_latent" in sample:
+        raise ValueError(f"{source_path} already carries an OC sheet")
+    info = dict(sample.get("info") or {})
+    caption = str(info.get("prompt") or entry["prompt"])
+    document = str(info.get("conditioning_prompt") or caption)
+    if not document.endswith(caption):
+        raise ValueError(f"{source_path}: the cached conditioning prompt does not end with its caption")
+    if float(info.get("qwen_video_fps", args.qwen_video_fps)) != float(args.qwen_video_fps):
+        raise ValueError(f"{source_path} was encoded at qwen_video_fps={info.get('qwen_video_fps')}")
+    references = entry_proxy_references(entry, args)
+    recorded = tuple(info.get("proxy_references") or LEGACY_REFERENCES)
+    if recorded != references:
+        raise ValueError(f"{source_path} carries {list(recorded)}, this row requires {list(references)}")
+    role = entry_cwm_system(entry, args.cwm_system)
+    if str(info.get("cwm_system") or "none") != role:
+        raise ValueError(f"{source_path} was encoded with cwm_system={info.get('cwm_system')!r}, not {role!r}")
+    subject = str(entry.get("oc_subject") or "")
+    if subject not in OC_PROMPTS:
+        raise ValueError(f"oc_subject must be one of {sorted(OC_PROMPTS)}, got {subject!r}")
+
+    previews = load_proxy_previews(entry, args, root)
+    target_frames = read_video_frames(root / str(entry["target"]), args.num_frames, args.height, args.width, args.fit,
+                                      crop=entry.get("target_crop"))
+    anchor = read_anchor_image(None, target_frames, args.anchor_short_edge, aspect=anchor_aspect(args))
+    if verify:
+        embedding, tags = encoders.encode_text(document, anchor, previews, cwm_system=role)
+        cached = sample["text_embedding"].float()
+        if not torch.equal(tags, sample["text_token_tags"]) or embedding.shape != cached.shape:
+            raise ValueError(f"{source_path}: re-encoding without the sheet gives other Qwen tokens")
+        error = float((embedding - cached).abs().max() / cached.abs().max().clamp_min(1e-6))
+        if error > 2e-2:
+            raise ValueError(f"{source_path}: re-encoding without the sheet differs by {error:.3g} (relative)")
+        print(f"  verified {source_path.name}: no-sheet rows reproduce the cache (max relative error {error:.2e})")
+
+    with Image.open(root / str(entry["oc"])) as raw:
+        sheet = scale_to_short_edge(raw.convert("RGB"), args.oc_short_edge)
+    sheeted = f"{document[:len(document) - len(caption)]}{OC_PROMPTS[subject]}\n{caption}"
+    embedding, tags = encoders.encode_text(sheeted, anchor, previews, cwm_system=role, pictures=(sheet, ))
+    info.update({
+        "oc": str(entry["oc"]),
+        "oc_subject": subject,
+        "oc_short_edge": int(args.oc_short_edge),
+        "oc_conditioning_prompt": sheeted,
+        **({"oc_donor": str(entry["oc_donor"])} if entry.get("oc_donor") else {}),
+    })
+    return {
+        **sample,
+        "oc_latent": encoders.encode_keyframe(sheet),
+        "text_embedding": embedding,
+        "text_token_tags": tags,
+        "text_embedding_no_oc": sample["text_embedding"],
+        "text_token_tags_no_oc": sample["text_token_tags"],
+        "info": info,
+    }
+
+
 MEDIA_KEYS = ("target", *PROXY_KEYS, "anchor")
 
 
@@ -1089,11 +1197,42 @@ def main() -> None:
     )
 
     written = skipped = failed = 0
+    verify_left = int(args.oc_verify_rows)
     for index, entry in enumerate(entries):
         # Flatten ids like ``kof-video-0809/seg_0001``: the train loader scans one directory level.
         name = str(entry.get("name") or Path(str(entry["target"])).stem).replace("/", "__")
         out_path = output_dir / f"{name}.pt"
         source_path = Path(args.text_source).expanduser() / out_path.name if args.text_source else out_path
+        if args.oc_refresh:
+            if not source_path.exists():
+                failed += 1
+                print(f"[{index + 1}/{len(entries)}] FAILED {name}: no source sample {source_path}")
+                continue
+            if out_path.exists() and not args.overwrite:
+                skipped += 1
+                continue
+            verify = bool(entry.get("oc")) and verify_left > 0
+            try:
+                sample = encode_entry_oc_refresh(entry, encoders, args, root, source_path, verify=verify)
+            except (KeyError, OSError, RuntimeError, ValueError) as error:
+                if verify:
+                    raise SystemExit(f"{name}: {error}") from error
+                failed += 1
+                print(f"[{index + 1}/{len(entries)}] FAILED {name}: {error}")
+                continue
+            verify_left -= int(verify)
+            temporary = out_path.with_suffix(".pt.tmp")
+            torch.save(sample, temporary)
+            os.replace(temporary, out_path)
+            written += 1
+            if written % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+            sheet = sample.get("oc_latent")
+            print(f"[{index + 1}/{len(entries)}] {name}: "
+                  f"{'copied' if sheet is None else f'oc {tuple(sheet.shape)}'}, "
+                  f"text {tuple(sample['text_embedding'].shape)}")
+            continue
         if args.text_only:
             if not source_path.exists():
                 skipped += 1

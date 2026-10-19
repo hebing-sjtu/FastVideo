@@ -49,6 +49,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gta_record import render_crop_box  # noqa: E402
+from oc_sheets import add_sheets  # noqa: E402
 from seg_dir_to_encode_manifest import CONTRACT_PROSE_STYLES, extract_prompt_text  # noqa: E402
 
 VARIANTS = ("duv", "depth", "semantic", "style")
@@ -69,6 +70,10 @@ def parse_args() -> argparse.Namespace:
                    default="one",
                    help="'one' modality per target; 'complement' the other modalities of each target, to "
                    "encode next to an existing 'one' cache; 'all' both.")
+    p.add_argument("--oc",
+                   action="store_true",
+                   help="Give each high-tier row its render's <Picture 2> identity sheet ('oc', 'oc_subject'); "
+                   "see oc_sheets.py.")
     p.add_argument("--heldout-per-cell", type=int, default=0)
     p.add_argument("--heldout-out", default="")
     p.add_argument("--allow-unscored",
@@ -273,7 +278,7 @@ def summarize(label: str, rows: list[dict]) -> None:
 
 
 def check_media(root: Path, rows: list[dict]) -> None:
-    keys = ("target", "proxy", "proxy_duv_video", "proxy_depth_video", "proxy_semantic_video")
+    keys = ("target", "proxy", "proxy_duv_video", "proxy_depth_video", "proxy_semantic_video", "oc")
     missing = [f"{row['name']}:{row[key]}" for row in rows for key in keys if row.get(key) and not (root / row[key]).is_file()]
     if missing:
         duv = sum("duv.mp4" in item for item in missing)
@@ -290,6 +295,8 @@ def main() -> None:
     if not targets:
         raise SystemExit(f"No {args.split} targets under {root}")
     rows = assign(targets, variants, args.seed, args.modalities)
+    if args.oc:
+        rows = add_sheets(root, rows)
     check_media(root, rows)
     write_rows(Path(args.out).expanduser(), rows)
     summarize(f"Wrote {args.out}", rows)
