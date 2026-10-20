@@ -255,6 +255,10 @@ def test_style_rows_carry_their_crop_and_rows_without_a_source_are_refused(encod
     rows = encode_script.assign_mixed_modalities(
         [{"name": "a", "proxy_depth_video": "d.mp4", "proxy_semantic_video": "s.mp4"}], ("depth", ))
     assert rows[0]["proxy_modality"] == "depth"
+    take = [{"name": "t", "proxy_modality": "depth", "proxy_depth_video": "d.mp4", "proxy_semantic_video": "s.mp4"}]
+    assert encode_script.assign_mixed_modalities(take, ("duv", "depth"))[0]["proxy_modality"] == "depth"
+    with pytest.raises(SystemExit, match="No manifest row"):
+        encode_script.assign_mixed_modalities([{**take[0], "proxy_modality": None}], ("duv", "depth"))
 
 
 def _record_dataset(root: Path, segs: int = 8) -> None:

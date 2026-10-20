@@ -1116,9 +1116,11 @@ def assign_mixed_modalities(
 
     assigned: list[dict[str, Any]] = []
     counts = dict.fromkeys(variants, 0)
+    balanced = False
     for index, original in enumerate(entries):
         entry = dict(original)
         explicit = str(entry.get("proxy_modality") or "").strip().lower()
+        balanced |= not explicit
         if explicit:
             if explicit not in variants:
                 raise SystemExit(
@@ -1138,8 +1140,9 @@ def assign_mixed_modalities(
         entry["proxy_modality"] = available[0]
         counts[available[0]] += 1
         assigned.append(entry)
+    # Fully labelled manifests (a held-out subset, a long take) may use only some modalities.
     missing = [kind for kind, count in counts.items() if count == 0]
-    if missing:
+    if missing and balanced:
         raise SystemExit(
             f"No manifest row was assigned requested proxy modalities {missing}; "
             "remove unavailable names from --proxy-variants or add their media"
