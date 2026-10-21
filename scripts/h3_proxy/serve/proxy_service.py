@@ -708,10 +708,13 @@ def build_ui(service: Service, gallery: Gallery) -> Any:
         thumbs = [(str(Path(e["dir"]) / "thumb.jpg"), gallery_label(e)) for e in entries]
         return thumbs, [e["id"] for e in entries], f"共 {len(entries)} 个结果（存档：`{gallery.remote}`）"
 
-    def show_entry(ids, evt: gr.SelectData):
+    def show_entry(ids, evt):
         meta = gallery.entry(ids[evt.index])
         return (gallery_file(meta, "compare"), gallery_file(meta, "take"), gallery_file(meta, "anchor"),
                 gallery_file(meta, "oc"), gallery_file(meta, "proxy_reference"), gallery_markdown(meta))
+
+    # gradio injects the select event by type hint; postponed annotations cannot see the local import.
+    show_entry.__annotations__["evt"] = gr.SelectData
 
     with gr.Blocks(title="H3 Proxy → Video") as demo:
         gr.Markdown("## H3 Ref2VA proxy 转视频（BD + OC：R5-B@600）\n"
