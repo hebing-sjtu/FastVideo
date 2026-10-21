@@ -361,6 +361,11 @@ class Service:
         with self.lock:
             verdict = self.vlm.classify(frames) if modality_choice == "auto" else {}
             modality = modality_choice if modality_choice != "auto" else (verdict.get("modality") or guess["modality"])
+            # Qwen reads a DUV frame as a segmentation; its smooth red depth beside a handful of
+            # green/blue class pairs is unambiguous in the pixels.
+            overruled = modality_choice == "auto" and guess["modality"] == "duv" and modality in {"semantic", "depth"}
+            if overruled:
+                modality = "duv"
             if depth_choice == "auto":
                 near = verdict.get("near_is_bright")
                 near_is_bright = True if near is None else bool(near)
@@ -378,8 +383,9 @@ class Service:
         write_mp4(job / "proxy_reference.mp4", reference[:out_frames])
         analysis = {
             "modality": modality,
-            "modality_source": "user" if modality_choice != "auto" else ("vlm" if verdict.get("modality") else
-                                                                         "pixel-statistics"),
+            "modality_source": "user" if modality_choice != "auto" else
+            ("pixel-statistics (DUV overrides the VLM)" if overruled else
+             "vlm" if verdict.get("modality") else "pixel-statistics"),
             "near_is_bright": near_is_bright,
             "vlm": verdict,
             "pixel_guess": guess,
