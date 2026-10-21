@@ -7,7 +7,8 @@ and free text. Qwen3-VL -- the H3 text encoder's own weights, run with their lan
 -- names the proxy modality and writes a caption in the training captions' style. The request is
 then encoded into 124-frame cache samples exactly as ``encode_proxy_samples.py`` encodes an omni
 training row, and spooled to SolarWM's resident ``proxy_loop serve`` workers; a proxy longer than
-one segment becomes a take of segments overlapping by 39 frames.
+one segment becomes a take of segments overlapping by 39 frames. Every finished conversion is
+archived, inputs and outputs together, to a shared gallery that the UI shows to everyone.
 
 Two GPUs: ``cuda:0`` holds the cache encoders (VAE + FastVideo Qwen3-VL), ``cuda:1`` the HF
 Qwen3-VL used for generation. Usage::
@@ -24,6 +25,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -400,7 +402,8 @@ class Service:
     # encoding and spooling --------------------------------------------
 
     def submit(self, job: Path, proxy_path: str, anchor_path: str, oc_path: str | None, oc_subject: str,
-               analysis: dict[str, Any], captions: list[str], steps: int, seed: int) -> str:
+               analysis: dict[str, Any], captions: list[str], steps: int, seed: int, *, submitter: str = "",
+               text: str = "") -> str:
         modality = analysis["modality"]
         frames = read_proxy_video(Path(proxy_path))
         reference = to_reference(frames, modality, bool(analysis["near_is_bright"]))
@@ -433,6 +436,9 @@ class Service:
         payload = {"schema": JOB_SCHEMA, "segments": segments, "fps": FPS, "frames": int(analysis["output_frames"]),
                    "steps": int(steps), "seed": int(seed)}
         (job / "job.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        request = {"submitter": submitter.strip(), "text": text, "oc_subject": oc_subject if oc_path else None,
+                   "steps": int(steps), "seed": int(seed), "captions": captions, "submitted": time.time()}
+        (job / "request.json").write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
         scratch = self.spool / "queue" / f".{job_id}.tmp"
         scratch.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(scratch, self.spool / "queue" / f"{job_id}.json")
@@ -467,6 +473,161 @@ class Service:
         return job
 
 
+# ----------------------------------------------------------------------
+# Gallery
+# ----------------------------------------------------------------------
+
+
+class Gallery:
+    """Finished conversions for everyone to watch.
+
+    Each successful job is assembled in a pod-local directory, then copied file by file into the
+    shared ``remote`` directory (a GCS mount: whole-file copies are safe there, renames are not),
+    ``meta.json`` last, so an entry without it is still being copied. The UI reads ``remote``, which
+    outlives the pod.
+    """
+
+    INPUT_STEMS = ("anchor", "oc")
+    MAX_PROXY_BYTES = 300 << 20
+
+    def __init__(self, spool: Path, jobs: Path, local: Path, remote: Path) -> None:
+        self.spool, self.jobs, self.local, self.remote = spool, jobs, local, remote
+        self.local.mkdir(parents=True, exist_ok=True)
+        self.remote.mkdir(parents=True, exist_ok=True)
+        self._cache: dict[str, dict[str, Any]] = {}
+
+    def pending(self) -> list[str]:
+        ids = sorted(path.stem for path in self.spool.glob("done/*.json"))
+        return [i for i in ids if not (self.local / i / "ARCHIVED").exists() and not (self.local / i / "SKIPPED").exists()]
+
+    def archive(self, job_id: str) -> bool:
+        """Archive one finished job; ``False`` if there is nothing to show (failed or foreign)."""
+        done = json.loads((self.spool / "done" / f"{job_id}.json").read_text(encoding="utf-8"))
+        job = self.jobs / job_id
+        local = self.local / job_id
+        local.mkdir(parents=True, exist_ok=True)
+        if done.get("error") or not (job / "analysis.json").is_file() or not Path(str(done.get("take"))).is_file():
+            (local / "SKIPPED").write_text(str(done.get("error") or "no job inputs"), encoding="utf-8")
+            return False
+        analysis = json.loads((job / "analysis.json").read_text(encoding="utf-8"))
+        request = json.loads((job / "request.json").read_text(encoding="utf-8")) if (job / "request.json").is_file() else {}
+        files = {"take.mp4": Path(done["take"]), "compare.mp4": Path(done["compare"]),
+                 "proxy_reference.mp4": job / "proxy_reference.mp4"}
+        for stem in self.INPUT_STEMS:
+            for source in sorted(job.glob(f"{stem}.*")):
+                files[f"{stem}{source.suffix}"] = source
+        for source in sorted(job.glob("proxy.*")):
+            if source.stat().st_size <= self.MAX_PROXY_BYTES:
+                files[f"proxy_input{source.suffix}"] = source
+        for name, source in files.items():
+            if source.is_file():
+                shutil.copyfile(source, local / name)
+        self.thumbnail(local / "compare.mp4", local / "thumb.jpg")
+        meta = {
+            "id": job_id,
+            "submitted": request.get("submitted") or (job / "job.json").stat().st_mtime,
+            "submitter": request.get("submitter") or "",
+            "text": request.get("text") or "",
+            "modality": analysis["modality"],
+            "modality_source": analysis.get("modality_source"),
+            "oc": any(name.startswith("oc.") for name in files),
+            "oc_subject": request.get("oc_subject"),
+            "captions": request.get("captions") or analysis.get("captions"),
+            "segments": analysis.get("segments"),
+            "frames": done.get("frames"),
+            "duration_s": round(float(done.get("frames") or 0) / FPS, 2),
+            "generation_s": done.get("seconds"),
+            "worker": done.get("worker"),
+            "weights_id": done.get("weights_id"),
+            "steps": done.get("num_inference_steps"),
+            "seed": done.get("noise_seed"),
+            "files": sorted(path.name for path in local.iterdir() if path.is_file()) + ["meta.json"],
+        }
+        (local / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        remote = self.remote / job_id
+        remote.mkdir(parents=True, exist_ok=True)
+        for name in [*(n for n in meta["files"] if n != "meta.json"), "meta.json"]:
+            shutil.copyfile(local / name, remote / name)
+        (local / "ARCHIVED").write_text(str(remote), encoding="utf-8")
+        return True
+
+    @staticmethod
+    def thumbnail(video: Path, out: Path) -> None:
+        import av
+
+        with av.open(str(video)) as container:
+            stream = container.streams.video[0]
+            middle = max(0, int((stream.frames or 124) // 2))
+            frame = None
+            for index, decoded in enumerate(container.decode(stream)):
+                frame = decoded
+                if index >= middle:
+                    break
+        image = frame.to_image()
+        image.thumbnail((960, 540))
+        image.save(out, quality=85)
+
+    def run_forever(self, interval: float = 20.0) -> None:
+        while True:
+            for job_id in self.pending():
+                try:
+                    if self.archive(job_id):
+                        print(f"[gallery] archived {job_id} -> {self.remote / job_id}", flush=True)
+                except Exception as exc:
+                    print(f"[gallery] {job_id}: {type(exc).__name__}: {exc}", flush=True)
+            time.sleep(interval)
+
+    def entries(self) -> list[dict[str, Any]]:
+        """Every complete entry under ``remote``, newest first (listing, not stat: GCS fuse caches misses)."""
+        for job_id in os.listdir(self.remote):
+            if job_id in self._cache:
+                continue
+            folder = self.remote / job_id
+            if "meta.json" not in os.listdir(folder):
+                continue
+            try:
+                meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            meta["dir"] = str(folder)
+            self._cache[job_id] = meta
+        return sorted(self._cache.values(), key=lambda m: m.get("submitted") or 0, reverse=True)
+
+    def entry(self, job_id: str) -> dict[str, Any]:
+        self.entries()
+        return self._cache[job_id]
+
+
+def gallery_label(meta: dict[str, Any]) -> str:
+    when = time.strftime("%m-%d %H:%M", time.gmtime(float(meta.get("submitted") or 0) + 8 * 3600))
+    who = f" · {meta['submitter']}" if meta.get("submitter") else ""
+    oc = " · OC" if meta.get("oc") else ""
+    return f"{when}{who} · {meta['modality']}{oc} · {meta.get('duration_s', 0):.1f}s"
+
+
+def gallery_markdown(meta: dict[str, Any]) -> str:
+    captions = meta.get("captions") or []
+    lines = [
+        f"**任务 `{meta['id']}`** · {gallery_label(meta)}",
+        f"- proxy 种类：`{meta['modality']}`（{meta.get('modality_source')}）；OC："
+        f"{meta.get('oc_subject') or '有' if meta.get('oc') else '无'}",
+        f"- {meta.get('segments')} 段，{meta.get('frames')} 帧；{meta.get('steps')} 步，种子 {meta.get('seed')}；"
+        f"生成用时 {meta.get('generation_s')}s（worker `{meta.get('worker')}`）",
+        f"- 模型 `{str(meta.get('weights_id', ''))[-20:]}`；文件：`{meta['dir']}`",
+    ]
+    if meta.get("text"):
+        lines.append(f"- 用户描述：{meta['text']}")
+    lines += ["", "**Caption**", *(f"> {c}" for c in captions)]
+    return "\n".join(lines)
+
+
+def gallery_file(meta: dict[str, Any], prefix: str) -> str | None:
+    for name in meta.get("files", []):
+        if name == prefix or name.startswith(f"{prefix}."):
+            return str(Path(meta["dir"]) / name)
+    return None
+
+
 def split_captions(text: str) -> list[str]:
     return [" ".join(part.split()) for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
 
@@ -496,7 +657,7 @@ def workers_markdown(service: Service) -> str:
     return (f"**推理 worker：** {len(live)} 在线 / {len(busy)} 忙碌，排队 {queued} 个 · 模型 `{weights}`")
 
 
-def build_ui(service: Service) -> Any:
+def build_ui(service: Service, gallery: Gallery) -> Any:
     import gradio as gr
 
     def analyze(proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds, state):
@@ -508,7 +669,7 @@ def build_ui(service: Service) -> Any:
                 state)
 
     def generate(proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds, captions, steps, seed,
-                 state):
+                 submitter, state):
         try:
             if not state or not captions.strip():
                 yield "VLM 分析中…", None, None, None, captions, None, state
@@ -518,7 +679,8 @@ def build_ui(service: Service) -> Any:
             job = Path(state["job"])
             yield "编码条件（Qwen3-VL + VAE）…", None, None, None, captions, gr.update(), state
             job_id = service.submit(job, state["proxy"], state["anchor"], state["oc"], oc_subject, state["analysis"],
-                                    split_captions(captions), int(steps), int(seed))
+                                    split_captions(captions), int(steps), int(seed), submitter=submitter or "",
+                                    text=text or "")
             started = time.time()
             while True:
                 phase, info = service.status(job_id)
@@ -535,10 +697,21 @@ def build_ui(service: Service) -> Any:
                 yield f"生成失败：{info['error']}", None, None, info, captions, gr.update(), state
                 return
             summary = (f"完成：{info['frames']} 帧（{info['frames'] / FPS:.1f}s），{len(info.get('segments', []))} 段，"
-                       f"用时 {info['seconds']}s，worker `{info.get('worker')}`，任务 `{job_id}`")
+                       f"用时 {info['seconds']}s，worker `{info.get('worker')}`，任务 `{job_id}`；"
+                       "结果会自动存入「结果画廊」")
             yield summary, info["take"], info["compare"], info, captions, gr.update(), state
         except Exception as exc:  # surfaced in the UI
             yield f"出错：{type(exc).__name__}: {exc}", None, None, None, captions, gr.update(), state
+
+    def load_gallery():
+        entries = gallery.entries()
+        thumbs = [(str(Path(e["dir"]) / "thumb.jpg"), gallery_label(e)) for e in entries]
+        return thumbs, [e["id"] for e in entries], f"共 {len(entries)} 个结果（存档：`{gallery.remote}`）"
+
+    def show_entry(ids, evt: gr.SelectData):
+        meta = gallery.entry(ids[evt.index])
+        return (gallery_file(meta, "compare"), gallery_file(meta, "take"), gallery_file(meta, "anchor"),
+                gallery_file(meta, "oc"), gallery_file(meta, "proxy_reference"), gallery_markdown(meta))
 
     with gr.Blocks(title="H3 Proxy → Video") as demo:
         gr.Markdown("## H3 Ref2VA proxy 转视频（BD + OC：R5-B@600）\n"
@@ -547,7 +720,7 @@ def build_ui(service: Service) -> Any:
                     "长于 5.17 s 的 proxy 按 124 帧一段、重叠 39 帧接续生成。")
         status_bar = gr.Markdown(workers_markdown(service))
         state = gr.State(None)
-        with gr.Row():
+        with gr.Tab("转换"), gr.Row():
             with gr.Column():
                 proxy = gr.File(label="Proxy 视频（原样读取，不转码）", file_types=["video"], type="filepath")
                 with gr.Row():
@@ -564,6 +737,7 @@ def build_ui(service: Service) -> Any:
                     max_seconds = gr.Slider(5, 60, value=15, step=0.5, label="最长输出秒数")
                     steps = gr.Slider(10, 50, value=30, step=1, label="采样步数")
                     seed = gr.Number(value=42, precision=0, label="种子")
+                submitter = gr.Textbox(label="提交人（可选，显示在结果画廊）", max_lines=1)
                 with gr.Row():
                     analyze_btn = gr.Button("① VLM 分析")
                     generate_btn = gr.Button("② 生成", variant="primary")
@@ -575,9 +749,26 @@ def build_ui(service: Service) -> Any:
                 result = gr.Video(label="生成结果")
                 compare = gr.Video(label="对比：proxy | 生成")
                 details = gr.JSON(label="任务详情")
+        with gr.Tab("结果画廊（所有人可见）"):
+            with gr.Row():
+                gallery_info = gr.Markdown()
+                refresh = gr.Button("刷新", scale=0)
+            thumbs = gr.Gallery(label="点击缩略图查看", columns=4, height="auto", allow_preview=False)
+            gallery_ids = gr.State([])
+            with gr.Row():
+                g_compare = gr.Video(label="proxy | 生成")
+                g_take = gr.Video(label="生成结果")
+            with gr.Row():
+                g_anchor = gr.Image(label="首图", interactive=False)
+                g_oc = gr.Image(label="OC 设定图", interactive=False)
+                g_proxy = gr.Video(label="模型看到的 proxy")
+            g_meta = gr.Markdown()
+        refresh.click(load_gallery, outputs=[thumbs, gallery_ids, gallery_info])
+        demo.load(load_gallery, outputs=[thumbs, gallery_ids, gallery_info])
+        thumbs.select(show_entry, inputs=gallery_ids, outputs=[g_compare, g_take, g_anchor, g_oc, g_proxy, g_meta])
         inputs = [proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds]
         analyze_btn.click(analyze, inputs=[*inputs, state], outputs=[analysis_md, captions, preview, state])
-        generate_btn.click(generate, inputs=[*inputs, captions, steps, seed, state],
+        generate_btn.click(generate, inputs=[*inputs, captions, steps, seed, submitter, state],
                            outputs=[status, result, compare, details, captions, preview, state])
         for component in (proxy, anchor, oc, modality, depth, verbatim, max_seconds):
             component.change(lambda: (None, ""), outputs=[state, captions])
@@ -609,16 +800,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--max-segments", type=int, default=12)
+    p.add_argument("--gallery", default="/data/binghe/h3_proxy/serve-gallery",
+                   help="shared archive of finished conversions; must outlive the pod")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    gallery = Gallery(Path(args.spool), Path(args.jobs), Path(args.jobs).parent / "gallery", Path(args.gallery))
+    threading.Thread(target=gallery.run_forever, daemon=True, name="gallery").start()
     service = Service(args)
-    demo = build_ui(service)
+    demo = build_ui(service, gallery)
     demo.queue(default_concurrency_limit=16).launch(
-        server_name=args.host, server_port=args.port, allowed_paths=[str(Path(args.spool)), str(Path(args.jobs))],
-        show_error=True)
+        server_name=args.host, server_port=args.port,
+        allowed_paths=[str(Path(args.spool)), str(Path(args.jobs)), str(Path(args.gallery))], show_error=True)
 
 
 if __name__ == "__main__":

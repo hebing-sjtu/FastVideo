@@ -57,3 +57,36 @@ def test_pixel_guess_separates_grey_flat_and_textured_video(service):
     assert service.pixel_guess(grey)["modality"] == "depth"
     assert service.pixel_guess(flat)["modality"] == "semantic"
     assert service.pixel_guess(textured)["modality"] == "style"
+
+
+def test_gallery_archives_finished_jobs_with_their_inputs(service, tmp_path):
+    import json
+
+    spool, jobs = tmp_path / "spool", tmp_path / "jobs"
+    job, out = jobs / "20261021-000000-abc123", spool / "out" / "20261021-000000-abc123"
+    for folder in (job, out, spool / "done"):
+        folder.mkdir(parents=True)
+    frames = np.zeros((6, 64, 96, 3), dtype=np.uint8)
+    for name in ("take.mp4", "take_compare.mp4"):
+        service.write_mp4(out / name, frames)
+    service.write_mp4(job / "proxy_reference.mp4", frames)
+    service.Image.fromarray(frames[0]).save(job / "anchor.png")
+    (job / "proxy.mp4").write_bytes((out / "take.mp4").read_bytes())
+    (job / "job.json").write_text("{}")
+    (job / "analysis.json").write_text(json.dumps({"modality": "depth", "segments": 1, "captions": ["[0.00s-5.17s] x"]}))
+    (job / "request.json").write_text(json.dumps({"submitter": "binghe", "submitted": 1.0}))
+    (spool / "done" / f"{job.name}.json").write_text(json.dumps(
+        {"take": str(out / "take.mp4"), "compare": str(out / "take_compare.mp4"), "frames": 124, "seconds": 9.0}))
+    (spool / "done" / "failed.json").write_text(json.dumps({"error": "boom"}))
+
+    gallery = service.Gallery(spool, jobs, tmp_path / "local", tmp_path / "remote")
+    assert gallery.pending() == ["20261021-000000-abc123", "failed"]
+    assert gallery.archive(job.name) is True
+    assert gallery.archive("failed") is False
+    assert gallery.pending() == []
+    [entry] = gallery.entries()
+    assert entry["submitter"] == "binghe" and entry["modality"] == "depth" and not entry["oc"]
+    assert {"take.mp4", "compare.mp4", "proxy_reference.mp4", "anchor.png", "proxy_input.mp4", "thumb.jpg",
+            "meta.json"} <= set(entry["files"])
+    assert service.gallery_file(entry, "anchor").endswith("anchor.png")
+    assert "binghe" in service.gallery_label(entry)
