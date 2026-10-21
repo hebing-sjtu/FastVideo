@@ -214,8 +214,9 @@ class Vlm:
             (merged / "chat_template.json").symlink_to(chat)
         self.device = torch.device(device)
         self.processor = AutoProcessor.from_pretrained(str(merged))
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            str(model_path / "text_encoder"), dtype=torch.bfloat16, device_map={"": str(self.device)}).eval()
+        # No device_map: that path needs `accelerate`, which the FastVideo venv does not carry.
+        self.model = Qwen3VLForConditionalGeneration.from_pretrained(str(model_path / "text_encoder"),
+                                                                     dtype=torch.bfloat16).to(self.device).eval()
 
     @torch.no_grad()
     def ask(self, images: list[Image.Image], text: str, max_new_tokens: int = 320) -> str:
