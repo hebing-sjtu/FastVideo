@@ -567,6 +567,53 @@ class Gallery:
         image.thumbnail((960, 540))
         image.save(out, quality=85)
 
+    @staticmethod
+    def make_card(compare: Path, out: Path, width: int = 640) -> None:
+        """Proxy above output from the middle frame of ``compare.mp4`` (proxy | output side by side).
+
+        Stacking the two 16:9 panels gives a near-square card, which the gallery grid shows uncropped.
+        """
+        import av
+        from PIL import ImageDraw, ImageFont
+
+        with av.open(str(compare)) as container:
+            stream = container.streams.video[0]
+            middle = max(0, int((stream.frames or 124) // 2))
+            frame = None
+            for index, decoded in enumerate(container.decode(stream)):
+                frame = decoded
+                if index >= middle:
+                    break
+        image = frame.to_image()
+        half = image.width // 2
+        height = round(image.height * width / half)
+        card = Image.new("RGB", (width, 2 * height + 4), "white")
+        font = ImageFont.load_default(size=22)
+        for row, (box, tag) in enumerate((((0, 0, half, image.height), "proxy"),
+                                          ((half, 0, 2 * half, image.height), "output"))):
+            card.paste(image.crop(box).resize((width, height), Image.BILINEAR), (0, row * (height + 4)))
+            draw = ImageDraw.Draw(card)
+            draw.rectangle((0, row * (height + 4), 84, row * (height + 4) + 30), fill=(0, 0, 0))
+            draw.text((8, row * (height + 4) + 3), tag, fill="white", font=font)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        card.save(out, quality=85)
+
+    def card(self, meta: dict[str, Any]) -> str:
+        """The card for a gallery entry, or its old wide thumbnail while the card is not built yet."""
+        path = self.local / "cards" / f"{meta['id']}.jpg"
+        return str(path if path.is_file() else Path(meta["dir"]) / "thumb.jpg")
+
+    def build_cards(self) -> None:
+        for meta in self.entries():
+            path = self.local / "cards" / f"{meta['id']}.jpg"
+            compare = gallery_file(meta, "compare")
+            if path.is_file() or compare is None:
+                continue
+            try:
+                self.make_card(Path(compare), path)
+            except Exception as exc:
+                print(f"[gallery] card {meta['id']}: {type(exc).__name__}: {exc}", flush=True)
+
     def run_forever(self, interval: float = 20.0) -> None:
         while True:
             for job_id in self.pending():
@@ -575,6 +622,7 @@ class Gallery:
                         print(f"[gallery] archived {job_id} -> {self.remote / job_id}", flush=True)
                 except Exception as exc:
                     print(f"[gallery] {job_id}: {type(exc).__name__}: {exc}", flush=True)
+            self.build_cards()
             time.sleep(interval)
 
     def entries(self) -> list[dict[str, Any]]:
@@ -705,7 +753,7 @@ def build_ui(service: Service, gallery: Gallery) -> Any:
 
     def load_gallery():
         entries = gallery.entries()
-        thumbs = [(str(Path(e["dir"]) / "thumb.jpg"), gallery_label(e)) for e in entries]
+        thumbs = [(gallery.card(e), gallery_label(e)) for e in entries]
         return thumbs, [e["id"] for e in entries], f"共 {len(entries)} 个结果（存档：`{gallery.remote}`）"
 
     def show_entry(ids, evt):
@@ -756,16 +804,20 @@ def build_ui(service: Service, gallery: Gallery) -> Any:
             with gr.Row():
                 gallery_info = gr.Markdown()
                 refresh = gr.Button("刷新", scale=0)
-            thumbs = gr.Gallery(label="点击缩略图查看", columns=4, height="auto", allow_preview=False)
             gallery_ids = gr.State([])
-            with gr.Row():
-                g_compare = gr.Video(label="proxy | 生成")
-                g_take = gr.Video(label="生成结果")
-            with gr.Row():
-                g_anchor = gr.Image(label="首图", interactive=False)
-                g_oc = gr.Image(label="OC 设定图", interactive=False)
-                g_proxy = gr.Video(label="模型看到的 proxy")
-            g_meta = gr.Markdown()
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=2, min_width=360):
+                    thumbs = gr.Gallery(label="点击查看（上：proxy，下：生成）", columns=3, height=860,
+                                        object_fit="contain", allow_preview=False)
+                with gr.Column(scale=3):
+                    g_compare = gr.Video(label="左：proxy ｜ 右：生成", autoplay=True, loop=True, height=400)
+                    g_meta = gr.Markdown()
+                    with gr.Row():
+                        g_proxy = gr.Video(label="模型看到的 proxy", loop=True)
+                        g_take = gr.Video(label="生成结果", loop=True)
+                    with gr.Row():
+                        g_anchor = gr.Image(label="首图", interactive=False, height=220)
+                        g_oc = gr.Image(label="OC 设定图", interactive=False, height=220)
         refresh.click(load_gallery, outputs=[thumbs, gallery_ids, gallery_info])
         demo.load(load_gallery, outputs=[thumbs, gallery_ids, gallery_info])
         thumbs.select(show_entry, inputs=gallery_ids, outputs=[g_compare, g_take, g_anchor, g_oc, g_proxy, g_meta])
@@ -816,7 +868,8 @@ def main() -> None:
     demo = build_ui(service, gallery)
     demo.queue(default_concurrency_limit=16).launch(
         server_name=args.host, server_port=args.port,
-        allowed_paths=[str(Path(args.spool)), str(Path(args.jobs)), str(Path(args.gallery))], show_error=True)
+        allowed_paths=[str(Path(args.spool)), str(Path(args.jobs)), str(Path(args.gallery)), str(gallery.local)],
+        show_error=True)
 
 
 if __name__ == "__main__":

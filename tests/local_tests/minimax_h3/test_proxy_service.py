@@ -90,3 +90,9 @@ def test_gallery_archives_finished_jobs_with_their_inputs(service, tmp_path):
             "meta.json"} <= set(entry["files"])
     assert service.gallery_file(entry, "anchor").endswith("anchor.png")
     assert "binghe" in service.gallery_label(entry)
+
+    assert gallery.card(entry).endswith("thumb.jpg")
+    gallery.build_cards()
+    card = service.Image.open(gallery.card(entry))
+    assert gallery.card(entry).endswith(f"cards/{job.name}.jpg")
+    assert card.size == (640, 2 * round(64 * 640 / 48) + 4)
