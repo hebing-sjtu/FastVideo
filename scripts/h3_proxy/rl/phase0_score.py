@@ -108,9 +108,11 @@ class Scorer:
 
         self.serve = load_serve()
         self.device = torch.device(args.device)
-        self.vlm = self.serve.Vlm(Path(args.model), args.device, Path(args.work))
-        tokenizer = self.vlm.processor.tokenizer
-        self.digits = [tokenizer.convert_tokens_to_ids(str(d)) for d in range(10)]
+        # The H3 text encoder is a 32B Qwen3-VL (~64 GB in bf16): it needs a GPU of its own.
+        self.vlm = None if args.no_vlm else self.serve.Vlm(Path(args.model), args.device, Path(args.work))
+        if self.vlm is not None:
+            tokenizer = self.vlm.processor.tokenizer
+            self.digits = [tokenizer.convert_tokens_to_ids(str(d)) for d in range(10)]
         self.depth_processor = AutoImageProcessor.from_pretrained(args.depth_model)
         self.depth = AutoModelForDepthEstimation.from_pretrained(args.depth_model).to(self.device).eval()
         self.dino_processor = AutoImageProcessor.from_pretrained(args.dino_model)
@@ -169,7 +171,8 @@ class Scorer:
             "depth": -aligned_error(self.disparity(take[index]), self.disparity(target[index])),
             "motion": motion_correlation(take[:n], target[:n]),
         }
-        row.update(self.judge(take[:n], caption, oc))
+        if self.vlm is not None:
+            row.update(self.judge(take[:n], caption, oc))
         return row
 
 
@@ -209,10 +212,14 @@ def main() -> None:
     p.add_argument("--also-eval", action="store_true", help="also score the eval's own seed-42 generated.mp4")
     p.add_argument("--watch", action="store_true", help="keep scoring until the spool has STOP and nothing is left")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--no-vlm", action="store_true", help="skip the VLM judge (no GPU to spare for it)")
+    p.add_argument("--shard", default="0/1", help="k/n: score only samples whose index %% n == k")
     args = p.parse_args()
+    shard, shards = (int(x) for x in args.shard.split("/"))
 
     spool, out = Path(args.spool), Path(args.out)
     slots, infos = eval_slots(Path(args.eval_dir)), sample_info(Path(args.data))
+    mine = {sample for index, sample in enumerate(infos) if index % shards == shard}
     seen = {json.loads(line)["id"] for line in out.read_text().splitlines()} if out.is_file() else set()
     scorer = Scorer(args)
     print(f"[score] ready: {len(slots)} eval slots, {len(infos)} samples, {len(seen)} already scored", flush=True)
@@ -230,7 +237,7 @@ def main() -> None:
         if args.also_eval:
             rows += [(f"eval-s0042-{s}", slot / "generated.mp4", s, 42) for s, slot in sorted(slots.items())
                      if f"eval-s0042-{s}" not in seen]
-        return rows
+        return [row for row in rows if row[2] in mine]
 
     scored = 0
     while True:
@@ -248,9 +255,8 @@ def main() -> None:
                 handle.write(json.dumps(row) + "\n")
             seen.add(job_id)
             scored += 1
-            print(f"[score] {job_id} {time.time() - started:.1f}s psnr_late={row['psnr_late']:.2f} "
-                  f"depth={row['depth']:.3f} event={row['vlm_event']:.2f} quality={row['vlm_quality']:.2f}",
-                  flush=True)
+            shown = {k: round(v, 3) for k, v in row.items() if isinstance(v, float)}
+            print(f"[score] {job_id} {time.time() - started:.1f}s {shown}", flush=True)
             if args.limit and scored >= args.limit:
                 return
         if not args.watch or ((spool / "STOP").exists() and not todo()):
