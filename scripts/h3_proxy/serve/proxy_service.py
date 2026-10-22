@@ -705,7 +705,12 @@ def workers_markdown(service: Service) -> str:
     return (f"**推理 worker：** {len(live)} 在线 / {len(busy)} 忙碌，排队 {queued} 个 · 模型 `{weights}`")
 
 
-def build_ui(service: Service, gallery: Gallery) -> Any:
+# gr.Gallery(height=...) clips its grid without a scrollbar (gradio 5.32), so the cap goes on the grid.
+GALLERY_CSS = "#gallery-thumbs .grid-wrap { max-height: 860px; overflow-y: auto; }"
+
+
+def build_ui(service: Service | None, gallery: Gallery) -> Any:
+    """The conversion tab and the gallery; ``service=None`` serves the gallery alone."""
     import gradio as gr
 
     def analyze(proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds, state):
@@ -764,42 +769,52 @@ def build_ui(service: Service, gallery: Gallery) -> Any:
     # gradio injects the select event by type hint; postponed annotations cannot see the local import.
     show_entry.__annotations__["evt"] = gr.SelectData
 
-    with gr.Blocks(title="H3 Proxy → Video") as demo:
+    with gr.Blocks(title="H3 Proxy → Video", css=GALLERY_CSS) as demo:
         gr.Markdown("## H3 Ref2VA proxy 转视频（BD + OC：R5-B@600）\n"
                     "上传任意 proxy 视频（DUV / depth / semantic 可视化，或风格化渲染）、首图、可选的人物设定图（OC）"
                     "和文字描述。VLM 先判断 proxy 种类并写标准化 caption（可编辑），再生成 704×1280、24 fps 的视频；"
                     "长于 5.17 s 的 proxy 按 124 帧一段、重叠 39 帧接续生成。")
-        status_bar = gr.Markdown(workers_markdown(service))
-        state = gr.State(None)
-        with gr.Tab("转换"), gr.Row():
-            with gr.Column():
-                proxy = gr.File(label="Proxy 视频（原样读取，不转码）", file_types=["video"], type="filepath")
-                with gr.Row():
-                    anchor = gr.Image(label="首图 <Picture 1>", type="filepath")
-                    oc = gr.Image(label="OC 人物设定图 <Picture 2>（可选）", type="filepath")
-                oc_subject = gr.Radio(["protagonist", "vehicle"], value="protagonist", label="OC 主体")
-                text = gr.Textbox(label="文字描述（可选，中英文均可；VLM 会据此写标准化 caption）", lines=3)
-                with gr.Row():
-                    modality = gr.Dropdown(["auto", *MODALITIES], value="auto", label="Proxy 种类")
-                    depth = gr.Dropdown([("自动", "auto"), ("近处亮", "near_bright"), ("近处暗", "near_dark")],
-                                        value="auto", label="Depth 明暗")
-                verbatim = gr.Checkbox(label="直接把我的文字当 caption（不经 VLM 改写）", value=False)
-                with gr.Row():
-                    max_seconds = gr.Slider(5, 60, value=15, step=0.5, label="最长输出秒数")
-                    steps = gr.Slider(10, 50, value=30, step=1, label="采样步数")
-                    seed = gr.Number(value=42, precision=0, label="种子")
-                submitter = gr.Textbox(label="提交人（可选，显示在结果画廊）", max_lines=1)
-                with gr.Row():
-                    analyze_btn = gr.Button("① VLM 分析")
-                    generate_btn = gr.Button("② 生成", variant="primary")
-            with gr.Column():
-                analysis_md = gr.Markdown()
-                captions = gr.Textbox(label="标准化 caption（每段一条，空行分隔；可编辑后再生成）", lines=8)
-                preview = gr.Video(label="模型看到的 proxy 参考（352×640）")
-                status = gr.Markdown()
-                result = gr.Video(label="生成结果")
-                compare = gr.Video(label="对比：proxy | 生成")
-                details = gr.JSON(label="任务详情")
+        if service is None:
+            gr.Markdown("**转换服务已暂停**，目前只提供结果画廊浏览。")
+        else:
+            status_bar = gr.Markdown(workers_markdown(service))
+            state = gr.State(None)
+            with gr.Tab("转换"), gr.Row():
+                with gr.Column():
+                    proxy = gr.File(label="Proxy 视频（原样读取，不转码）", file_types=["video"], type="filepath")
+                    with gr.Row():
+                        anchor = gr.Image(label="首图 <Picture 1>", type="filepath")
+                        oc = gr.Image(label="OC 人物设定图 <Picture 2>（可选）", type="filepath")
+                    oc_subject = gr.Radio(["protagonist", "vehicle"], value="protagonist", label="OC 主体")
+                    text = gr.Textbox(label="文字描述（可选，中英文均可；VLM 会据此写标准化 caption）", lines=3)
+                    with gr.Row():
+                        modality = gr.Dropdown(["auto", *MODALITIES], value="auto", label="Proxy 种类")
+                        depth = gr.Dropdown([("自动", "auto"), ("近处亮", "near_bright"), ("近处暗", "near_dark")],
+                                            value="auto", label="Depth 明暗")
+                    verbatim = gr.Checkbox(label="直接把我的文字当 caption（不经 VLM 改写）", value=False)
+                    with gr.Row():
+                        max_seconds = gr.Slider(5, 60, value=15, step=0.5, label="最长输出秒数")
+                        steps = gr.Slider(10, 50, value=30, step=1, label="采样步数")
+                        seed = gr.Number(value=42, precision=0, label="种子")
+                    submitter = gr.Textbox(label="提交人（可选，显示在结果画廊）", max_lines=1)
+                    with gr.Row():
+                        analyze_btn = gr.Button("① VLM 分析")
+                        generate_btn = gr.Button("② 生成", variant="primary")
+                with gr.Column():
+                    analysis_md = gr.Markdown()
+                    captions = gr.Textbox(label="标准化 caption（每段一条，空行分隔；可编辑后再生成）", lines=8)
+                    preview = gr.Video(label="模型看到的 proxy 参考（352×640）")
+                    status = gr.Markdown()
+                    result = gr.Video(label="生成结果")
+                    compare = gr.Video(label="对比：proxy | 生成")
+                    details = gr.JSON(label="任务详情")
+            inputs = [proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds]
+            analyze_btn.click(analyze, inputs=[*inputs, state], outputs=[analysis_md, captions, preview, state])
+            generate_btn.click(generate, inputs=[*inputs, captions, steps, seed, submitter, state],
+                               outputs=[status, result, compare, details, captions, preview, state])
+            for component in (proxy, anchor, oc, modality, depth, verbatim, max_seconds):
+                component.change(lambda: (None, ""), outputs=[state, captions])
+            gr.Timer(10).tick(lambda: workers_markdown(service), outputs=status_bar)
         with gr.Tab("结果画廊（所有人可见）"):
             with gr.Row():
                 gallery_info = gr.Markdown()
@@ -807,8 +822,8 @@ def build_ui(service: Service, gallery: Gallery) -> Any:
             gallery_ids = gr.State([])
             with gr.Row(equal_height=False):
                 with gr.Column(scale=2, min_width=360):
-                    thumbs = gr.Gallery(label="点击查看（上：proxy，下：生成）", columns=3, height=860,
-                                        object_fit="contain", allow_preview=False)
+                    thumbs = gr.Gallery(label="点击查看（上：proxy，下：生成）", columns=3, object_fit="contain",
+                                        allow_preview=False, elem_id="gallery-thumbs")
                 with gr.Column(scale=3):
                     g_compare = gr.Video(label="左：proxy ｜ 右：生成", autoplay=True, loop=True, height=400)
                     g_meta = gr.Markdown()
@@ -821,13 +836,6 @@ def build_ui(service: Service, gallery: Gallery) -> Any:
         refresh.click(load_gallery, outputs=[thumbs, gallery_ids, gallery_info])
         demo.load(load_gallery, outputs=[thumbs, gallery_ids, gallery_info])
         thumbs.select(show_entry, inputs=gallery_ids, outputs=[g_compare, g_take, g_anchor, g_oc, g_proxy, g_meta])
-        inputs = [proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds]
-        analyze_btn.click(analyze, inputs=[*inputs, state], outputs=[analysis_md, captions, preview, state])
-        generate_btn.click(generate, inputs=[*inputs, captions, steps, seed, submitter, state],
-                           outputs=[status, result, compare, details, captions, preview, state])
-        for component in (proxy, anchor, oc, modality, depth, verbatim, max_seconds):
-            component.change(lambda: (None, ""), outputs=[state, captions])
-        gr.Timer(10).tick(lambda: workers_markdown(service), outputs=status_bar)
     return demo
 
 
@@ -857,6 +865,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-segments", type=int, default=12)
     p.add_argument("--gallery", default="/data/binghe/h3_proxy/serve-gallery",
                    help="shared archive of finished conversions; must outlive the pod")
+    p.add_argument("--gallery-only", action="store_true",
+                   help="serve the gallery without loading the encoders or the VLM (no GPU)")
     return p.parse_args()
 
 
@@ -864,7 +874,7 @@ def main() -> None:
     args = parse_args()
     gallery = Gallery(Path(args.spool), Path(args.jobs), Path(args.jobs).parent / "gallery", Path(args.gallery))
     threading.Thread(target=gallery.run_forever, daemon=True, name="gallery").start()
-    service = Service(args)
+    service = None if args.gallery_only else Service(args)
     demo = build_ui(service, gallery)
     demo.queue(default_concurrency_limit=16).launch(
         server_name=args.host, server_port=args.port,
