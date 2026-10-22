@@ -160,8 +160,12 @@ def main() -> None:
     p.add_argument("scores", nargs="+")
     p.add_argument("--out", required=True)
     p.add_argument("--json")
+    p.add_argument("--seeds", help="comma-separated seeds to keep, e.g. to compare best-of-5 across models")
     args = p.parse_args()
     rows = [json.loads(line) for path in args.scores for line in Path(path).read_text().splitlines() if line.strip()]
+    if args.seeds:
+        keep = {int(s) for s in args.seeds.split(",")}
+        rows = [row for row in rows if row["seed"] in keep]
     report = analyse(rows)
     Path(args.out).write_text(markdown(report), encoding="utf-8")
     if args.json:

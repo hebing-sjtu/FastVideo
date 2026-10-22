@@ -213,6 +213,7 @@ def main() -> None:
     p.add_argument("--watch", action="store_true", help="keep scoring until the spool has STOP and nothing is left")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--no-vlm", action="store_true", help="skip the VLM judge (no GPU to spare for it)")
+    p.add_argument("--ignore-oc", action="store_true", help="the model takes no OC sheet: skip the identity judge")
     p.add_argument("--shard", default="0/1", help="k/n: score only samples whose index %% n == k")
     args = p.parse_args()
     shard, shards = (int(x) for x in args.shard.split("/"))
@@ -244,7 +245,7 @@ def main() -> None:
         rows = todo()
         for job_id, take, sample, seed in rows:
             info = infos[sample]
-            oc_path = Path(args.dataset_root) / info["oc"] if info.get("oc") else None
+            oc_path = Path(args.dataset_root) / info["oc"] if info.get("oc") and not args.ignore_oc else None
             oc = Image.open(oc_path).convert("RGB") if oc_path and oc_path.is_file() else None
             started = time.time()
             row = scorer.score(take, slots[sample] / "target.mp4", info["prompt"], oc)
