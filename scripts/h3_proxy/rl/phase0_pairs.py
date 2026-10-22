@@ -24,7 +24,7 @@ def clip(proxy: Path, left: Path, right: Path, out: Path) -> None:
     scale = "scale=640:352:flags=bicubic,setsar=1"
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(proxy), "-i", str(left), "-i", str(right),
                     "-filter_complex", f"[0:v]{scale}[p];[1:v]{scale}[a];[2:v]{scale}[b];[p][a][b]hstack=3",
-                    "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", "-an", str(out)], check=True)
+                    "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(out)], check=True)
 
 
 def main() -> None:

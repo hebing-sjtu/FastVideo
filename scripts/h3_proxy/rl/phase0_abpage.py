@@ -19,7 +19,7 @@ import json
 import math
 import random
 import secrets
-import shutil
+import subprocess
 from pathlib import Path
 
 PAGE = "rl0-ab.html"
@@ -43,7 +43,7 @@ button.on {{ background: #2b6cb0; color: #fff; border-color: #2b6cb0; }}
 <button onclick="exportAnswers()">导出结果</button></div>
 {cards}
 <script>
-const KEY = "rl0-ab-answers";
+const KEY = "rl0-ab-answers-v2";
 const answers = JSON.parse(localStorage.getItem(KEY) || "{{}}");
 function render() {{
   document.querySelectorAll(".card").forEach(card => {{
@@ -62,9 +62,9 @@ render();
 </script></body></html>
 """
 
-CARD = """<div class="card" data-id="{id}"><div>第 {n} 组</div>
+CARD = """<div class="card" data-id="{id}"><div>第 {n} 组 <a href="{src}" target="_blank">单独打开视频</a></div>
 <div class="labels"><span>proxy</span><span>A</span><span>B</span></div>
-<video src="{src}" controls loop muted preload="none"></video>
+<video src="{src}" poster="{poster}" controls loop muted playsinline preload="metadata"></video>
 <div class="caption">{caption}</div>
 <button data-v="A" onclick="choose('{id}','A')">A 更好</button>
 <button data-v="B" onclick="choose('{id}','B')">B 更好</button>
@@ -82,6 +82,14 @@ def captions(data: Path) -> dict[str, str]:
     return out
 
 
+def publish(clip: Path, video: Path, poster: Path) -> None:
+    # Browsers stall on mp4s whose index sits after the frames, so the board copy is faststart.
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(clip), "-c:v", "libx264", "-profile:v", "main",
+                    "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(video)], check=True)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "2", "-i", str(clip), "-frames:v", "1",
+                    "-q:v", "3", str(poster)], check=True)
+
+
 def build(args: argparse.Namespace) -> None:
     clips, board = Path(args.clips), Path(args.board)
     keys = {}
@@ -95,9 +103,9 @@ def build(args: argparse.Namespace) -> None:
     blind, cards = {}, []
     for n, name in enumerate(names, 1):
         token = secrets.token_hex(6)
-        shutil.copyfile(clips / name, media / f"{token}.mp4")
+        publish(clips / name, media / f"{token}.mp4", media / f"{token}.jpg")
         blind[token] = name
-        cards.append(CARD.format(id=token, n=n, src=f"{MEDIA}/{token}.mp4",
+        cards.append(CARD.format(id=token, n=n, src=f"{MEDIA}/{token}.mp4", poster=f"{MEDIA}/{token}.jpg",
                                  caption=html.escape(text.get(keys[name]["sample"], ""))))
     (clips / "blind-map.json").write_text(json.dumps(blind, indent=2), encoding="utf-8")
     (board / PAGE).write_text(TEMPLATE.format(total=len(names), cards="\n".join(cards)), encoding="utf-8")
