@@ -17,7 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
-REWARDS = ("depth", "motion", "vlm_event", "vlm_identity", "vlm_quality")
+REWARDS = ("depth", "motion", "vlm_event", "vlm_identity", "vlm_quality", "pair_event", "pair_identity",
+           "pair_quality")
 METRICS = ("psnr_late", "ssim_late", "dino")
 COMPOSITE = "composite"
 
@@ -39,6 +40,17 @@ def bootstrap(values: np.ndarray, rounds: int = 4000, seed: int = 0) -> tuple[fl
     rng = np.random.default_rng(seed)
     means = rng.choice(values, size=(rounds, len(values)), replace=True).mean(1)
     return float(values.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
+
+
+def merge_pairwise(rows: list[dict]) -> list[dict]:
+    """Folds ``phase0_pairwise.py`` rows into the score rows of the same sample and seed."""
+    pairwise = {(r["sample"], r["seed"]): r for r in rows if r.get("kind") == "pairwise"}
+    merged = [dict(r) for r in rows if r.get("kind") != "pairwise"]
+    for row in merged:
+        extra = pairwise.get((row["sample"], row["seed"])) if row.get("source", "serve") == "serve" else None
+        if extra:
+            row.update({k: v for k, v in extra.items() if k.startswith("pair_")})
+    return merged
 
 
 def grouped(rows: list[dict]) -> dict[str, list[dict]]:
@@ -163,6 +175,7 @@ def main() -> None:
     p.add_argument("--seeds", help="comma-separated seeds to keep, e.g. to compare best-of-5 across models")
     args = p.parse_args()
     rows = [json.loads(line) for path in args.scores for line in Path(path).read_text().splitlines() if line.strip()]
+    rows = merge_pairwise(rows)
     if args.seeds:
         keep = {int(s) for s in args.seeds.split(",")}
         rows = [row for row in rows if row["seed"] in keep]
