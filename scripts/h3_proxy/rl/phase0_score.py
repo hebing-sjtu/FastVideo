@@ -192,6 +192,21 @@ def sample_info(data: Path) -> dict[str, dict[str, Any]]:
     return info
 
 
+def compare_target(payload: dict[str, Any], work: Path, job_id: str) -> Path:
+    """The target panel of a ``real_target`` job's compare video, cut out once."""
+    order = payload.get("panel_order") or []
+    if "target" not in order:
+        raise SystemExit(f"{job_id}: no eval slot and the job has no target panel (enqueue with --real-target)")
+    out = work / "targets" / f"{job_id}.mp4"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        index, panels = order.index("target"), len(order)
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", payload["compare"], "-vf",
+                        f"crop=iw/{panels}:ih:iw*{index}/{panels}:0", "-c:v", "libx264", "-crf", "12",
+                        "-pix_fmt", "yuv420p", str(out)], check=True)
+    return out
+
+
 def parse_job(job_id: str) -> tuple[int, str]:
     seed, _, sample = job_id.split("-", 2)
     return int(seed[1:]), sample
@@ -200,7 +215,8 @@ def parse_job(job_id: str) -> tuple[int, str]:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--spool", required=True)
-    p.add_argument("--eval-dir", required=True, help="the model's seed-42 eval task dir (holds target.mp4)")
+    p.add_argument("--eval-dir", default="", help="the model's seed-42 eval task dir (holds target.mp4); "
+                   "samples without a slot take the target panel of a --real-target job")
     p.add_argument("--data", default="/data/binghe/h3_proxy/manifests/gta_record_0930_omni_704p_ref640_heldout32_oc.txt")
     p.add_argument("--dataset-root", default="/data/binghe/datasets/gta_record_0930-v0003", help="root of info['oc']")
     p.add_argument("--out", required=True)
@@ -219,13 +235,14 @@ def main() -> None:
     shard, shards = (int(x) for x in args.shard.split("/"))
 
     spool, out = Path(args.spool), Path(args.out)
-    slots, infos = eval_slots(Path(args.eval_dir)), sample_info(Path(args.data))
+    slots = eval_slots(Path(args.eval_dir)) if args.eval_dir else {}
+    infos = sample_info(Path(args.data))
     mine = {sample for index, sample in enumerate(infos) if index % shards == shard}
     seen = {json.loads(line)["id"] for line in out.read_text().splitlines()} if out.is_file() else set()
     scorer = Scorer(args)
     print(f"[score] ready: {len(slots)} eval slots, {len(infos)} samples, {len(seen)} already scored", flush=True)
 
-    def todo() -> list[tuple[str, Path, str, int]]:
+    def todo() -> list[tuple[str, Path, str, int, Path]]:
         rows = []
         for done in sorted(spool.glob("done/*.json")):
             if done.stem in seen:
@@ -234,21 +251,25 @@ def main() -> None:
             if payload.get("error"):
                 continue
             seed, sample = parse_job(done.stem)
-            rows.append((done.stem, Path(payload["take"]), sample, seed))
+            if sample not in mine:
+                continue
+            target = slots[sample] / "target.mp4" if sample in slots else compare_target(payload, Path(args.work),
+                                                                                           done.stem)
+            rows.append((done.stem, Path(payload["take"]), sample, seed, target))
         if args.also_eval:
-            rows += [(f"eval-s0042-{s}", slot / "generated.mp4", s, 42) for s, slot in sorted(slots.items())
-                     if f"eval-s0042-{s}" not in seen]
-        return [row for row in rows if row[2] in mine]
+            rows += [(f"eval-s0042-{s}", slot / "generated.mp4", s, 42, slot / "target.mp4")
+                     for s, slot in sorted(slots.items()) if f"eval-s0042-{s}" not in seen and s in mine]
+        return rows
 
     scored = 0
     while True:
         rows = todo()
-        for job_id, take, sample, seed in rows:
+        for job_id, take, sample, seed, target in rows:
             info = infos[sample]
             oc_path = Path(args.dataset_root) / info["oc"] if info.get("oc") and not args.ignore_oc else None
             oc = Image.open(oc_path).convert("RGB") if oc_path and oc_path.is_file() else None
             started = time.time()
-            row = scorer.score(take, slots[sample] / "target.mp4", info["prompt"], oc)
+            row = scorer.score(take, target, info["prompt"], oc)
             row.update({"id": job_id, "sample": sample, "seed": seed, "modality": info.get("proxy_modality"),
                         "target_kind": info.get("target_kind"), "oc": oc is not None,
                         "source": "eval" if job_id.startswith("eval-") else "serve"})

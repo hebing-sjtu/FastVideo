@@ -39,14 +39,18 @@ def groups(samples: list[Path], long: bool) -> list[tuple[str, list[Path]]]:
     return [(name, sorted(clips, key=lambda p: p.stem)) for name, clips in sorted(takes.items())]
 
 
-def jobs(samples: list[Path], seeds: list[int], role: str, long: bool = False) -> list[tuple[str, dict]]:
+def jobs(samples: list[Path], seeds: list[int], role: str, long: bool = False,
+         real_target: bool = False) -> list[tuple[str, dict]]:
     out = []
     for seed in seeds:
         for i, (name, clips) in enumerate(groups(samples, long)):
             segments = [{"name": pt.stem, "pt": str(pt), "cwm_system": role if k == 0 else CONTINUATION[role]}
                         for k, pt in enumerate(clips)]
-            out.append((job_id(seed, i, name), {"schema": JOB_SCHEMA, "seed": seed, "fps": 24,
-                                                 "segments": segments, "phase0": {"sample": name, "index": i}}))
+            job = {"schema": JOB_SCHEMA, "seed": seed, "fps": 24, "segments": segments,
+                   "phase0": {"sample": name, "index": i}}
+            if real_target:
+                job["real_target"] = True
+            out.append((job_id(seed, i, name), job))
     return out
 
 
@@ -57,13 +61,16 @@ def main() -> None:
     p.add_argument("--seeds", default="42,1,2,3,4")
     p.add_argument("--cwm-system", default="w0_omni")
     p.add_argument("--long", action="store_true", help="one chained job per <take>-sNN group")
+    p.add_argument("--real-target", action="store_true",
+                   help="workers add the decoded cached target as a third compare panel (samples without an eval)")
     args = p.parse_args()
     samples = [Path(line.split()[0]) for line in Path(args.data).read_text().splitlines() if line.strip()]
     spool = Path(args.spool)
     (spool / "queue").mkdir(parents=True, exist_ok=True)
     known = {path.stem for folder in ("queue", "running", "done") for path in (spool / folder).glob("*.json")}
     queued = 0
-    for name, job in jobs(samples, [int(s) for s in args.seeds.split(",")], args.cwm_system, args.long):
+    for name, job in jobs(samples, [int(s) for s in args.seeds.split(",")], args.cwm_system, args.long,
+                          args.real_target):
         if name in known:
             continue
         scratch = spool / f".{name}.json"
