@@ -59,6 +59,9 @@ def main() -> None:
                 by_sample[row["sample"]].append(row)
 
     out, spool = Path(args.out), Path(args.spool)
+    for sample, rows in by_sample.items():
+        rows[:] = [row for row in rows
+                   if (spool / "out" / row["id"] / "segments" / "seg-00" / "generated.safetensors").is_file()]
     out.mkdir(parents=True, exist_ok=True)
     manifest, records = [], []
     for sample, rows in sorted(by_sample.items()):
