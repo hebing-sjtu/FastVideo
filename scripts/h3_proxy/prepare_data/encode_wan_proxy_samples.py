@@ -126,7 +126,7 @@ def to_vae_pixels(frames_thwc: np.ndarray) -> torch.Tensor:
 
 
 def image_pixels(image: Image.Image) -> torch.Tensor:
-    return to_vae_pixels(np.asarray(image.convert("RGB"))[None])
+    return to_vae_pixels(np.array(image.convert("RGB"))[None])
 
 
 class WanCodec:
