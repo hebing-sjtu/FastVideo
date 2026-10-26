@@ -105,6 +105,8 @@ def parse_args() -> argparse.Namespace:
     args.num_frames = timeline_frames(args.family)
     args.fit = "center-crop"
     args.code_resize = "nearest"
+    args.proxy_variants = tuple(args.proxy_variants)
+    args.proxy_references = ()
     return args
 
 
