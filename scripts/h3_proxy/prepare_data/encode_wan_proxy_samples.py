@@ -25,10 +25,13 @@ Run in the FastVideo venv (media helpers) with SolarWM's source on the path (Wan
       --include /data/binghe/h3_proxy/manifests/gta_record_0930_omni_704p_ref640_clean_oc.txt \\
       --root /data/binghe/datasets/gta_record_0930-v0003 \\
       --output /workspace/wan_proxy/cache/gta0930_omni_5b_121f_oc \\
+      --list-prefix /data/binghe/wan_proxy/cache/gta0930_omni_5b_121f_oc \\
       --shard-index 0 --num-shards 8
 
 Write to pod-local disk and copy the finished directory to ``/data`` afterwards; the GCS mount
-does not support the atomic rename each sample is written with.
+does not support the atomic rename each sample is written with. Each shard writes
+``samples-shardNNN-of-MMM.txt`` naming its samples under ``--list-prefix``; concatenate them
+into the training list.
 """
 
 from __future__ import annotations
@@ -74,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include", default="", help="Optional list of .pt paths or names to keep (e.g. the H3 clean list).")
     parser.add_argument("--root", required=True, help="Dataset root the manifest paths are relative to.")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--list-prefix", default="",
+                        help="Directory the shard's sample list names instead of --output (the /data copy).")
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
@@ -309,7 +314,8 @@ def main() -> None:
               f"proxy {tuple(sample['proxy_latent'].shape)} anchor {tuple(sample['anchor_latent'].shape)} "
               f"oc {tuple(sample['oc_latent'].shape) if 'oc_latent' in sample else None} "
               f"text {sample['info']['prompt_tokens']} tok, {time.monotonic() - started:.1f}s", flush=True)
-    listing.write_text("".join(f"{path}\n" for path in paths), encoding="utf-8")
+    listed = Path(args.list_prefix) if args.list_prefix else output
+    listing.write_text("".join(f"{listed / path.name}\n" for path in paths), encoding="utf-8")
     print(f"Done: {written} written, {skipped} skipped, {failed} failed -> {output} (list {listing})")
 
 
