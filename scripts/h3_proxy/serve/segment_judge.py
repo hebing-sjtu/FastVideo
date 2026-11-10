@@ -63,10 +63,11 @@ COUNT_GUIDES = {
                   "a round base. The player character, other people, crates, barrels, posts and pillars are not dummies."),
 }
 
-# VLM counts of small far dummies are off by one now and then, so only a sustained surplus (an
-# extra dummy in two thirds of the moments) or a large repeated shortfall fails a segment. On the
-# 2026-11-10 long takes this flagged 11 of 58 segments, the extra dummies seen by eye among them.
-EXTRA_SHARE = 2 / 3
+# VLM counts of small far dummies are off by one now and then, and a grey dummy next to the
+# grey player reads as none, so a moment whose proxy count is 0 is skipped and a surplus must
+# hold in every other moment (at least EXTRA_MOMENTS of them). On the 2026-11-10 long takes this
+# flagged 3 of 58 segments, each with an extra dummy in every moment.
+EXTRA_MOMENTS = 3
 MISSING_BY, MISSING_MOMENTS = 2, 2
 
 
@@ -116,18 +117,20 @@ def parse(raw: str, proxy_counts: list[int] | None = None,
           generated_counts: list[int] | None = None) -> dict[str, Any]:
     """The VLM's rows and segment flags, with ``dummies`` and ``structures`` decided here.
 
-    dummies: the generated frames hold more dummies than the proxy in ``EXTRA_SHARE`` of the
-    moments, or ``MISSING_BY`` fewer in ``MISSING_MOMENTS``; structures: any moment names an
-    opening the proxy does not have.
+    dummies: every moment with dummies in the proxy shows more in the generated frame (at least
+    ``EXTRA_MOMENTS`` such moments), or ``MISSING_BY`` fewer in ``MISSING_MOMENTS``; structures:
+    any moment names an opening the proxy does not have.
     """
 
     answer = _json(raw)
     rows = [row for row in answer.get("rows") or [] if isinstance(row, dict)]
-    misses = ([g - p for p, g in zip(proxy_counts, generated_counts)]
-              if proxy_counts is not None and generated_counts is not None else [])
+    pairs = (list(zip(proxy_counts, generated_counts))
+             if proxy_counts is not None and generated_counts is not None else [])
+    misses = [g - p for p, g in pairs]
     openings = [f"image {row.get('image')}: {row['openings']}" for row in rows
                 if str(row.get("openings") or "").strip().lower() not in ("", "none", "no")]
-    surplus = sum(m >= 1 for m in misses) >= max(1, round(EXTRA_SHARE * len(misses))) if misses else False
+    seen = [g - p for p, g in pairs if p > 0]
+    surplus = len(seen) >= EXTRA_MOMENTS and all(m >= 1 for m in seen)
     shortfall = sum(m <= -MISSING_BY for m in misses) >= MISSING_MOMENTS
     verdict: dict[str, Any] = {
         "dummies": surplus or shortfall,
@@ -247,7 +250,14 @@ def serve(args: argparse.Namespace) -> int:
                 print(f"[judge] error: {type(exc).__name__}: {exc}", flush=True)
                 self._reply(500, {"error": f"{type(exc).__name__}: {exc}"})
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    # A replacement loads while the old judge still serves, then takes the port the moment it frees.
+    print(f"[judge] loaded; binding {args.host}:{args.port}", flush=True)
+    while True:
+        try:
+            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            break
+        except OSError:
+            time.sleep(0.2)
     print(f"[judge] serving on {args.host}:{args.port}", flush=True)
     server.serve_forever()
     return 0
