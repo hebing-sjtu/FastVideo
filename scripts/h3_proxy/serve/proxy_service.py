@@ -104,12 +104,20 @@ Rules: one paragraph of 60 to 110 words in English. Start with the medium as Ima
 # ----------------------------------------------------------------------
 
 
+MAX_PROXY_SECONDS = 61.0  # the UI's longest take; H3's 15 s cap is per reference video, not per take
+
+
 def read_proxy_video(path: Path) -> np.ndarray:
     """``[T, H, W, 3]`` uint8 frames resampled to 24 fps by whole-frame selection."""
-    from fastvideo.pipelines.basic.minimax_h3.reference import decode_reference_video, resample_reference_frames
+    from fastvideo.pipelines.basic.minimax_h3 import reference
 
-    frames, source_fps, _ = decode_reference_video(path)
-    frames = resample_reference_frames(frames, source_fps)
+    limit = reference.MINIMAX_H3_MAX_DURATION
+    reference.MINIMAX_H3_MAX_DURATION = MAX_PROXY_SECONDS
+    try:
+        frames, source_fps, _ = reference.decode_reference_video(path)
+    finally:
+        reference.MINIMAX_H3_MAX_DURATION = limit
+    frames = reference.resample_reference_frames(frames, source_fps)
     if frames.shape[0] < 1:
         raise ValueError("the proxy video has no frames")
     return frames
