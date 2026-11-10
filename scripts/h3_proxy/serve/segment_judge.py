@@ -215,6 +215,13 @@ def open_image(path: str | None) -> Image.Image | None:
     return Image.open(path).convert("RGB") if path else None
 
 
+def decode_image(data: str | None) -> Image.Image | None:
+    import base64
+    import io
+
+    return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB") if data else None
+
+
 # ----------------------------------------------------------------------
 # serve
 # ----------------------------------------------------------------------
@@ -241,8 +248,13 @@ def serve(args: argparse.Namespace) -> int:
         def do_POST(self) -> None:
             try:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                pairs = [(Image.open(p).convert("RGB"), Image.open(g).convert("RGB")) for p, g in request["pairs"]]
-                verdict = judge.judge(open_image(request["anchor"]), open_image(request.get("oc")), pairs)
+                if "pairs_b64" in request:
+                    pairs = [(decode_image(p), decode_image(g)) for p, g in request["pairs_b64"]]
+                    anchor, oc = decode_image(request["anchor_b64"]), decode_image(request.get("oc_b64"))
+                else:
+                    pairs = [(open_image(p), open_image(g)) for p, g in request["pairs"]]
+                    anchor, oc = open_image(request["anchor"]), open_image(request.get("oc"))
+                verdict = judge.judge(anchor, oc, pairs)
                 print(f"[judge] {request.get('tag', '')} score={verdict['score']} "
                       f"failures={verdict['failures']} {verdict['problems'][:160]} ({verdict['seconds']}s)", flush=True)
                 self._reply(200, verdict)
