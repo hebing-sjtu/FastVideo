@@ -289,6 +289,18 @@ class Judge:
         verdict["seconds"] = round(time.time() - started, 1)
         return verdict
 
+    def count(self, images: list[Image.Image], side: str = "generated") -> list[int] | None:
+        """Training dummies (standing + fallen) per image, one image per call so none are mixed up."""
+        what, guide = COUNT_GUIDES[side]
+        out = []
+        for image in images:
+            got = parse_counts(self.ask(["Image 1:", thumbnail(image, 1344),
+                                         COUNT_PROMPT.format(count=1, what=what, guide=guide)], max_new_tokens=100), 1)
+            if got is None:
+                return None
+            out += got
+        return out
+
     def first_frame(self, proxy: Image.Image, painting: Image.Image, overlay: Image.Image,
                     oc: Image.Image | None, theme: str) -> dict[str, Any]:
         started = time.time()
@@ -366,6 +378,9 @@ class Remote:
             "clip_b64": [encode_image(c) for c in clip or []], "clip_fps": 1.0,
             "clip_frames": list(clip_times or [])})
 
+    def count(self, images, side="generated") -> list[int] | None:
+        return self._post("/count", {"images_b64": [encode_image(i) for i in images], "side": side})["counts"]
+
     def first_frame(self, proxy, painting, overlay, oc, theme) -> dict[str, Any]:
         return self._post("/first_frame", {"proxy_b64": encode_image(proxy), "painting_b64": encode_image(painting),
                                            "overlay_b64": encode_image(overlay), "oc_b64": encode_image(oc),
@@ -406,6 +421,10 @@ def serve(args: argparse.Namespace) -> int:
         def do_POST(self) -> None:
             try:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.rstrip("/").endswith("count"):
+                    images = [decode_image(i) for i in request["images_b64"]]
+                    self._reply(200, {"counts": judge.count(images, request.get("side", "generated"))})
+                    return
                 if self.path.rstrip("/").endswith("first_frame"):
                     verdict = judge.first_frame(decode_image(request["proxy_b64"]), decode_image(request["painting_b64"]),
                                                 decode_image(request["overlay_b64"]), decode_image(request.get("oc_b64")),
