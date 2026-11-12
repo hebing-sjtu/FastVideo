@@ -176,7 +176,7 @@ def follow(spool: Path, job_id: str, entry: dict[str, Any], state: State, status
 def run_out(args: argparse.Namespace) -> None:
     serve = Path(args.serve)
     spool, jobs = serve / "spool", serve / "jobs"
-    state = State(serve / "relay_out.json")
+    state = State(serve / "relay_service_out.json")
     log(f"out: front end {serve} -> {args.node} via {RELAY}")
     while True:
         try:
@@ -240,7 +240,7 @@ def run_in(args: argparse.Namespace) -> None:
     spool, jobs = serve / "spool", serve / "jobs"
     for name in ("queue", "running", "out", "done"):
         (spool / name).mkdir(parents=True, exist_ok=True)
-    state = State(serve / "relay_in.json")
+    state = State(serve / "relay_service_in.json")
     log(f"in: {RELAY} -> worker pod {serve} as {args.node}")
     while True:
         try:
