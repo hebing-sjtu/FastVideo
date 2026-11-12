@@ -455,7 +455,10 @@ class Service:
 
     def submit(self, job: Path, proxy_path: str, anchor_path: str, oc_path: str | None, oc_subject: str,
                analysis: dict[str, Any], captions: list[str], steps: int, seed: int, *, submitter: str = "",
-               text: str = "") -> str:
+               text: str = "", enqueue: bool = True, private: bool = False) -> str:
+        """Encode the request into ``job``; queue it for the workers unless ``enqueue`` is off.
+
+        A ``private`` job (a batch that queues its own, gated copy) stays out of the gallery."""
         modality = analysis["modality"]
         frames = read_proxy_video(Path(proxy_path))
         reference = to_reference(frames, modality, bool(analysis["near_is_bright"]))
@@ -495,8 +498,11 @@ class Service:
                    "steps": int(steps), "seed": int(seed)}
         (job / "job.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         request = {"submitter": submitter.strip(), "text": text, "oc_subject": oc_subject if oc_path else None,
-                   "steps": int(steps), "seed": int(seed), "captions": captions, "submitted": time.time()}
+                   "steps": int(steps), "seed": int(seed), "captions": captions, "submitted": time.time(),
+                   "private": private}
         (job / "request.json").write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not enqueue:
+            return job_id
         scratch = self.spool / "queue" / f".{job_id}.tmp"
         scratch.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(scratch, self.spool / "queue" / f"{job_id}.json")
@@ -564,11 +570,13 @@ class Gallery:
         job = self.jobs / job_id
         local = self.local / job_id
         local.mkdir(parents=True, exist_ok=True)
-        if done.get("error") or not (job / "analysis.json").is_file() or not Path(str(done.get("take"))).is_file():
-            (local / "SKIPPED").write_text(str(done.get("error") or "no job inputs"), encoding="utf-8")
+        request = json.loads((job / "request.json").read_text(encoding="utf-8")) if (job / "request.json").is_file() else {}
+        if done.get("error") or not (job / "analysis.json").is_file() or not Path(str(done.get("take"))).is_file() \
+                or request.get("private"):
+            reason = "private batch job" if request.get("private") else done.get("error") or "no job inputs"
+            (local / "SKIPPED").write_text(str(reason), encoding="utf-8")
             return False
         analysis = json.loads((job / "analysis.json").read_text(encoding="utf-8"))
-        request = json.loads((job / "request.json").read_text(encoding="utf-8")) if (job / "request.json").is_file() else {}
         files = {"take.mp4": Path(done["take"]), "compare.mp4": Path(done["compare"]),
                  "proxy_reference.mp4": job / "proxy_reference.mp4"}
         for stem in self.INPUT_STEMS:
@@ -862,6 +870,16 @@ def build_ui(service: Service | None, gallery: Gallery) -> Any:
         except Exception as exc:  # surfaced in the UI
             yield f"出错：{type(exc).__name__}: {exc}", None, None, None, captions, gr.update(), state
 
+    def encode(proxy, anchor, oc, oc_subject, modality, depth, max_seconds, captions, steps, seed, submitter):
+        """API only: encode a request without queueing it; the caller queues its own (gated) job."""
+        _, _, _, state = run_analysis(proxy, anchor, oc, "", modality, depth, False, max_seconds, "")
+        job = Path(state["job"])
+        texts = split_captions(captions)
+        job_id = service.submit(job, state["proxy"], state["anchor"], state["oc"], oc_subject, state["analysis"],
+                                texts, int(steps), int(seed), submitter=submitter or "", enqueue=False, private=True)
+        return {"job": job_id, "dir": str(job), "segments": state["analysis"]["segments"],
+                "modality": state["analysis"]["modality"], "frames": state["analysis"]["output_frames"]}
+
     def load_gallery():
         entries = gallery.entries()
         thumbs = [(gallery.card(e), gallery_label(e)) for e in entries]
@@ -925,6 +943,9 @@ def build_ui(service: Service | None, gallery: Gallery) -> Any:
             generate_btn.click(generate, inputs=[proxy, anchor, oc, oc_subject, text, modality, depth, draft,
                                                  max_seconds, captions, steps, seed, submitter, state],
                                outputs=[status, result, compare, details, captions, preview, state])
+            encode_btn = gr.Button(visible=False)
+            encode_btn.click(encode, inputs=[proxy, anchor, oc, oc_subject, modality, depth, max_seconds, captions,
+                                             steps, seed, submitter], outputs=details, api_name="encode")
             # New inputs need a new analysis; the user's caption text stays.
             for component in (proxy, anchor, oc, modality, depth, max_seconds):
                 component.change(lambda: None, outputs=state)
