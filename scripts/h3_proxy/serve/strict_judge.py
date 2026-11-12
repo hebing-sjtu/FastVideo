@@ -47,13 +47,13 @@ PANEL_WIDTH = 640
 # Moments (out of ``samples``) a per-moment flag must hold in before it fails the segment: one
 # moment is enough for a door in a plain wall, two for the rest, which a VLM now and then reads into
 # a single frame.
-MOMENTS = {"structures": 1, "objects": 2, "dummy_shape": 2, "facing": 2, "artifacts": 2, "framing": 3}
+MOMENTS = {"structures": 1, "objects": 2, "missing": 2, "dummy_shape": 2, "facing": 2, "artifacts": 2, "framing": 3}
 EXTRA_MOMENTS = 3  # a dummy surplus must hold in every moment with dummies, and in at least this many
 MISSING_BY, MISSING_MOMENTS = 2, 3
 # Calibrated on graded steady takes: "popping" and "teleport" fired on most clean segments (dummies
 # leaving the frame as the camera pans), so only morphing and flicker fail a segment.
 MOTION_FAILS = ("flicker", "morphing")
-KINDS = ("dummies", "structures", "objects", "dummy_shape", "facing", "framing", "artifacts",
+KINDS = ("dummies", "structures", "objects", "missing", "dummy_shape", "facing", "framing", "artifacts",
          "scene", "character", "motion", "score")
 
 LAYOUT_PROMPT = """You are a strict quality inspector for a generated video game clip. Reject anything a viewer would notice.
@@ -61,9 +61,10 @@ The "opening frame" fixes the arena: its style, walls, floor, props, training du
 Each "moment" image is one instant of a later segment, in time order. Its LEFT half is the layout proxy, a plain grey render of the game: it is the ground truth for where the walls, pillars, crates, training dummies and the character are, which way the character faces, and how far the camera is. Its RIGHT half is the generated frame at the same instant.
 For every moment fill one row, comparing RIGHT with LEFT:
 - proxy_facing / facing: which way the main character faces the camera in LEFT and in RIGHT: "back" (we see the back), "side", "front" (we see the face and chest) or "absent".
-- dummy_shape: "" if every training dummy in RIGHT is a plain practice dummy on a stand; otherwise name the change, e.g. "near-left dummy became a person", "dummy is a cross-shaped rack", "dummy melted".
+- dummy_shape: "" if every training dummy in RIGHT is a plain practice dummy on a stand; otherwise name the change, e.g. "near-left dummy became a person", "dummy is a cross-shaped rack", "dummy melted". A dummy knocked over and lying on the ground is fine wherever LEFT shows a dummy lying there too.
 - structures: a door, doorway, gate, arch, window, staircase or building front in RIGHT where LEFT shows plain wall or open floor; "" if none. Decorative patterns of the arena style and towers, roofs, trees or sky far behind and above the walls do not count.
-- objects: a large object inside the arena in RIGHT with no counterpart in LEFT: an extra pillar, wall, statue, person, creature or vehicle; "" if none. Small props near the walls do not count.
+- objects: a large object inside the arena in RIGHT with no counterpart in LEFT: an extra pillar, wall, statue, person, creature or vehicle; "" if none. Small props near the walls and knocked-over dummies that LEFT also shows do not count.
+- missing: a training dummy, pillar or crate that LEFT shows clearly (not tiny in the distance) and RIGHT lacks at that place, e.g. "near-left dummy missing"; "" if none.
 - framing: "match" if the camera distance and height in RIGHT look like LEFT; "closer" or "farther" if the character is clearly (about 1.5x or more) larger or smaller than in LEFT.
 - artifacts: melting, smeared or garbled regions, a duplicated or missing limb, an extra head, a body merged with an object, or a frame that is mostly blur; "" if none. Glowing spell effects, beams, fire, lightning, sparks, rings, smoke and motion blur of a fast dash are expected and are never artifacts.
 Then judge the segment as a whole:
@@ -71,7 +72,7 @@ Then judge the segment as a whole:
 - character: true if the main character's outfit, hair or body differs from the opening frame{oc_ref}, or there are two copies of it.
 - score: an integer 0-10, strict: 9-10 only if the RIGHT halves are clean and follow LEFT closely; 6 or lower if anything above is wrong.
 Answer with JSON only, no other text:
-{{"rows": [{{"moment": 1, "proxy_facing": "back", "facing": "back", "dummy_shape": "", "structures": "", "objects": "", "framing": "match", "artifacts": ""}}, ...one row per moment...], "scene": false, "character": false, "score": 0, "problems": "<one short sentence naming the moments, or empty>"}}"""
+{{"rows": [{{"moment": 1, "proxy_facing": "back", "facing": "back", "dummy_shape": "", "structures": "", "objects": "", "missing": "", "framing": "match", "artifacts": ""}}, ...one row per moment...], "scene": false, "character": false, "score": 0, "problems": "<one short sentence naming the moments, or empty>"}}"""
 
 MOTION_PROMPT = """These contact sheets show consecutive frames of one generated video game clip, left to right and top to bottom, with the time printed on each frame. Watch for temporal failures a viewer would notice:
 - flicker: the image, lighting or colours jump between neighbouring frames;
@@ -200,7 +201,7 @@ def decide(layout: dict[str, Any], count: int, proxy_counts: list[int] | None, g
     rows = [row for row in layout.get("rows") or [] if isinstance(row, dict)]
     found: dict[str, list[str]] = {kind: [] for kind in MOMENTS}
     for index, row in enumerate(rows, start=1):
-        for kind in ("dummy_shape", "structures", "objects", "artifacts"):
+        for kind in ("dummy_shape", "structures", "objects", "missing", "artifacts"):
             if _flag(row.get(kind)):
                 found[kind].append(f"moment {index}: {_flag(row.get(kind))}")
         facing, proxy_facing = str(row.get("facing") or "").lower(), str(row.get("proxy_facing") or "").lower()
