@@ -316,6 +316,29 @@ class Judge:
             print(f"[judge] detect {what[:40]!r}: no boxes in {raw[:300]!r}", flush=True)
         return boxes
 
+    def detect_all(self, image: Image.Image, kinds: dict[str, str]) -> dict[str, list[list[float]]]:
+        """One grounding pass that gives every object a single kind: ``{kind: [box, ...]}``."""
+        listing = "; ".join(f'"{name}": {what}' for name, what in kinds.items())
+        raw = self.ask(["Image:", thumbnail(image, 1344),
+                        f"Locate every object of these kinds in the image, including small far ones and ones cut by "
+                        f"the border, and give each object exactly one label: {listing}. Do not label walls, the "
+                        "ground or the person. Answer with JSON only: "
+                        '[{"bbox_2d": [x1, y1, x2, y2], "label": "<kind>"}, ...], coordinates in 0-1000.'],
+                       max_new_tokens=1200)
+        out: dict[str, list[list[float]]] = {name: [] for name in kinds}
+        for chunk in re.findall(r"\{[^{}]*\}", raw):
+            try:
+                row = json.loads(chunk)
+            except ValueError:
+                continue
+            box, label = row.get("bbox_2d"), str(row.get("label", "")).strip().lower()
+            if (label in out and isinstance(box, list) and len(box) == 4
+                    and all(isinstance(v, (int, float)) for v in box)):
+                out[label].append([v / 1000.0 for v in box])
+        if not any(out.values()):
+            print(f"[judge] detect_all: no boxes in {raw[:300]!r}", flush=True)
+        return out
+
     def first_frame(self, proxy: Image.Image, painting: Image.Image, overlay: Image.Image,
                     oc: Image.Image | None, theme: str) -> dict[str, Any]:
         started = time.time()
@@ -393,6 +416,9 @@ class Remote:
             "clip_b64": [encode_image(c) for c in clip or []], "clip_fps": 1.0,
             "clip_frames": list(clip_times or [])})
 
+    def detect_all(self, image, kinds) -> dict[str, list[list[float]]]:
+        return self._post("/detect_all", {"image_b64": encode_image(image), "kinds": kinds})["boxes"]
+
     def detect(self, image, what) -> list[list[float]]:
         return self._post("/detect", {"image_b64": encode_image(image), "what": what})["boxes"]
 
@@ -439,6 +465,9 @@ def serve(args: argparse.Namespace) -> int:
         def do_POST(self) -> None:
             try:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.rstrip("/").endswith("detect_all"):
+                    self._reply(200, {"boxes": judge.detect_all(decode_image(request["image_b64"]), request["kinds"])})
+                    return
                 if self.path.rstrip("/").endswith("detect"):
                     self._reply(200, {"boxes": judge.detect(decode_image(request["image_b64"]), request["what"])})
                     return
