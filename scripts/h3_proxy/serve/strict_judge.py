@@ -309,16 +309,11 @@ class Judge:
                         f"Locate every {what} in the image, including small far ones and ones cut by the border. "
                         'Answer with JSON only: [{"bbox_2d": [x1, y1, x2, y2]}, ...], coordinates in 0-1000.'],
                        max_new_tokens=600)
-        match = re.search(r"\[.*\]", raw, flags=re.S)
-        try:
-            rows = json.loads(match.group(0)) if match else []
-        except ValueError:
-            rows = []
-        boxes = []
-        for row in rows if isinstance(rows, list) else []:
-            box = row.get("bbox_2d") if isinstance(row, dict) else row
-            if isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box):
-                boxes.append([v / 1000.0 for v in box])
+        number = r"\s*(-?\d+(?:\.\d+)?)\s*"
+        boxes = [[float(v) / 1000.0 for v in quad]
+                 for quad in re.findall(r"\[" + ",".join([number] * 4) + r"\]", raw)]
+        if not boxes:
+            print(f"[judge] detect {what[:40]!r}: no boxes in {raw[:300]!r}", flush=True)
         return boxes
 
     def first_frame(self, proxy: Image.Image, painting: Image.Image, overlay: Image.Image,
