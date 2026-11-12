@@ -3,8 +3,9 @@
 
 A request is an arbitrary proxy video (a DUV, depth or semantic visualisation, or a restyled
 RGB render), a first frame (``<Picture 1>``), optionally an OC identity sheet (``<Picture 2>``)
-and free text. Qwen3-VL -- the H3 text encoder's own weights, run with their language-model head
--- names the proxy modality and writes a caption in the training captions' style. The request is
+and one caption per segment, written by the user from a recommended structure (the training
+captions' style). Qwen3-VL -- the H3 text encoder's own weights, run with their language-model
+head -- names the proxy modality and, on request, drafts the captions. The request is
 then encoded into 124-frame cache samples exactly as ``encode_proxy_samples.py`` encodes an omni
 training row, and spooled to SolarWM's resident ``proxy_loop serve`` workers; a proxy longer than
 one segment becomes a take of segments overlapping by 39 frames. Every finished conversion is
@@ -97,6 +98,50 @@ The last {count} images are frames sampled in order from a {modality} conditioni
 Write the caption of the generated video in exactly the style of these examples:
 {examples}
 Rules: one paragraph of 60 to 110 words in English. Start with the medium as Image 1 shows it (for example "A 3D video game captures ..." or "A live-action film captures ..."), then the setting and the lighting, then the main subject's appearance, then what happens, in order, following the motion in the conditioning frames. Describe the result as an ordinary video: never mention depth maps, segmentation, conditioning, frames or images. Output only the caption."""
+
+# The structure of the training captions, offered to users who write their own; the 【】 slots
+# must be filled in before a job is accepted.
+PLACEHOLDER = re.compile(r"【[^】]*】")
+TEMPLATE_SUBJECT = {
+    True: "The protagonist from the identity sheet, 【主角外观：发型、服装、手持物】,",
+    False: "【主角：一句话写清外观，如 a man in a light grey jacket and jeans】",
+}
+TEMPLATE = ("A 3D video game captures 【场景：地点、建筑、地面、道具，与首图一致】. 【光照：时间、天气、光源】. "
+            "{subject} 【这一段里按时间顺序发生的事：走向哪里、放什么技能、命中什么、之后怎样】. "
+            "【镜头：和 proxy 的运镜一致，如 The camera follows from behind the protagonist.】")
+STRUCTURE_GUIDE = f"""**Caption 由你直接填写**，下面是训练 caption 的结构（英文效果最好，中文也能用）。每段一段话，约 60–200 词：
+
+1. **媒介开头**：`A 3D video game captures …`（真人素材写 `A live-action film captures …`）
+2. **场景**：地点、建筑、地面、道具，与首图一致
+3. **光照**：时间、天气、光源
+4. **主体外观**：上传了 OC 设定图时写 `The protagonist from the identity sheet, a …`
+5. **动作**：按时间顺序写这一段里发生的事，一句一个动作；技能写清起手、出手、命中、消散
+6. **镜头**：一句，和 proxy 的实际运镜一致；proxy 里没有推拉时不要写 `pushes in`
+
+分段：第 1 段覆盖 0–{SEGMENT_FRAMES / FPS:.2f} s，之后每段向后推 {STRIDE_FRAMES / FPS:.2f} s，开头 {(SEGMENT_FRAMES - STRIDE_FRAMES) / FPS:.2f} s 与上一段重叠。
+段与段之间空一行；`#` 开头的行是段落标注，提交时忽略；只写一段时所有段共用它。
+不要提 proxy、深度图、分割、帧或图片。`{SEGMENT_SPAN}` 时间标记、proxy 种类和 OC 设定图说明由服务自动加上，不用写。"""
+
+
+def segment_header(index: int, count: int) -> str:
+    start = index * STRIDE_FRAMES / FPS
+    overlap = f"，前 {(SEGMENT_FRAMES - STRIDE_FRAMES) / FPS:.2f} s 与上一段重叠" if index else ""
+    return f"# 第 {index + 1}/{count} 段 · {start:.2f}–{start + SEGMENT_FRAMES / FPS:.2f} s{overlap}"
+
+
+def caption_template(count: int, oc: bool) -> str:
+    body = TEMPLATE.format(subject=TEMPLATE_SUBJECT[oc])
+    return "\n\n".join(f"{segment_header(i, count)}\n{body}" for i in range(count))
+
+
+def untouched(text: str) -> bool:
+    """Empty, or still the bare template: safe to replace when the segment count changes."""
+    bodies = {" ".join(TEMPLATE.format(subject=subject).split()) for subject in TEMPLATE_SUBJECT.values()}
+    return all(caption in bodies for caption in split_captions(text or ""))
+
+
+def with_headers(captions: list[str]) -> str:
+    return "\n\n".join(f"{segment_header(i, len(captions))}\n{c}" for i, c in enumerate(captions))
 
 
 # ----------------------------------------------------------------------
@@ -271,7 +316,7 @@ class Vlm:
                                      guide=MODALITY_GUIDE[modality], seconds=len(window) / FPS, user=user,
                                      examples="\n".join(f"- {example}" for example in CAPTION_EXAMPLES))
         caption = " ".join(self.ask(images, text).split())
-        return f"{SEGMENT_SPAN} {caption.strip(chr(34))}"
+        return caption.strip(chr(34))
 
 
 class CacheEncoder:
@@ -359,7 +404,8 @@ class Service:
     # analysis ---------------------------------------------------------
 
     def analyze(self, job: Path, proxy_path: str, anchor_path: str | None, oc_path: str | None, text: str,
-                modality_choice: str, depth_choice: str, verbatim: bool, max_seconds: float) -> dict[str, Any]:
+                modality_choice: str, depth_choice: str, draft: bool, max_seconds: float) -> dict[str, Any]:
+        """Name the modality and plan the segments; with ``draft`` the VLM also drafts captions."""
         if not proxy_path:
             raise ValueError("请上传 proxy 视频")
         if not anchor_path:
@@ -382,14 +428,12 @@ class Service:
             else:
                 near_is_bright = depth_choice == "near_bright"
             reference = to_reference(frames, modality, near_is_bright)
-            windows = segment_windows(reference, count)
-            anchor = Image.open(anchor_path).convert("RGB")
-            oc = Image.open(oc_path).convert("RGB") if oc_path else None
-            if verbatim and text.strip():
-                body = text.strip()
-                captions = [body if body.startswith("[") else f"{SEGMENT_SPAN} {body}"] * count
-            else:
-                captions = [self.vlm.caption(anchor, oc, window, modality, text) for window in windows]
+            captions = []
+            if draft:
+                anchor = Image.open(anchor_path).convert("RGB")
+                oc = Image.open(oc_path).convert("RGB") if oc_path else None
+                captions = [self.vlm.caption(anchor, oc, window, modality, text)
+                            for window in segment_windows(reference, count)]
         write_mp4(job / "proxy_reference.mp4", reference[:out_frames])
         analysis = {
             "modality": modality,
@@ -416,10 +460,16 @@ class Service:
         frames = read_proxy_video(Path(proxy_path))
         reference = to_reference(frames, modality, bool(analysis["near_is_bright"]))
         windows = segment_windows(reference, int(analysis["segments"]))
+        if not captions:
+            raise ValueError("请先填写 caption")
+        for index, caption in enumerate(captions):
+            if PLACEHOLDER.search(caption):
+                raise ValueError(f"第 {index + 1} 段还有没填写的【…】：{PLACEHOLDER.search(caption).group(0)}")
         if len(captions) == 1 and len(windows) > 1:
             captions = captions * len(windows)
         if len(captions) != len(windows):
             raise ValueError(f"{len(windows)} 段需要 {len(windows)} 条 caption（空行分隔），收到 {len(captions)} 条")
+        captions = [spanned(caption) for caption in captions]
         job_id = job.name
         with self.lock:
             anchor = read_anchor_image(Path(anchor_path), np.zeros((1, HEIGHT, WIDTH, 3), np.uint8), ANCHOR_SHORT_EDGE,
@@ -685,7 +735,13 @@ def gallery_file(meta: dict[str, Any], prefix: str) -> str | None:
 
 
 def split_captions(text: str) -> list[str]:
-    return [" ".join(part.split()) for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
+    """One caption per blank-line-separated block; ``#`` lines are segment labels, not caption."""
+    body = "\n".join("" if line.lstrip().startswith("#") else line for line in text.splitlines())
+    return [" ".join(part.split()) for part in re.split(r"\n\s*\n", body.strip()) if part.strip()]
+
+
+def spanned(caption: str) -> str:
+    return caption if caption.startswith("[") else f"{SEGMENT_SPAN} {caption}"
 
 
 def stage_inputs(job: Path, proxy: str, anchor: str | None, oc: str | None) -> tuple[str, str | None, str | None]:
@@ -702,15 +758,36 @@ def stage_inputs(job: Path, proxy: str, anchor: str | None, oc: str | None) -> t
     return copy(proxy, "proxy"), copy(anchor, "anchor"), copy(oc, "oc")
 
 
+def worker_alive(beat: dict[str, Any]) -> bool:
+    """An idle worker beats every poll; a busy one is silent until its job ends, so ask its pid."""
+    if beat.get("state") == "idle":
+        return beat["age_s"] < 30
+    if beat.get("state") != "busy":
+        return False
+    try:
+        os.kill(int(beat.get("pid") or 0), 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def workers_markdown(service: Service) -> str:
-    rows = service.workers()
+    rows = [r for r in service.workers() if worker_alive(r)]
+    busy = sum(r.get("state") == "busy" for r in rows)
+    queued = len(list(service.spool.glob("queue/*.json")))
+    parts = [f"本机 {len(rows)} 在线 / {busy} 忙碌"]
+    for path in sorted(service.spool.glob("remote/*.json")):
+        try:
+            remote = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if time.time() - float(remote.get("updated", 0)) < 120:
+            parts.append(f"{remote['node']} {remote['workers']} 在线 / {remote['workers'] - remote['idle']} 忙碌")
+            rows += [remote]
     if not rows:
         return "**推理 worker：** 尚未就绪"
-    live = [r for r in rows if r["age_s"] < 30 and r.get("state") != "stopped"]
-    busy = [r for r in live if r.get("state") == "busy"]
-    queued = len(list(service.spool.glob("queue/*.json")))
-    weights = rows[0].get("weights_id", "")
-    return (f"**推理 worker：** {len(live)} 在线 / {len(busy)} 忙碌，排队 {queued} 个 · 模型 `{weights}`")
+    weights = next((r.get("weights_id") for r in rows if r.get("weights_id")), "")
+    return f"**推理 worker：** {'；'.join(parts)}；排队 {queued} 个 · 模型 `{weights}`"
 
 
 # gr.Gallery(height=...) clips its grid without a scrollbar (gradio 5.32), so the cap goes on the grid.
@@ -721,22 +798,41 @@ def build_ui(service: Service | None, gallery: Gallery) -> Any:
     """The conversion tab and the gallery; ``service=None`` serves the gallery alone."""
     import gradio as gr
 
-    def analyze(proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds, state):
+    def run_analysis(proxy, anchor, oc, text, modality, depth, draft, max_seconds, captions):
         job = service.new_job()
         proxy, anchor, oc = stage_inputs(job, proxy, anchor, oc)
-        analysis = service.analyze(job, proxy, anchor, oc, text or "", modality, depth, verbatim, max_seconds)
+        analysis = service.analyze(job, proxy, anchor, oc, text or "", modality, depth, draft, max_seconds)
         state = {"job": str(job), "proxy": proxy, "anchor": anchor, "oc": oc, "analysis": analysis}
-        return (analysis_markdown(analysis), "\n\n".join(analysis["captions"]), str(job / "proxy_reference.mp4"),
-                state)
+        count = analysis["segments"]
+        md = analysis_markdown(analysis)
+        if analysis["captions"]:
+            captions = with_headers(analysis["captions"])
+            md += "\n- caption 由 VLM 起草，请检查、修改后再生成"
+        elif untouched(captions):
+            captions = caption_template(count, bool(oc))
+            md += f"\n- 已按 {count} 段填入推荐结构：把【…】换成你的描述（只写一段则所有段共用）"
+        elif len(split_captions(captions)) not in (1, count):
+            md += f"\n- ⚠ 现在是 {count} 段，你写了 {len(split_captions(captions))} 段：请补齐，或只留一段供所有段共用"
+        return md, captions, str(job / "proxy_reference.mp4"), state
 
-    def generate(proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds, captions, steps, seed,
+    def analyze(proxy, anchor, oc, text, modality, depth, draft, max_seconds, captions, state):
+        try:
+            return run_analysis(proxy, anchor, oc, text, modality, depth, draft, max_seconds, captions)
+        except Exception as exc:  # surfaced in the UI
+            return f"出错：{type(exc).__name__}: {exc}", captions, None, state
+
+    def generate(proxy, anchor, oc, oc_subject, text, modality, depth, draft, max_seconds, captions, steps, seed,
                  submitter, state):
         try:
-            if not state or not captions.strip():
-                yield "VLM 分析中…", None, None, None, captions, None, state
-                md, captions, preview, state = analyze(proxy, anchor, oc, oc_subject, text, modality, depth, verbatim,
-                                                       max_seconds, state)
+            if not state:
+                yield "分析 proxy 中…", None, None, None, captions, None, state
+                md, captions, preview, state = run_analysis(proxy, anchor, oc, text, modality, depth, draft,
+                                                            max_seconds, captions)
                 yield md, None, None, None, captions, preview, state
+            if untouched(captions) or PLACEHOLDER.search(captions):
+                yield ("请先把 caption 里的【…】换成你的描述，再点「② 生成」", None, None, None, captions, gr.update(),
+                       state)
+                return
             job = Path(state["job"])
             yield "编码条件（Qwen3-VL + VAE）…", None, None, None, captions, gr.update(), state
             job_id = service.submit(job, state["proxy"], state["anchor"], state["oc"], oc_subject, state["analysis"],
@@ -749,7 +845,9 @@ def build_ui(service: Service | None, gallery: Gallery) -> Any:
                 if phase == "done":
                     break
                 if phase == "running":
-                    message = f"生成中：第 {info.get('done', 0)}/{state['analysis']['segments']} 段完成 · {elapsed}s"
+                    where = f"（转发到 {info['node']}）" if info.get("node") else ""
+                    message = (f"生成中{where}：第 {info.get('done', 0)}/{state['analysis']['segments']} 段完成 · "
+                               f"{elapsed}s")
                 else:
                     message = f"排队中：第 {info['position']}/{info['queued']} 位 · {elapsed}s"
                 yield message, None, None, None, captions, gr.update(), state
@@ -779,8 +877,8 @@ def build_ui(service: Service | None, gallery: Gallery) -> Any:
 
     with gr.Blocks(title="H3 Proxy → Video", css=GALLERY_CSS) as demo:
         gr.Markdown("## H3 Ref2VA proxy 转视频（BD + OC：R5-B@600）\n"
-                    "上传任意 proxy 视频（DUV / depth / semantic 可视化，或风格化渲染）、首图、可选的人物设定图（OC）"
-                    "和文字描述。VLM 先判断 proxy 种类并写标准化 caption（可编辑），再生成 704×1280、24 fps 的视频；"
+                    "上传任意 proxy 视频（DUV / depth / semantic 可视化，或风格化渲染）、首图和可选的人物设定图（OC），"
+                    "按推荐结构直接写每段的 caption，生成 704×1280、24 fps 的视频；"
                     "长于 5.17 s 的 proxy 按 124 帧一段、重叠 39 帧接续生成。")
         if service is None:
             gr.Markdown("**转换服务已暂停**，目前只提供结果画廊浏览。")
@@ -794,34 +892,42 @@ def build_ui(service: Service | None, gallery: Gallery) -> Any:
                         anchor = gr.Image(label="首图 <Picture 1>", type="filepath")
                         oc = gr.Image(label="OC 人物设定图 <Picture 2>（可选）", type="filepath")
                     oc_subject = gr.Radio(["protagonist", "vehicle"], value="protagonist", label="OC 主体")
-                    text = gr.Textbox(label="文字描述（可选，中英文均可；VLM 会据此写标准化 caption）", lines=3)
                     with gr.Row():
                         modality = gr.Dropdown(["auto", *MODALITIES], value="auto", label="Proxy 种类")
                         depth = gr.Dropdown([("自动", "auto"), ("近处亮", "near_bright"), ("近处暗", "near_dark")],
                                             value="auto", label="Depth 明暗")
-                    verbatim = gr.Checkbox(label="直接把我的文字当 caption（不经 VLM 改写）", value=False)
+                    with gr.Accordion("可选：让 VLM 起草 caption", open=False):
+                        draft = gr.Checkbox(label="分析时由 VLM 按每段 proxy 起草 caption（会覆盖右侧文本框）",
+                                            value=False)
+                        text = gr.Textbox(label="给 VLM 的提示（中英文均可）", lines=2)
                     with gr.Row():
                         max_seconds = gr.Slider(5, 60, value=15, step=0.5, label="最长输出秒数")
                         steps = gr.Slider(10, 50, value=30, step=1, label="采样步数")
                         seed = gr.Number(value=42, precision=0, label="种子")
                     submitter = gr.Textbox(label="提交人（可选，显示在结果画廊）", max_lines=1)
                     with gr.Row():
-                        analyze_btn = gr.Button("① VLM 分析")
+                        analyze_btn = gr.Button("① 分析 proxy（分段 + 填入推荐结构）")
                         generate_btn = gr.Button("② 生成", variant="primary")
                 with gr.Column():
                     analysis_md = gr.Markdown()
-                    captions = gr.Textbox(label="标准化 caption（每段一条，空行分隔；可编辑后再生成）", lines=8)
+                    with gr.Accordion("Caption 推荐结构", open=True):
+                        gr.Markdown(STRUCTURE_GUIDE)
+                    captions = gr.Textbox(label="Caption（直接输入；每段一段、空行分隔，# 行是段落标注）", lines=12,
+                                          value=caption_template(1, False))
                     preview = gr.Video(label="模型看到的 proxy 参考（352×640）")
                     status = gr.Markdown()
                     result = gr.Video(label="生成结果")
                     compare = gr.Video(label="对比：proxy | 生成")
                     details = gr.JSON(label="任务详情")
-            inputs = [proxy, anchor, oc, oc_subject, text, modality, depth, verbatim, max_seconds]
-            analyze_btn.click(analyze, inputs=[*inputs, state], outputs=[analysis_md, captions, preview, state])
-            generate_btn.click(generate, inputs=[*inputs, captions, steps, seed, submitter, state],
+            analyze_btn.click(analyze, inputs=[proxy, anchor, oc, text, modality, depth, draft, max_seconds, captions,
+                                               state],
+                              outputs=[analysis_md, captions, preview, state])
+            generate_btn.click(generate, inputs=[proxy, anchor, oc, oc_subject, text, modality, depth, draft,
+                                                 max_seconds, captions, steps, seed, submitter, state],
                                outputs=[status, result, compare, details, captions, preview, state])
-            for component in (proxy, anchor, oc, modality, depth, verbatim, max_seconds):
-                component.change(lambda: (None, ""), outputs=[state, captions])
+            # New inputs need a new analysis; the user's caption text stays.
+            for component in (proxy, anchor, oc, modality, depth, max_seconds):
+                component.change(lambda: None, outputs=state)
             gr.Timer(10).tick(lambda: workers_markdown(service), outputs=status_bar)
         with gr.Tab("结果画廊（所有人可见）"):
             with gr.Row():
