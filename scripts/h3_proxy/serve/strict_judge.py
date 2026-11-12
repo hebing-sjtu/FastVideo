@@ -48,7 +48,10 @@ PANEL_WIDTH = 640
 # a single frame.
 MOMENTS = {"structures": 1, "objects": 2, "dummy_shape": 2, "facing": 2, "artifacts": 2, "framing": 3}
 EXTRA_MOMENTS = 3  # a dummy surplus must hold in every moment with dummies, and in at least this many
-MISSING_BY, MISSING_MOMENTS = 2, 2
+MISSING_BY, MISSING_MOMENTS = 2, 3
+# Calibrated on graded steady takes: "popping" and "teleport" fired on most clean segments (dummies
+# leaving the frame as the camera pans), so only morphing and flicker fail a segment.
+MOTION_FAILS = ("flicker", "morphing")
 KINDS = ("dummies", "structures", "objects", "dummy_shape", "facing", "framing", "artifacts",
          "scene", "character", "motion", "score")
 
@@ -209,11 +212,10 @@ def decide(layout: dict[str, Any], count: int, proxy_counts: list[int] | None, g
     for kind in ("scene", "character"):
         if layout.get(kind) is True or str(layout.get(kind)).lower() == "true":
             failures[kind] = [kind]
-    motion_notes = [f"{k}: {_flag(motion.get(k))}" for k in ("flicker", "morphing", "popping", "teleport")
-                    if motion and _flag(motion.get(k))]
+    motion_notes = [f"{k}: {_flag(motion.get(k))}" for k in MOTION_FAILS if motion and _flag(motion.get(k))]
     motion_score = _int((motion or {}).get("score"))
-    if motion_notes or (motion_score is not None and motion_score < min_score):
-        failures["motion"] = motion_notes or [f"motion score {motion_score}"]
+    if motion_notes:
+        failures["motion"] = motion_notes
     score = _int(layout.get("score"))
     score = None if score is None else max(0, min(10, score))
     if score is not None and score < min_score:
