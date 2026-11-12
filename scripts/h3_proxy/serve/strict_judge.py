@@ -303,6 +303,41 @@ class Judge:
         }
 
 
+def encode_image(image: Image.Image | None) -> str | None:
+    if image is None:
+        return None
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=90)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+class Remote:
+    """A running ``serve`` judge behind the same two calls as :class:`Judge`."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url.rstrip("/")
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        import urllib.request
+
+        request = urllib.request.Request(self.url + path, data=json.dumps(payload).encode(),
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=1800) as response:
+            return json.loads(response.read())
+
+    def judge(self, anchor, oc, pairs, clip=None, clip_times=None) -> dict[str, Any]:
+        return self._post("/judge", {
+            "anchor_b64": encode_image(anchor), "oc_b64": encode_image(oc),
+            "pairs_b64": [[encode_image(p), encode_image(g)] for p, g in pairs],
+            "clip_b64": [encode_image(c) for c in clip or []], "clip_fps": 1.0,
+            "clip_frames": list(clip_times or [])})
+
+    def first_frame(self, proxy, painting, overlay, oc, theme) -> dict[str, Any]:
+        return self._post("/first_frame", {"proxy_b64": encode_image(proxy), "painting_b64": encode_image(painting),
+                                           "overlay_b64": encode_image(overlay), "oc_b64": encode_image(oc),
+                                           "theme": theme})
+
+
 def decode_image(data: str | None) -> Image.Image | None:
     return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB") if data else None
 
@@ -382,7 +417,7 @@ def read_video(path: Path) -> np.ndarray:
 def audit(args: argparse.Namespace) -> int:
     """Judge every segment of the takes a manifest lists: [{"name", "take", "anchor", "oc"}, ...]."""
 
-    judge = Judge(Path(args.model), args.device, args.min_score)
+    judge = Remote(args.url) if args.url else Judge(Path(args.model), args.device, args.min_score)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a", encoding="utf-8") as sink:
@@ -412,7 +447,7 @@ def audit(args: argparse.Namespace) -> int:
 def frames(args: argparse.Namespace) -> int:
     """Judge painted first frames: [{"name", "proxy", "painting", "overlay", "oc", "theme"}, ...]."""
 
-    judge = Judge(Path(args.model), args.device, args.min_score)
+    judge = Remote(args.url) if args.url else Judge(Path(args.model), args.device, args.min_score)
     with Path(args.out).open("a", encoding="utf-8") as sink:
         for entry in json.loads(Path(args.manifest).read_text(encoding="utf-8")):
             verdict = judge.first_frame(open_image(entry["proxy"]), open_image(entry["painting"]),
@@ -439,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
     paint = commands.add_parser("frames")
     paint.add_argument("--manifest", required=True)
     paint.add_argument("--out", required=True)
+    for child in (check, paint):
+        child.add_argument("--url", help="a running serve judge (e.g. http://127.0.0.1:7871) instead of loading one")
     for child in (run, check, paint):
         child.add_argument("--model", default=str(MODEL))
         child.add_argument("--device", default="cuda:0")
