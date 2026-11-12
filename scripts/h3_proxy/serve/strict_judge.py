@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import re
@@ -81,6 +82,13 @@ Glowing spell effects that appear and fade, and camera movement, are expected.
 Answer with JSON only, no other text:
 {"flicker": "", "morphing": "", "popping": "", "teleport": "", "score": <integer 0-10 for temporal coherence, strict>}
 Each field is "" when there is no such failure, otherwise a short description with the frame times."""
+
+FACING_PROMPT = """Which way does the main character of this video game frame face the camera: "back" (we see the back), "side", "front" (we see the face and chest) or "absent"?
+Answer with JSON only, no other text: {"facing": "back"}"""
+# Every take opens on the character seen from behind. When the VLM reads that opening frame as "front",
+# it cannot tell this character's back (a braid, hood or cape) from its front, so facing goes unchecked.
+BACK_NOTE = """
+Note: this character's back looks like a front view to you, so do not judge facing: copy proxy_facing into facing in every row, and do not lower the score for it."""
 
 COUNT_PROMPT = """The {count} images are frames of {what}.
 {guide}
@@ -245,6 +253,7 @@ class Judge:
         self.model = self.model.to(self.device).eval()
         self.min_score = min_score
         self.lock = threading.Lock()
+        self.anchor_facing: dict[str, str] = {}
 
     @torch.no_grad()
     def ask(self, parts: list[str | Image.Image], max_new_tokens: int = 600) -> str:
@@ -271,6 +280,10 @@ class Judge:
             oc="\nThe \"identity sheet\" shows the main character." if oc is not None else "",
             oc_ref=" and the identity sheet" if oc is not None else ""))
         raw = self.ask(parts, max_new_tokens=900)
+        facing_unchecked = self._flags_front(_json(raw)) and self._misreads_back(anchor)
+        if facing_unchecked:
+            parts[-1] += BACK_NOTE
+            raw = self.ask(parts, max_new_tokens=900)
         counts = {}
         for side, index in (("proxy", 0), ("generated", 1)):
             what, guide = COUNT_GUIDES[side]
@@ -287,9 +300,28 @@ class Judge:
                 parts += [f"Contact sheet {k}:", sheet]
             motion = _json(self.ask(parts + [MOTION_PROMPT], max_new_tokens=300))
         verdict = decide(_json(raw), len(pairs), counts["proxy"], counts["generated"], motion, self.min_score)
+        if facing_unchecked:
+            verdict["notes"].pop("facing", None)
+            verdict["failures"] = [kind for kind in verdict["failures"] if kind != "facing"]
+            verdict["problems"] = "; ".join(n for notes in verdict["notes"].values() for n in notes)[:600]
+            verdict["facing_unchecked"] = True
         verdict["raw"] = raw
         verdict["seconds"] = round(time.time() - started, 1)
         return verdict
+
+    @staticmethod
+    def _flags_front(layout: dict[str, Any]) -> bool:
+        rows = [row for row in layout.get("rows") or [] if isinstance(row, dict)]
+        return any(str(row.get("facing") or "").lower() == "front"
+                   and str(row.get("proxy_facing") or "").lower() in ("back", "side") for row in rows)
+
+    def _misreads_back(self, anchor: Image.Image) -> bool:
+        key = hashlib.md5(anchor.tobytes()).hexdigest()
+        if key not in self.anchor_facing:
+            answer = _json(self.ask([thumbnail(anchor), FACING_PROMPT], max_new_tokens=40))
+            self.anchor_facing[key] = str(answer.get("facing") or "").lower()
+            print(f"[judge] opening frame read as {self.anchor_facing[key]!r}", flush=True)
+        return self.anchor_facing[key] == "front"
 
     def count(self, images: list[Image.Image], side: str = "generated") -> list[int] | None:
         """Training dummies (standing + fallen) per image, one image per call so none are mixed up."""
