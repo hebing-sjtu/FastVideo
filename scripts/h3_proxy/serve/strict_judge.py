@@ -102,14 +102,30 @@ The painting passes only if it can replace the proxy frame exactly. Check:
 Answer with JSON only, no other text:
 {{"proxy_dummies": 0, "painting_dummies": 0, "dummies_ok": true, "layout_ok": true, "player_ok": true, "plausible": true, "style_ok": true, "score": <integer 0-10, strict>, "problems": "<short list of every problem, or empty>"}}"""
 
+FF_DIFF_PROMPT = """The image shows two views of the same game frame side by side. LEFT is a plain grey render: the ground-truth layout. RIGHT is the finished painting, which must match it object for object.
+Go through LEFT object by object (every wall segment, wall corner, pillar, crate, training dummy and the player figure, including objects cut by the image border) and find its counterpart in RIGHT at the same place and size. Then search RIGHT for anything LEFT does not have.
+Answer with JSON only, no other text:
+{"missing": "<objects of LEFT with no counterpart in RIGHT, saying where, or empty>", "extra": "<objects or structures in RIGHT with no counterpart in LEFT, saying where: crates, barrels, benches, racks, statues, extra pillars or walls, doors, doorways, arches, gates, windows, towers, roofs, trees or buildings rising above the walls, people or creatures; or empty>", "moved": "<objects of RIGHT clearly shifted or resized from their place in LEFT, or empty>"}
+Decoration on the wall surfaces (ivy, banners, shields, lanterns, carvings, cracks, trim) and leaves, snow or puddles on the floor are not objects."""
+
+FF_COUNT_PROMPT = """The {count} images are views of game arenas. For every image count:
+- dummies: training dummies (a body on a post or on a round base; in a grey render, rounded capsules with arm stubs on round bases);
+- crates: boxes and crates on the floor (count each box of a stack);
+- pillars: tall square pillars or columns;
+- openings: doors, doorways, gates, arches, windows or gaps in the walls;
+- people: human figures, the player included.
+Count objects that are only partly in the image too. Answer with JSON only, no other text:
+{{"rows": [{{"image": 1, "dummies": 0, "crates": 0, "pillars": 0, "openings": 0, "people": 0}}, ...one row per image...]}}"""
+FF_COUNTED = ("dummies", "crates", "pillars", "openings", "people")
+
 
 def thumbnail(image: Image.Image, width: int = PANEL_WIDTH) -> Image.Image:
     image = image.convert("RGB")
     return image.resize((width, max(2, round(image.height * width / image.width))), Image.BICUBIC)
 
 
-def pair(proxy: Image.Image, generated: Image.Image) -> Image.Image:
-    left, right = thumbnail(proxy), thumbnail(generated)
+def pair(proxy: Image.Image, generated: Image.Image, width: int = PANEL_WIDTH) -> Image.Image:
+    left, right = thumbnail(proxy, width), thumbnail(generated, width)
     canvas = Image.new("RGB", (left.width + right.width, max(left.height, right.height)))
     canvas.paste(left, (0, 0))
     canvas.paste(right, (left.width, 0))
@@ -292,12 +308,29 @@ class Judge:
         count_gap = (_int(answer.get("proxy_dummies")) or 0) != (_int(answer.get("painting_dummies")) or 0)
         if count_gap and "dummies_ok" not in failed:
             failed.append("dummies_ok")
+        # the overall look above is lenient on layout: a side-by-side difference and separate counts
+        diff = _json(self.ask([pair(proxy, painting, 800), FF_DIFF_PROMPT], max_new_tokens=400))
+        differences = {k: _flag(diff.get(k)) for k in ("missing", "extra", "moved") if _flag(diff.get(k))}
+        if differences:
+            failed.append("differences")
+        rows = _json(self.ask(["Image 1:", thumbnail(proxy, 960), "Image 2:", thumbnail(painting, 960),
+                               FF_COUNT_PROMPT.format(count=2)], max_new_tokens=300)).get("rows") or []
+        counts = {}
+        if len(rows) == 2 and all(isinstance(r, dict) for r in rows):
+            counts = {k: [_int(rows[0].get(k)), _int(rows[1].get(k))] for k in FF_COUNTED}
+            gaps = [k for k, (p, g) in counts.items() if p is not None and g is not None and p != g]
+            if gaps:
+                failed.append("counts:" + ",".join(gaps))
+        problems = "; ".join([str(answer.get("problems") or "")] + [f"{k}: {v}" for k, v in differences.items()])
         return {
             "parsed": bool(answer) and score is not None,
             "pass": bool(answer) and not failed and score is not None and score >= self.min_score,
             "score": score,
             "failed": failed,
-            **{k: answer.get(k) for k in ("proxy_dummies", "painting_dummies", "problems")},
+            "counts": counts,
+            "differences": differences,
+            **{k: answer.get(k) for k in ("proxy_dummies", "painting_dummies")},
+            "problems": problems.strip("; "),
             "raw": raw,
             "seconds": round(time.time() - started, 1),
         }
