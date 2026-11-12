@@ -171,7 +171,8 @@ def _int(value: Any) -> int | None:
 
 def _flag(value: Any) -> str:
     text = str(value or "").strip()
-    return "" if text.lower() in ("", "none", "no", "false", "n/a", "match", "ok") else text
+    empty = ("", "none", "no", "false", "n/a", "match", "ok", "empty", "nothing", "-", "null")
+    return "" if text.lower().strip(" .<>") in empty else text
 
 
 def parse_counts(raw: str, count: int) -> list[int] | None:
