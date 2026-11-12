@@ -221,9 +221,9 @@ class Judge:
 
         self.device = torch.device(device)
         self.processor = AutoProcessor.from_pretrained(str(model_path))
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            str(model_path), dtype=torch.bfloat16, device_map={"": self.device}
-        ).eval()
+        # loaded on the CPU and moved: a device_map needs accelerate, which the venv does not have
+        self.model = AutoModelForImageTextToText.from_pretrained(str(model_path), dtype=torch.bfloat16)
+        self.model = self.model.to(self.device).eval()
         self.min_score = min_score
         self.lock = threading.Lock()
 
