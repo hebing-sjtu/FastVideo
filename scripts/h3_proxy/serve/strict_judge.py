@@ -301,6 +301,24 @@ class Judge:
             out += got
         return out
 
+    def detect(self, image: Image.Image, what: str) -> list[list[float]]:
+        """Boxes ``[x0, y0, x1, y1]`` (fractions of the image) of every ``what``, from Qwen's grounding."""
+        raw = self.ask(["Image:", thumbnail(image, 1344),
+                        f"Locate every {what} in the image, including small far ones and ones cut by the border. "
+                        'Answer with JSON only: [{"bbox_2d": [x1, y1, x2, y2]}, ...], coordinates in 0-1000.'],
+                       max_new_tokens=600)
+        match = re.search(r"\[.*\]", raw, flags=re.S)
+        try:
+            rows = json.loads(match.group(0)) if match else []
+        except ValueError:
+            rows = []
+        boxes = []
+        for row in rows if isinstance(rows, list) else []:
+            box = row.get("bbox_2d") if isinstance(row, dict) else row
+            if isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box):
+                boxes.append([v / 1000.0 for v in box])
+        return boxes
+
     def first_frame(self, proxy: Image.Image, painting: Image.Image, overlay: Image.Image,
                     oc: Image.Image | None, theme: str) -> dict[str, Any]:
         started = time.time()
@@ -378,6 +396,9 @@ class Remote:
             "clip_b64": [encode_image(c) for c in clip or []], "clip_fps": 1.0,
             "clip_frames": list(clip_times or [])})
 
+    def detect(self, image, what) -> list[list[float]]:
+        return self._post("/detect", {"image_b64": encode_image(image), "what": what})["boxes"]
+
     def count(self, images, side="generated") -> list[int] | None:
         return self._post("/count", {"images_b64": [encode_image(i) for i in images], "side": side})["counts"]
 
@@ -421,6 +442,9 @@ def serve(args: argparse.Namespace) -> int:
         def do_POST(self) -> None:
             try:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.rstrip("/").endswith("detect"):
+                    self._reply(200, {"boxes": judge.detect(decode_image(request["image_b64"]), request["what"])})
+                    return
                 if self.path.rstrip("/").endswith("count"):
                     images = [decode_image(i) for i in request["images_b64"]]
                     self._reply(200, {"counts": judge.count(images, request.get("side", "generated"))})
